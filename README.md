@@ -148,6 +148,14 @@ setup_internal_medicine()
 | 11 | `expert_norm_max` | `moe_health/.../expert_norm_max` | `max(expert_L2_norms)` | 每层+全局 | 最大专家范数 |
 | 12 | `shared_expert_norm` | `moe_health/.../shared_expert_norm` | `\|\|shared_params\|\|₂` | 每层+全局 | 共享专家权重范数 |
 | 13 | `shared_routed_ratio` | `moe_health/.../shared_routed_ratio` | `shared_norm / routed_mean` | 每层+全局 | 共享/路由专家比例 |
+| 14 | `load_max_min_ratio` | `moe_health/.../load_max_min_ratio` | `max(tokens) / min(tokens)` | 每层+全局 | 最忙/最闲专家 token 数比值 |
+| 15 | `load_max_median_ratio` | `moe_health/.../load_max_median_ratio` | `max(tokens) / median(tokens)` | 每层+全局 | 最忙/中位专家 token 数比值 |
+| 16 | `load_cv` | `moe_health/.../load_cv` | `std(tokens) / mean(tokens)` | 每层+全局 | 专家负载变异系数 (均衡=0) |
+
+> **注**: 指标 14-16 (`load_*`) 仅在 `moe_router_enable_expert_bias=true` 时输出。
+> 它们复用 mcore 在 `get_updated_expert_bias` 中已做的 TPxCPxDP all-reduce
+> (每个 global batch 一次, 不在 forward hook 热路径上), 因此无需 monitor 侧
+> collective, 统计值已是全局正确值。
 
 ### 健康阈值
 
@@ -303,6 +311,9 @@ NeMo Trainer 对应字段为 `internal_medicine_hook_timing`。开启后 trainer
 | **MoE** | `expert_norm_max` | `max(L2)` | max | 不应过载 |
 | **MoE** | `shared_expert_norm` | `\|\|shared\|\|₂` | mean | 稳定 |
 | **MoE** | `shared_routed_ratio` | `shared/routed` | mean | 0.3 ~ 3.0 OK |
+| **MoE** | `load_max_min_ratio` | `max/min(tokens)` | mean | 越接近 1 越均衡 (仅 expert_bias) |
+| **MoE** | `load_max_median_ratio` | `max/median(tokens)` | mean | 越接近 1 越均衡 (仅 expert_bias) |
+| **MoE** | `load_cv` | `std/mean(tokens)` | mean | 越接近 0 越均衡 (仅 expert_bias) |
 | **QK** | `max` | `max(QK^T/√d)` | max | 不应暴增 |
 | **QK** | `mean` | `mean(logits)` | mean | 稳定 |
 | **QK** | `entropy_avg` | `-Σ(p log p)` avg | mean | 适中 |

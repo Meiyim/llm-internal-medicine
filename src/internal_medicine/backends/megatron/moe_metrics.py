@@ -100,6 +100,52 @@ def compute_bias_affinity_jaccard(
     return intersection / union.clamp(min=1e-8)
 
 
+def compute_load_balance_ratios(tokens_per_expert: torch.Tensor) -> dict[str, torch.Tensor] | None:
+    """专家负载极值比值, 基于已 all-reduce 的 tokens-per-expert.
+
+    输入是 mcore 在 get_updated_expert_bias 里跨 TPxCPxDP all-reduce 之后的
+    全局 per-expert token 计数 (每张卡上都相同), 因此这里算出的比值本身就是全局
+    正确值, 无需 monitor 侧 collective, 也无需 training_logs 跨 rank 聚合.
+
+    对每一层 (行) 计算:
+      - load_max_min_ratio    = #tokens(most-routed) / #tokens(least-routed)
+      - load_max_median_ratio = #tokens(most-routed) / #tokens(median expert)
+      - load_cv               = std(counts) / mean(counts)  (变异系数, 完全均衡=0)
+
+    median 用 torch.median (偶数个专家时取下中位, 即某个真实专家的计数, 不做插值).
+    极值比值分母 clamp(min=1.0) 防止死专家 (count=0) 产生 inf/NaN. CV 用 population
+    std (unbiased=False) 除以 mean, mean clamp(min=1.0) 防止空批次除零. 全程 GPU
+    tensor, 不在 hot path 上运行 (调用点在 finalize_model_grads, forward hook 之外).
+
+    Args:
+        tokens_per_expert: reduced counts. [num_layers, num_experts] (stacked)
+            or [num_experts] (single layer). Last dim is the expert axis.
+
+    Returns:
+        Dict of per-layer 0-dim/1-dim tensors keyed by metric name (shape matches
+        the leading layer dim), or None if the expert axis has < 2 experts.
+    """
+    counts = tokens_per_expert.to(torch.float32)
+    if counts.dim() == 1:
+        counts = counts.unsqueeze(0)
+    if counts.dim() != 2 or counts.shape[-1] < 2:
+        return None
+
+    max_count = counts.max(dim=-1).values
+    min_count = counts.min(dim=-1).values
+    median_count = counts.median(dim=-1).values
+    # Population std (unbiased=False): with the global per-expert totals this is
+    # the exact CV, not a sample estimate. Balanced load -> std=0 -> CV=0.
+    mean_count = counts.mean(dim=-1)
+    std_count = counts.std(dim=-1, unbiased=False)
+
+    return {
+        "load_max_min_ratio": max_count / min_count.clamp(min=1.0),
+        "load_max_median_ratio": max_count / median_count.clamp(min=1.0),
+        "load_cv": std_count / mean_count.clamp(min=1.0),
+    }
+
+
 def compute_expert_norms(expert_weights: list[torch.Tensor]) -> dict[str, torch.Tensor]:
     """
     计算 Expert Norms (专家权重L2范数).

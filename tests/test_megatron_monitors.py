@@ -97,6 +97,77 @@ class MegatronMoEMonitorTest(unittest.TestCase):
         self.assertIn("moe_health/layer_0/expert_norm_mean", latest)
         self.assertIn("moe_health/global_expert_norm_mean", latest)
 
+    def test_load_balance_metrics_from_reduced_tokens_per_expert(self):
+        # Two bias-enabled layers, recorded in the order finalize_model_grads
+        # stacks them. tokens_per_expert is the ALREADY-reduced global count.
+        monitor = MoESpecialistMonitor(log_per_layer=True, log_global=True)
+        monitor._expert_bias_enabled = True
+        monitor._load_balance_layer_order = [0, 1]
+        for layer_idx in (0, 1):
+            for name in moe_monitor_module._LOAD_BALANCE_METRICS:
+                monitor.declare_layer_metric(layer_idx, name)
+        monitor.allocate_buffers(torch.device("cpu"))
+
+        # layer 0: [5,3,2,2] -> max/min=5/2=2.5, max/median=5/2=2.5
+        # layer 1: [10,0,4,6] -> max/min=10/1(clamp)=10, max/median=10/4=2.5
+        reduced = torch.tensor([[5.0, 3.0, 2.0, 2.0], [10.0, 0.0, 4.0, 6.0]])
+        monitor._record_load_balance_metrics(reduced)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="moe_health")
+        self.assertAlmostEqual(latest["moe_health/layer_0/load_max_min_ratio"], 2.5, places=5)
+        self.assertAlmostEqual(latest["moe_health/layer_1/load_max_min_ratio"], 10.0, places=5)
+        self.assertAlmostEqual(latest["moe_health/layer_0/load_max_median_ratio"], 2.5, places=5)
+        self.assertAlmostEqual(latest["moe_health/layer_1/load_max_median_ratio"], 2.5, places=5)
+        # CV = population std / mean. layer 0 mean=3, std=sqrt(((2)+(0)+(1)+(1))/4)=sqrt(1.5)
+        self.assertAlmostEqual(latest["moe_health/layer_0/load_cv"], (1.5**0.5) / 3.0, places=5)
+        self.assertIn("moe_health/global_load_max_min_ratio", latest)
+        self.assertIn("moe_health/global_load_cv", latest)
+
+    def test_load_balance_metrics_absent_without_expert_bias(self):
+        # When no router has expert-bias enabled, the metric must not be
+        # declared (schema stays clean) — nothing to record or patch.
+        monitor = MoESpecialistMonitor(log_per_layer=True, log_global=True)
+        self.assertFalse(monitor._expert_bias_enabled)
+        self.assertEqual(monitor._load_balance_layer_order, [])
+        # Idempotent no-op when expert-bias is off.
+        monitor._patch_expert_bias_update()
+        self.assertIsNone(monitor._orig_get_updated_expert_bias)
+
+    def test_expert_bias_patch_rebinds_caller_and_fires(self):
+        # The wrapper must rebind the name in finalize_model_grads (the caller),
+        # observe the reduced tokens_per_expert, and unpatch cleanly.
+        fmg = moe_monitor_module._finalize_model_grads
+        original = fmg.get_updated_expert_bias
+        # Stub the underlying update so the test needs no distributed group:
+        # the real fn all-reduces tokens_per_expert, which requires dist init.
+        # Our wrapper only cares that the tensor it receives is the reduced one.
+        fmg.get_updated_expert_bias = lambda tpe, bias, rate, *a, **k: bias
+
+        monitor = MoESpecialistMonitor(log_per_layer=True, log_global=True)
+        monitor._expert_bias_enabled = True
+        monitor._load_balance_layer_order = [0]
+        for name in moe_monitor_module._LOAD_BALANCE_METRICS:
+            monitor.declare_layer_metric(0, name)
+        monitor.allocate_buffers(torch.device("cpu"))
+
+        try:
+            monitor._patch_expert_bias_update()
+            self.assertTrue(getattr(fmg.get_updated_expert_bias, "_im_patched", False))
+
+            # Caller hands the wrapper an ALREADY-reduced count row.
+            tokens = torch.tensor([[6.0, 2.0, 3.0, 3.0]])  # max/min=6/2=3, max/median=6/3=2
+            bias = torch.zeros_like(tokens)
+            fmg.get_updated_expert_bias(tokens, bias, 0.0)
+            monitor.step()
+
+            latest = training_logs.get_latest(prefix="moe_health")
+            self.assertAlmostEqual(latest["moe_health/layer_0/load_max_min_ratio"], 3.0, places=5)
+            self.assertAlmostEqual(latest["moe_health/layer_0/load_max_median_ratio"], 2.0, places=5)
+        finally:
+            monitor.remove_hooks()
+            fmg.get_updated_expert_bias = original
+
 
 class MegatronPLEMonitorTest(unittest.TestCase):
     def setUp(self):

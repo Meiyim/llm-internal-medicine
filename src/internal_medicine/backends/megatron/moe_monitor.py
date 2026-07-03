@@ -5,6 +5,7 @@ Migrated from src/internal_medicine/moe_specialist/.
 
 import logging
 import weakref
+from importlib import import_module
 from typing import Any
 
 import torch
@@ -15,6 +16,7 @@ from .base import TorchProbe
 from .moe_metrics import (
     compute_bias_affinity_jaccard,
     compute_expert_norms,
+    compute_load_balance_ratios,
     compute_router_entropy,
     compute_shared_expert_norm,
     compute_shared_routed_ratio,
@@ -22,6 +24,11 @@ from .moe_metrics import (
 )
 
 logger = logging.getLogger(__name__)
+
+# `megatron.core.distributed` exposes a *function* named `finalize_model_grads`
+# that shadows the submodule of the same name, so `from ... import
+# finalize_model_grads` binds the function. Fetch the module object explicitly.
+_finalize_model_grads = import_module("megatron.core.distributed.finalize_model_grads")
 
 
 _ROUTER_METRICS = (
@@ -32,6 +39,17 @@ _ROUTER_METRICS = (
     "expert_bias_mean",
     "expert_bias_std",
     "bias_affinity_jaccard",
+)
+
+# Emitted only when moe_router_enable_expert_bias is on. mcore already
+# all-reduces tokens-per-expert across TPxCPxDP inside get_updated_expert_bias
+# (once per global batch, off the hot path); we piggyback on that reduced
+# tensor rather than adding any monitor-side collective. See
+# _patch_expert_bias_update / _record_load_balance_metrics.
+_LOAD_BALANCE_METRICS = (
+    "load_max_min_ratio",
+    "load_max_median_ratio",
+    "load_cv",
 )
 
 _EXPERT_METRICS = (
@@ -61,6 +79,12 @@ class MoESpecialistMonitor(TorchProbe):
         )
         self._monitored_moe_layers: list[tuple[int, weakref.ref]] = []
         self._patched_routers: list[weakref.ref] = []
+        # Populated in _prepare_layers when moe_router_enable_expert_bias is on.
+        # Maps the layer position within the stacked tokens_per_expert tensor
+        # (the order finalize_model_grads visits routers) to our layer_idx.
+        self._expert_bias_enabled = False
+        self._load_balance_layer_order: list[int] = []
+        self._orig_get_updated_expert_bias = None
 
     def register_hooks(self, model: nn.Module):
         self._init_parallel_state()
@@ -69,6 +93,7 @@ class MoESpecialistMonitor(TorchProbe):
             return
         self.allocate_buffers(next(model.parameters()).device)
         self._attach_hooks(targets)
+        self._patch_expert_bias_update()
 
     def _init_parallel_state(self):
         try:
@@ -87,9 +112,18 @@ class MoESpecialistMonitor(TorchProbe):
         if self.verbose:
             logger.info(f"[MoEMonitor] Found {len(moe_layers)} MoE layers.")
 
-        for layer_idx, _ in moe_layers:
+        for layer_idx, moe_layer in moe_layers:
             for name in (*_ROUTER_METRICS, *_EXPERT_METRICS):
                 self.declare_layer_metric(layer_idx, name)
+            # Load-balance ratios are only observable when expert-bias is on
+            # (mcore all-reduces tokens-per-expert only in that path). Declare
+            # them here so the schema is locked before allocate_buffers.
+            router = getattr(moe_layer, "router", None)
+            if router is not None and getattr(router, "enable_expert_bias", False):
+                self._expert_bias_enabled = True
+                self._load_balance_layer_order.append(layer_idx)
+                for name in _LOAD_BALANCE_METRICS:
+                    self.declare_layer_metric(layer_idx, name)
         return moe_layers
 
     def _attach_hooks(self, targets: list[tuple[int, nn.Module]]):
@@ -103,6 +137,71 @@ class MoESpecialistMonitor(TorchProbe):
                 self.hooks.append(hook)
 
         logger.info(f"[MoEMonitor] Registered {len(self.hooks)} hooks on {len(targets)} layers.")
+
+    def _patch_expert_bias_update(self):
+        """Piggyback on mcore's per-global-batch expert-bias update to emit
+        load-balance ratios, without adding any monitor-side collective.
+
+        mcore's ``get_updated_expert_bias`` all-reduces the stacked
+        ``tokens_per_expert`` (``[num_bias_layers, num_experts]``) across
+        TPxCPxDP in-place, then throws it away. We wrap it: after the original
+        runs, the passed tensor holds the *global* counts, identical on every
+        rank, so ratios computed here need no cross-rank aggregation.
+
+        The stacking order in ``_update_router_expert_bias`` is the order
+        routers appear in ``model.modules()`` — the same order we recorded in
+        ``self._load_balance_layer_order`` while walking the layers.
+
+        NOTE: ``finalize_model_grads`` binds the function via
+        ``from ..moe_utils import get_updated_expert_bias`` at import time, so it
+        holds its own module-level reference. We must rebind the name in the
+        *caller's* namespace, not in ``moe_utils``, or the wrapper never fires.
+        """
+        if not self._expert_bias_enabled:
+            return
+        fmg = _finalize_model_grads
+        if getattr(fmg.get_updated_expert_bias, "_im_patched", False):
+            return
+
+        original = fmg.get_updated_expert_bias
+        monitor = self
+
+        def patched(tokens_per_expert, expert_bias, expert_bias_update_rate, *args, **kwargs):
+            updated = original(tokens_per_expert, expert_bias, expert_bias_update_rate, *args, **kwargs)
+            # `tokens_per_expert` has been all-reduced in-place by `original`.
+            # in_forward=False: the update runs at finalize_model_grads time,
+            # outside any forward, so skip the recompute grad guard but keep the
+            # monitor-interval gate.
+            try:
+                if monitor._should_monitor(in_forward=False):
+                    monitor._record_load_balance_metrics(tokens_per_expert.detach())
+            except Exception as e:
+                if monitor.verbose:
+                    logger.error(f"[MoEMonitor] load-balance metric error: {e}")
+            return updated
+
+        patched._im_patched = True
+        patched._im_original = original
+        fmg.get_updated_expert_bias = patched
+        self._orig_get_updated_expert_bias = (fmg, original)
+        if self.verbose:
+            logger.info(
+                f"[MoEMonitor] Patched get_updated_expert_bias for "
+                f"{len(self._load_balance_layer_order)} bias-enabled layers."
+            )
+
+    def _record_load_balance_metrics(self, tokens_per_expert: torch.Tensor):
+        ratios = compute_load_balance_ratios(tokens_per_expert)
+        if ratios is None:
+            return
+        max_min = ratios["load_max_min_ratio"]
+        max_median = ratios["load_max_median_ratio"]
+        load_cv = ratios["load_cv"]
+        n = min(max_min.shape[0], len(self._load_balance_layer_order))
+        for row, layer_idx in zip(range(n), self._load_balance_layer_order[:n], strict=False):
+            self.record_layer_metric(layer_idx, "load_max_min_ratio", max_min[row])
+            self.record_layer_metric(layer_idx, "load_max_median_ratio", max_median[row])
+            self.record_layer_metric(layer_idx, "load_cv", load_cv[row])
 
     def _patch_router_cache(self, router):
         if not hasattr(router, "_apply_aux_loss"):
@@ -204,11 +303,11 @@ class MoESpecialistMonitor(TorchProbe):
                     logger.error(f"[MoEMonitor] Step expert-metric error layer {layer_idx}: {e}")
 
     def step(self):
-        # Bypass TorchProbe._should_monitor's torch.is_grad_enabled() guard:
-        # that guard exists to skip recompute-pass forward hooks, but step()
-        # runs outside any forward and a caller-side no_grad wrapper must not
-        # silently disable expert-weight metrics.
-        if self.step_count % self.monitor_interval == 0:
+        # in_forward=False: step() runs outside any forward, so we want the
+        # monitor-interval gate without _should_monitor's recompute grad guard
+        # (a caller-side no_grad wrapper must not silently disable expert-weight
+        # metrics). Same reason the expert-bias update uses in_forward=False.
+        if self._should_monitor(in_forward=False):
             self._compute_expert_metrics_for_all_layers()
         super().step()
 
@@ -285,6 +384,11 @@ class MoESpecialistMonitor(TorchProbe):
 
     def remove_hooks(self):
         super().remove_hooks()
+        if self._orig_get_updated_expert_bias is not None:
+            fmg, original = self._orig_get_updated_expert_bias
+            if getattr(fmg.get_updated_expert_bias, "_im_patched", False):
+                fmg.get_updated_expert_bias = original
+            self._orig_get_updated_expert_bias = None
         for router_ref in self._patched_routers:
             router = router_ref()
             if router is None:
@@ -341,6 +445,8 @@ def setup_moe_monitor(
         monitor.allocate_buffers(device)
         for _, targets in chunk_targets:
             monitor._attach_hooks(targets)
+        # Idempotent global patch; call once after all chunks' schemas are locked.
+        monitor._patch_expert_bias_update()
     logger.info(f"[MoEMonitor] Setup complete. Monitoring {len(monitor.hooks)} hooks.")
     if monitor_dict is not None:
         monitor_dict["moe_health"] = monitor

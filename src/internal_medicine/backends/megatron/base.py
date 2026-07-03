@@ -57,8 +57,11 @@ class TorchProbe(Probe):
         self.hook_timing_enabled = hook_timing_enabled
         self._hook_timing: dict[str, tuple[int, float]] = {}
 
-    def _should_monitor(self) -> bool:
-        if not torch.is_grad_enabled():
+    def _should_monitor(self, in_forward: bool = True) -> bool:
+        # in_forward=False lets off-forward callers (e.g. the expert-bias update
+        # at finalize_model_grads time) keep the interval gate without the
+        # recompute-pass grad guard, which only makes sense inside a forward.
+        if in_forward and not torch.is_grad_enabled():
             return False
         return super()._should_monitor()
 

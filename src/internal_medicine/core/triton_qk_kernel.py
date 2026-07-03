@@ -91,7 +91,12 @@ def qk_stats_kernel(
         row_sum_logit_raw = tl.zeros([BLOCK_M], dtype=tl.float32)
         row_count_raw = tl.zeros([BLOCK_M], dtype=tl.float32)
 
-        for n_start in range(0, seq_len, BLOCK_N):
+        if apply_causal_mask:
+            n_stop = tl.minimum(m_start + (BLOCK_M - 1) * ROW_STRIDE + BLOCK_N, seq_len)
+        else:
+            n_stop = seq_len
+
+        for n_start in range(0, n_stop, BLOCK_N):
             n_offsets = n_start + tl.arange(0, BLOCK_N)
             n_mask = n_offsets < seq_len
 
@@ -107,7 +112,7 @@ def qk_stats_kernel(
                 k_ptr = k_base + n_offsets[:, None] * stride_k_seq + k_offsets[None, :] * stride_k_dim
                 k = tl.load(k_ptr, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
 
-                acc += tl.dot(q, tl.trans(k), input_precision="ieee")
+                acc += tl.dot(q, tl.trans(k))
 
             logits = acc * scale
 

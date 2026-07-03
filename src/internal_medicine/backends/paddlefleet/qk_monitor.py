@@ -108,35 +108,44 @@ def _compute_qk_stats_triton(
     ``row_stride`` subsamples query rows (see kernel docstring).
     """
     _ensure_triton_driver()
-    from ...core.triton_qk_kernel import qk_stats_kernel
+    from ...core.triton_qk_kernel import qk_stats_partial_kernel
 
     batch, num_heads, seq_len, head_dim = q.shape
     scale = 1.0 / (head_dim**0.5)
 
-    max_logits = paddle.empty([batch, num_heads], dtype="float32")
-    mean_logits = paddle.empty([batch, num_heads], dtype="float32")
-    entropy = paddle.empty([batch, num_heads], dtype="float32")
-    sink = paddle.empty([batch, num_heads], dtype="float32")
-    count = paddle.empty([batch, num_heads], dtype="float32")
-
     BLOCK_M = 64
     BLOCK_N = 64
     BLOCK_K = 64 if head_dim <= 64 else 128
-    grid = (batch * num_heads,)
 
-    qk_stats_kernel[grid](
+    # Stage-1 grid: parallelize over (B*H, num_M_blocks) instead of (B*H,) only.
+    m_block_span = BLOCK_M * row_stride
+    num_m_blocks = (seq_len + m_block_span - 1) // m_block_span
+
+    partial_shape = [batch, num_heads, num_m_blocks]
+    partial_max = paddle.empty(partial_shape, dtype="float32")
+    partial_sum_logit = paddle.empty(partial_shape, dtype="float32")
+    partial_count = paddle.empty(partial_shape, dtype="float32")
+    partial_sum_entropy = paddle.empty(partial_shape, dtype="float32")
+    partial_sum_sink = paddle.empty(partial_shape, dtype="float32")
+    partial_valid_rows = paddle.empty(partial_shape, dtype="float32")
+
+    grid = (batch * num_heads, num_m_blocks)
+
+    qk_stats_partial_kernel[grid](
         q,
         k,
-        max_logits,
-        mean_logits,
-        entropy,
-        sink,
-        count,
+        partial_max,
+        partial_sum_logit,
+        partial_count,
+        partial_sum_entropy,
+        partial_sum_sink,
+        partial_valid_rows,
         batch,
         num_heads,
         seq_len,
         head_dim,
         heads_per_group,
+        num_m_blocks,
         q.strides[0],
         q.strides[1],
         q.strides[2],
@@ -145,8 +154,9 @@ def _compute_qk_stats_triton(
         k.strides[1],
         k.strides[2],
         k.strides[3],
-        max_logits.strides[0],
-        max_logits.strides[1],
+        partial_max.strides[0],
+        partial_max.strides[1],
+        partial_max.strides[2],
         scale=scale,
         apply_causal_mask=causal,
         ROW_STRIDE=row_stride,
@@ -154,6 +164,14 @@ def _compute_qk_stats_triton(
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
     )
+
+    # reduce: pure paddle GPU ops, deterministic reduction order, no D2H sync.
+    max_logits = partial_max.max(axis=-1)  # [B, H]
+    total_count = partial_count.sum(axis=-1).clip(min=1.0)
+    total_rows = partial_valid_rows.sum(axis=-1).clip(min=1.0)
+    mean_logits = partial_sum_logit.sum(axis=-1) / total_count
+    entropy = partial_sum_entropy.sum(axis=-1) / total_rows
+    sink = partial_sum_sink.sum(axis=-1) / total_rows
 
     return {
         "max_per_head": max_logits,

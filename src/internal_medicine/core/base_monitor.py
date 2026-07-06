@@ -63,6 +63,8 @@ class Probe(ABC):
         return None
 
     def _should_monitor(self) -> bool:
+        if not self.monitor_interval:
+            return False
         return self.step_count % self.monitor_interval == 0
 
     # ------------------------------------------------------------------

@@ -256,9 +256,9 @@ def qk_stats_partial_kernel(
     row_count_raw = tl.zeros([BLOCK_M], dtype=tl.float32)
 
     if apply_causal_mask:
-            n_stop = tl.minimum(m_start + (BLOCK_M - 1) * ROW_STRIDE + BLOCK_N, seq_len)
-        else:
-            n_stop = seq_len
+        n_stop = tl.minimum(m_start + (BLOCK_M - 1) * ROW_STRIDE + BLOCK_N, seq_len)
+    else:
+        n_stop = seq_len
 
     for n_start in range(0, n_stop, BLOCK_N):
         n_offsets = n_start + tl.arange(0, BLOCK_N)

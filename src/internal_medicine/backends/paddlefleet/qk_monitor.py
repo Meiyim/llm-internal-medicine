@@ -298,7 +298,7 @@ class PaddleQKStatsMonitor(PaddleProbe):
                 self.cp_size,
             )
 
-        for layer_idx, _ in attention_layers:
+        for layer_idx, _attn_module, attn_type in attention_layers:
             for m in (
                 "max",
                 "mean",
@@ -311,18 +311,20 @@ class PaddleQKStatsMonitor(PaddleProbe):
                 "sink_head_max",
                 "sink_nonsink_gap",
             ):
-                self.declare_layer_metric(layer_idx, m)
+                self.declare_layer_metric(layer_idx, m, attn_type=attn_type)
 
         self.allocate_buffers()
 
-        for layer_idx, attn_module in attention_layers:
+        for layer_idx, attn_module, attn_type in attention_layers:
             if hasattr(attn_module, "core_attention"):
-                hook = attn_module.core_attention.register_forward_pre_hook(self._make_compute_hook(layer_idx))
+                hook = attn_module.core_attention.register_forward_pre_hook(
+                    self._make_compute_hook(layer_idx, attn_type)
+                )
                 self.hooks.append(hook)
 
         logger.info(f"[PaddleQKMonitor] Registered {len(self.hooks)} hooks.")
 
-    def _find_attention_layers(self, model: nn.Layer) -> list[tuple[int, nn.Layer]]:
+    def _find_attention_layers(self, model: nn.Layer) -> list[tuple[int, nn.Layer, str | None]]:
         def has_attention(layer):
             return hasattr(layer, "self_attn") or hasattr(layer, "self_attention")
 
@@ -338,7 +340,7 @@ class PaddleQKStatsMonitor(PaddleProbe):
         for item in monitor_layers:
             attn = getattr(item.layer, "self_attn", None) or getattr(item.layer, "self_attention", None)
             if attn is not None:
-                attention_layers.append((item.idx, attn))
+                attention_layers.append((item.idx, attn, item.attn_type))
         return attention_layers
 
     def _cp_gather_seq(self, tensor: paddle.Tensor) -> paddle.Tensor | None:
@@ -404,19 +406,19 @@ class PaddleQKStatsMonitor(PaddleProbe):
                     stats = compute_qk_stats_paddle(query, key, causal=self.causal, row_stride=effective_stride)
 
                 all_heads = stats["entropy_per_head"]
-                self.record_layer_metric(layer_idx, "max", stats["max_global"])
-                self.record_layer_metric(layer_idx, "mean", stats["mean_global"])
-                self.record_layer_metric(layer_idx, "entropy_avg", stats["entropy_global"])
-                self.record_layer_metric(layer_idx, "sink", stats["sink_global"])
-                self.record_layer_metric(layer_idx, "entropy_min", all_heads.min())
-                self.record_layer_metric(layer_idx, "entropy_max", all_heads.max())
-                self.record_layer_metric(layer_idx, "entropy_std", all_heads.std())
+                self.record_layer_metric(layer_idx, "max", stats["max_global"], attn_type=attn_type)
+                self.record_layer_metric(layer_idx, "mean", stats["mean_global"], attn_type=attn_type)
+                self.record_layer_metric(layer_idx, "entropy_avg", stats["entropy_global"], attn_type=attn_type)
+                self.record_layer_metric(layer_idx, "sink", stats["sink_global"], attn_type=attn_type)
+                self.record_layer_metric(layer_idx, "entropy_min", all_heads.min(), attn_type=attn_type)
+                self.record_layer_metric(layer_idx, "entropy_max", all_heads.max(), attn_type=attn_type)
+                self.record_layer_metric(layer_idx, "entropy_std", all_heads.std(), attn_type=attn_type)
                 # sink_per_head: [B, H] — average across batch to get [H]
                 sink_per_head = stats["sink_per_head"]
                 sink_for_classify = sink_per_head.mean(axis=0) if sink_per_head.ndim > 1 else sink_per_head
                 sink_class = compute_sink_head_classification(sink_for_classify, threshold=self.sink_head_threshold)
                 for name, val in sink_class.items():
-                    self.record_layer_metric(layer_idx, name, val)
+                    self.record_layer_metric(layer_idx, name, val, attn_type=attn_type)
             except Exception as e:
                 logger.error(f"[PaddleQKMonitor] Error layer {layer_idx}: {e}")
 

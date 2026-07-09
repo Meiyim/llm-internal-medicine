@@ -1,6 +1,6 @@
 # Massive Activation Monitor
 
-**Residual Stream Massive Activation 健康监控模块**，监控 13 个核心指标。
+**Residual Stream Massive Activation 健康监控模块**，监控 15 个核心指标。
 
 基于论文发现实现：
 
@@ -197,6 +197,38 @@ RMSNorm(h^(a)) ≈ RMSNorm(h^(b))
 
 ---
 
+### 10. Spectral Norm Bounds (谱范数上下界)
+
+**数学公式：**
+```
+ratio_t = post_layer_rms_t / pre_layer_rms_t = ||y_t|| / ||x_t||   (每 token)
+spectral_norm_max = max_t(ratio_t)     # 在一个 global batch 内对所有 token 取 max
+spectral_norm_min = min_t(ratio_t)     # 在一个 global batch 内对所有 token 取 min
+```
+
+对每个 token，用该层输出残差 `y_t` 与输入残差 `x_t` 的 RMS 之比近似该层作为线性映射的
+增益 `||y_t|| / ||x_t||`（`sqrt(H)` 约掉）。在一个 global batch 内对所有 token 归约：
+
+- `spectral_norm_max`（ratio 的最大值）是该层**谱范数（最大奇异值 σ_max）的下界** ——
+  任意观测到的增益都 ≤ `sup_x ||f(x)||/||x||`。
+- `spectral_norm_min`（ratio 的最小值）是该层**最小奇异值 σ_min 的上界** ——
+  任意观测到的增益都 ≥ `inf_x ||f(x)||/||x||`。
+
+**实现要点：**
+- 残差在 transformer layer 边界携带完整 hidden 维（LayerNorm 需要完整 H），因此每 token
+  RMS 是真实的全向量 RMS，**无需 TP 通道归约**。
+- 指标是对 token 取 max/min；token 可能被切分到不同 rank（sequence-parallel / DP / PP），
+  但 `gather_and_aggregate()` 在 flush 时做全 world 的 `all_gather` + max/min 归约，因此整个
+  global batch 的 max/min 在跨 rank 时正确合成，**hook 内无需任何 collective**。
+- "一个 global batch" 的语义依赖既有约定：`monitor.step()`（flush 累加器）每个 optimizer
+  step 调用一次；窗口内 `record_max`/`record_min` 跨所有 microbatch 累积极值。
+
+**诊断意义：**
+- `spectral_norm_max` 持续 > 1 且上升 → 该层放大残差流，可能驱动 spike 生命周期的 rise 段
+- `spectral_norm_min` 远小于 1 → 该层对部分 token 强烈压缩，关注训练稳定性
+
+---
+
 ## 健康阈值参考
 
 | 指标 | 值 | 状态 | 说明 |
@@ -219,6 +251,10 @@ RMSNorm(h^(a)) ≈ RMSNorm(h^(b))
 | | > 0.8 | HIGH | 高度稀疏，implicit parameter 效应 |
 | `post_norm_cosine` | < 0.5 | DIVERSE | token 表示多样 |
 | | > 0.9 | COLLAPSED | 近常量向量，sink 前提条件满足 |
+| `spectral_norm_max` | ~1.0 | NORMAL | 层增益接近恒等 |
+| | 持续 > 1 且上升 | WARNING | 层放大残差流，关注 spike/训练稳定性 |
+| `spectral_norm_min` | ~1.0 | NORMAL | 层增益接近恒等 |
+| | << 1.0 | WARNING | 对部分 token 强烈压缩 |
 
 ---
 

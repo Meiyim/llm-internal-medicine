@@ -15,10 +15,10 @@ from .base import TorchProbe
 from .massive_activation_metrics import (
     DEFAULT_ABSOLUTE_THRESHOLDS,
     _threshold_key,
-    compute_activation_scale_stats,
     compute_per_channel_max,
     compute_post_norm_cosine_stability,
     compute_post_norm_sparsity,
+    compute_spectral_norm_bounds,
     summarize_per_channel_max,
 )
 
@@ -38,6 +38,10 @@ class MassiveActivationMonitor(TorchProbe):
         "topk_channel_norm",
         "activation_rms",
         "massive_act_channel_count",
+        "spectral_norm_max",
+    }
+    MIN_AGGREGATED = {
+        "spectral_norm_min",
     }
 
     def __init__(
@@ -52,8 +56,8 @@ class MassiveActivationMonitor(TorchProbe):
         cosine_sample_pairs: int = 256,
         sample_layers: list[int] | None = None,
         absolute_thresholds: tuple[float, ...] = DEFAULT_ABSOLUTE_THRESHOLDS,
-        log_activation_rms: bool = True,
         log_post_norm_metrics: bool = True,
+        log_activation_rms: bool = True,
         hook_timing_enabled: bool = False,
     ):
         super().__init__(
@@ -69,8 +73,11 @@ class MassiveActivationMonitor(TorchProbe):
         self.cosine_sample_pairs = cosine_sample_pairs
         self.sample_layers = set(sample_layers) if sample_layers else None
         self.absolute_thresholds = tuple(absolute_thresholds)
-        self.log_activation_rms = log_activation_rms
         self.log_post_norm_metrics = log_post_norm_metrics
+        # Single knob for the residual-scale/gain group: activation_rms plus the
+        # per-token spectral-norm bounds. activation_rms is derived from the same
+        # per-token pre-RMS the spectral hook computes, so they share one flag.
+        self.log_activation_rms = log_activation_rms
         self.MAX_AGGREGATED = self.MAX_AGGREGATED | {
             f"channel_count_gt_{_threshold_key(t)}" for t in self.absolute_thresholds
         }
@@ -89,10 +96,10 @@ class MassiveActivationMonitor(TorchProbe):
             "topk_channel_norm",
             "massive_act_channel_count",
         ]
-        if self.log_activation_rms:
-            names.append("activation_rms")
         if self.log_post_norm_metrics:
             names.extend(["post_norm_sparsity", "post_norm_cosine"])
+        if self.log_activation_rms:
+            names.extend(["activation_rms", "spectral_norm_max", "spectral_norm_min"])
         for t in self.absolute_thresholds:
             names.append(f"channel_count_gt_{_threshold_key(t)}")
         return tuple(names)
@@ -153,6 +160,14 @@ class MassiveActivationMonitor(TorchProbe):
                     self.timed_hook("residual", self._make_residual_hook(global_idx)), with_kwargs=True
                 )
             self.hooks.append(hook)
+            # Spectral-norm bounds need BOTH the layer input and output, so they
+            # ride a dedicated forward hook on the layer itself (the residual/
+            # input_layernorm hooks above only see the input).
+            if self.log_activation_rms:
+                spec_hook = layer.register_forward_hook(
+                    self.timed_hook("spectral_norm", self._make_spectral_norm_hook(global_idx)), with_kwargs=True
+                )
+                self.hooks.append(spec_hook)
             registered += 1
         logger.info(f"[MassiveActMonitor] Registered {registered} hooks.")
 
@@ -233,6 +248,34 @@ class MassiveActivationMonitor(TorchProbe):
 
         return hook_fn
 
+    def _make_spectral_norm_hook(self, layer_idx: int):
+        def hook_fn(module, args, kwargs, output):
+            if not self._should_monitor():
+                return
+            try:
+                pre = self._extract_hidden_states(args, kwargs)
+                post = self._first_tensor(output)
+                if pre is None or post is None:
+                    return
+
+                with torch.no_grad():
+                    self._compute_spectral_norm(layer_idx, pre.detach(), post.detach())
+            except Exception as e:
+                if self.verbose:
+                    logger.error(f"[MassiveActMonitor] Spectral-norm error at layer {layer_idx}: {e}")
+
+        return hook_fn
+
+    def _compute_spectral_norm(self, layer_idx: int, pre: torch.Tensor, post: torch.Tensor):
+        if pre.shape[-1] == 0 or pre.numel() == 0 or post.numel() == 0:
+            return
+        # pre is the layer input residual — the same tensor the input_layernorm /
+        # residual hook sees — so activation_rms is derived here for free from the
+        # per-token pre-RMS instead of squaring the input a second time.
+        tensor_metrics = compute_spectral_norm_bounds(pre, post, include_activation_rms=True)
+        for name, val in tensor_metrics.items():
+            self.record_layer_metric(layer_idx, name, val)
+
     def _compute_residual_metrics(self, layer_idx: int, hidden_states: torch.Tensor):
         per_channel_max = compute_per_channel_max(hidden_states)
         per_channel_max = self._aggregate_per_channel_max(per_channel_max)
@@ -242,8 +285,6 @@ class MassiveActivationMonitor(TorchProbe):
             k=self.topk_channels,
             absolute_thresholds=self.absolute_thresholds,
         )
-        if self.log_activation_rms:
-            tensor_metrics.update(compute_activation_scale_stats(hidden_states))
 
         for name, val in tensor_metrics.items():
             self.record_layer_metric(layer_idx, name, val)
@@ -293,8 +334,8 @@ def setup_massive_activation_monitor(
     cosine_sample_pairs: int = 256,
     sample_layers: list[int] | None = None,
     absolute_thresholds: tuple[float, ...] = DEFAULT_ABSOLUTE_THRESHOLDS,
-    log_activation_rms: bool = True,
     log_post_norm_metrics: bool = True,
+    log_activation_rms: bool = True,
     hook_timing_enabled: bool = False,
     monitor_dict: dict | None = None,
 ):
@@ -309,8 +350,8 @@ def setup_massive_activation_monitor(
         cosine_sample_pairs=cosine_sample_pairs,
         sample_layers=sample_layers,
         absolute_thresholds=absolute_thresholds,
-        log_activation_rms=log_activation_rms,
         log_post_norm_metrics=log_post_norm_metrics,
+        log_activation_rms=log_activation_rms,
         hook_timing_enabled=hook_timing_enabled,
     )
 

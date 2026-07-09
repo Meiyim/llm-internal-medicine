@@ -81,8 +81,18 @@ class CoreMonitoringTest(unittest.TestCase):
             "massive_act/layer_0/massive_act_channel_count",
             "massive_act/layer_0/channel_count_gt_100",
             "massive_act/layer_0/activation_rms",
+            "massive_act/layer_0/spectral_norm_max",
+            "massive_act/global_spectral_norm_max",
         ):
             self.assertTrue(training_logs._is_max_metric(key), key)
+
+    def test_spectral_norm_min_keys_are_min_aggregated(self):
+        for key in (
+            "massive_act/layer_0/spectral_norm_min",
+            "massive_act/global_spectral_norm_min",
+        ):
+            self.assertTrue(training_logs._is_min_metric(key), key)
+            self.assertFalse(training_logs._is_max_metric(key), key)
 
     def test_resolve_layer_idx_prefers_explicit_attrs_then_layer_number_then_offset(self):
         probe = DummyProbe()

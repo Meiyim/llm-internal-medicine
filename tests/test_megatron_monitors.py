@@ -24,6 +24,7 @@ MoESpecialistMonitor = importlib.import_module("internal_medicine.backends.megat
 moe_monitor_module = importlib.import_module("internal_medicine.backends.megatron.moe_monitor")
 PLEHealthMonitor = importlib.import_module("internal_medicine.backends.megatron.ple_monitor").PLEHealthMonitor
 training_logs = importlib.import_module("internal_medicine.core.training_logs").training_logs
+massive_activation_metrics = importlib.import_module("internal_medicine.backends.megatron.massive_activation_metrics")
 compute_sink_head_classification = importlib.import_module(
     "internal_medicine.backends.megatron.sink_head_metrics"
 ).compute_sink_head_classification
@@ -248,12 +249,60 @@ class MegatronMassiveActivationMonitorTest(unittest.TestCase):
             "channel_count_gt_2",
             "channel_count_gt_3",
             "topk_channel_norm",
-            "activation_rms",
         ):
             self.assertIn(f"massive_act/layer_0/{key}", latest)
             self.assertIn(f"massive_act/global_{key}", latest)
         self.assertEqual(latest["massive_act/layer_0/channel_count_gt_2"], 2.0)
         self.assertEqual(latest["massive_act/layer_0/channel_count_gt_3"], 1.0)
+
+    def test_spectral_norm_bounds_record_per_token_rms_ratio(self):
+        monitor = MassiveActivationMonitor(
+            log_per_layer=True,
+            log_global=True,
+            log_post_norm_metrics=False,
+        )
+        pre = torch.tensor(
+            [
+                [[1.0, -2.0, 0.5, 4.0]],
+                [[3.0, 1.0, -0.5, 2.0]],
+            ]
+        )
+        # post = 2 * pre => per-token RMS ratio is exactly 2.0 for every token,
+        # so both the max and min bound collapse to 2.0.
+        post = pre * 2.0
+        for name in monitor._layer_metric_names():
+            monitor.declare_layer_metric(0, name)
+        monitor.allocate_buffers(pre.device)
+
+        monitor._compute_spectral_norm(0, pre, post)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="massive_act")
+        for key in ("spectral_norm_max", "spectral_norm_min"):
+            self.assertIn(f"massive_act/layer_0/{key}", latest)
+            self.assertIn(f"massive_act/global_{key}", latest)
+        self.assertAlmostEqual(latest["massive_act/layer_0/spectral_norm_max"], 2.0, places=5)
+        self.assertAlmostEqual(latest["massive_act/layer_0/spectral_norm_min"], 2.0, places=5)
+        # activation_rms is derived from the shared per-token pre-RMS, not a second
+        # square of the input: it must equal sqrt(mean(pre**2)) over the whole input.
+        self.assertIn("massive_act/layer_0/activation_rms", latest)
+        expected_rms = pre.reshape(-1, pre.shape[-1]).float().square().mean().sqrt().item()
+        self.assertAlmostEqual(latest["massive_act/layer_0/activation_rms"], expected_rms, places=5)
+
+    def test_derived_activation_rms_matches_original_formula(self):
+        # Regression guard: the merged/derived activation_rms (from the spectral
+        # hook's per-token pre-RMS) must be numerically identical to the original
+        # standalone compute_activation_scale_stats(h) over the same tensor.
+        torch.manual_seed(0)
+        hidden_states = torch.randn(7, 3, 5) * 4.0 + 1.5  # [S, B, H], non-trivial scale
+
+        original = massive_activation_metrics.compute_activation_scale_stats(hidden_states)["activation_rms"]
+        # activation_rms depends only on the pre tensor; post is irrelevant to it.
+        derived = massive_activation_metrics.compute_spectral_norm_bounds(
+            hidden_states, torch.zeros_like(hidden_states), include_activation_rms=True
+        )["activation_rms"]
+
+        self.assertTrue(torch.allclose(original, derived, rtol=0, atol=1e-6), f"{original} != {derived}")
 
 
 class SinkHeadClassificationTest(unittest.TestCase):

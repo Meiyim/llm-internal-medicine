@@ -16,6 +16,10 @@ Core metrics:
 8. Post-Norm Sparsity — fraction of near-zero entries after RMSNorm (sparsification)
 9. Post-Norm Cosine Stability — cosine similarity of normalized representations
    across tokens (near-constant vector detection)
+10. Spectral Norm Bounds — per-token residual gain ratio (post_layer_rms /
+    pre_layer_rms). The max ratio over the global batch lower-bounds the layer's
+    spectral norm (largest singular value); the min ratio upper-bounds its
+    smallest singular value.
 
 All metrics compute local values only; cross-rank aggregation is handled
 by training_logs.gather_and_aggregate().
@@ -48,6 +52,48 @@ def compute_activation_scale_stats(hidden_states: torch.Tensor) -> dict[str, tor
     return {
         "activation_rms": h.square().mean().sqrt(),
     }
+
+
+def compute_spectral_norm_bounds(
+    pre_hidden: torch.Tensor,
+    post_hidden: torch.Tensor,
+    eps: float = 1e-8,
+    include_activation_rms: bool = False,
+) -> dict[str, torch.Tensor]:
+    """Per-token residual gain ratio (post_layer_rms / pre_layer_rms) reduced to
+    max/min bounds on the layer's spectral norm.
+
+    For each token, ``rms(y_t) / rms(x_t) == ||y_t|| / ||x_t||`` (the ``sqrt(H)``
+    cancels), the gain of the residual block on that token. Over all tokens:
+
+    - ``spectral_norm_max`` (max ratio) lower-bounds the layer's largest singular
+      value (spectral norm): every observed gain is <= sup_x ||f(x)||/||x||.
+    - ``spectral_norm_min`` (min ratio) upper-bounds the smallest singular value:
+      every observed gain is >= inf_x ||f(x)||/||x||.
+
+    Both inputs are the full-H residual ([S, B, H] or [B, S, H]); the RMS is a true
+    full-vector RMS, so no TP channel reduction is needed. The max/min compose
+    across token-partitioned ranks via ``training_logs.gather_and_aggregate``.
+
+    When ``include_activation_rms`` is set, the input residual's global RMS
+    (``activation_rms``) is derived from the same per-token ``pre_rms`` for free
+    (``activation_rms == sqrt(mean_t(pre_rms_t**2))``), so callers that already run
+    this function need not recompute it in a separate pass.
+
+    Returns 0-dim GPU tensors (no host sync).
+    """
+    pre = pre_hidden.reshape(-1, pre_hidden.shape[-1]).float()
+    post = post_hidden.reshape(-1, post_hidden.shape[-1]).float()
+    pre_rms = pre.square().mean(dim=-1).sqrt()
+    post_rms = post.square().mean(dim=-1).sqrt()
+    ratio = post_rms / pre_rms.clamp(min=eps)
+    metrics = {
+        "spectral_norm_max": ratio.max(),
+        "spectral_norm_min": ratio.min(),
+    }
+    if include_activation_rms:
+        metrics["activation_rms"] = pre_rms.square().mean().sqrt()
+    return metrics
 
 
 def _nearest_quantile_from_sorted(sorted_values: torch.Tensor, q: float) -> torch.Tensor:

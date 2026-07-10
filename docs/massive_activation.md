@@ -1,6 +1,6 @@
 # Massive Activation Monitor
 
-**Residual Stream Massive Activation 健康监控模块**，监控 15 个核心指标。
+**Residual Stream Massive Activation 健康监控模块**，监控 17 个核心指标。
 
 基于论文发现实现：
 
@@ -229,6 +229,49 @@ spectral_norm_min = min_t(ratio_t)     # 在一个 global batch 内对所有 tok
 
 ---
 
+### 11. Lipschitz / Gradient-Gain Bounds (每层 Lipschitz 常数)
+
+**数学公式：**
+```
+dx_t = ∂L/∂x_t   (loss 对该层输入 hidden 的梯度)
+dy_t = ∂L/∂y_t   (loss 对该层输出 hidden 的梯度)
+ratio_t = ||dx_t|| / ||dy_t|| = ||Jᵀ dy_t|| / ||dy_t||   (每 token, sqrt(H) 约掉)
+lipschitz_max = max_t(ratio_t)   # 一个 global batch 内对所有 token 取 max
+lipschitz_min = min_t(ratio_t)   # 一个 global batch 内对所有 token 取 min
+```
+
+反向传播给出 `∂L/∂x = Jᵀ·∂L/∂y`（`J = ∂y/∂x` 为该层前向映射的 Jacobian）。因为 `J` 与
+`Jᵀ` 奇异值相同，每 token 的梯度增益比 `||dx_t||/||dy_t||` 即 `Jᵀ` 作用在观测梯度上的增益。
+在一个 global batch 内对所有 token 归约：
+
+- `lipschitz_max`（ratio 的最大值）是该层 **σ_max(J) 的下界** —— 即该层前向映射
+  **Lipschitz 常数的下界**：任意观测增益 ≤ `sup_v ||Jᵀv||/||v||`。
+- `lipschitz_min`（ratio 的最小值）是该层 **σ_min(J) 的上界**：任意观测增益 ≥ `inf_v ||Jᵀv||/||v||`。
+
+它同时直接刻画反向传播中的**梯度放大系数**：`lipschitz_max > 1` 表示梯度反向穿过该层时被放大
+（爆炸风险），`<< 1` 表示被压缩（消失风险）。
+
+**实现要点：**
+- 该指标是**反向**量，但由 forward hook 在层的输入/输出 hidden 张量上注册 tensor grad hook
+  （`.register_hook`）来采集 —— 因为 Megatron 以全 keyword 参数调用 layer，module 级
+  `register_full_backward_hook` 的 `grad_input` 为空，拿不到输入梯度。
+- forward hook 的 grad guard（`torch.is_grad_enabled()`）会跳过 activation recompute 的初始
+  no-grad 前向，只在 grad-enabled 的重算前向上注册，故 grad hook **恰好触发一次**（已在
+  reentrant / non-reentrant checkpoint 下验证）。
+- 输入/输出梯度均为完整 H 向量，每 token RMS 是真实全向量 RMS，**无需 TP 通道归约**；
+  max/min 跨 token-partition rank 由 `gather_and_aggregate()` 在 flush 时 `all_gather` +
+  max/min 合成，**hook 内无 collective**。
+- 每 token 分解忽略了 attention 的 token 耦合（真实 Jacobian 会混合 token），与前向
+  `spectral_norm` 指标做同样的简化近似。
+- 仅在训练反向传播的 monitored step 记录（eval/inference 下 `requires_grad=False` 会跳过）；
+  被 CUDA graph 捕获的层不触发 eager hook，因而不产出该指标。
+
+**诊断意义：**
+- `lipschitz_max` 持续 > 1 且上升 → 该层反向放大梯度，谱范数/Lipschitz 增大，关注梯度爆炸与训练稳定性
+- `lipschitz_min` 远小于 1 → 该层对部分方向强烈压缩梯度，关注梯度消失
+
+---
+
 ## 健康阈值参考
 
 | 指标 | 值 | 状态 | 说明 |
@@ -255,6 +298,10 @@ spectral_norm_min = min_t(ratio_t)     # 在一个 global batch 内对所有 tok
 | | 持续 > 1 且上升 | WARNING | 层放大残差流，关注 spike/训练稳定性 |
 | `spectral_norm_min` | ~1.0 | NORMAL | 层增益接近恒等 |
 | | << 1.0 | WARNING | 对部分 token 强烈压缩 |
+| `lipschitz_max` | ~1.0 | NORMAL | 层 Jacobian 增益接近恒等 |
+| | 持续 > 1 且上升 | WARNING | 反向梯度放大，Lipschitz 增大，关注梯度爆炸 |
+| `lipschitz_min` | ~1.0 | NORMAL | 层 Jacobian 增益接近恒等 |
+| | << 1.0 | WARNING | 对部分方向强烈压缩梯度，关注梯度消失 |
 
 ---
 

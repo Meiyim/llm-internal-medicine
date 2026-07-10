@@ -83,6 +83,8 @@ class CoreMonitoringTest(unittest.TestCase):
             "massive_act/layer_0/activation_rms",
             "massive_act/layer_0/spectral_norm_max",
             "massive_act/global_spectral_norm_max",
+            "massive_act/layer_0/lipschitz_max",
+            "massive_act/global_lipschitz_max",
         ):
             self.assertTrue(training_logs._is_max_metric(key), key)
 
@@ -90,6 +92,8 @@ class CoreMonitoringTest(unittest.TestCase):
         for key in (
             "massive_act/layer_0/spectral_norm_min",
             "massive_act/global_spectral_norm_min",
+            "massive_act/layer_0/lipschitz_min",
+            "massive_act/global_lipschitz_min",
         ):
             self.assertTrue(training_logs._is_min_metric(key), key)
             self.assertFalse(training_logs._is_max_metric(key), key)

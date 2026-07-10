@@ -20,6 +20,11 @@ Core metrics:
     pre_layer_rms). The max ratio over the global batch lower-bounds the layer's
     spectral norm (largest singular value); the min ratio upper-bounds its
     smallest singular value.
+11. Lipschitz / Gradient-Gain Bounds — per-token backward gradient-gain ratio
+    (‖∂L/∂x‖ / ‖∂L/∂y‖). Since backprop gives ∂L/∂x = Jᵀ·∂L/∂y, this is the gain
+    of the layer Jacobian's transpose on the observed gradient; the max over the
+    global batch lower-bounds σ_max(J) (the layer's Lipschitz constant) and the
+    min upper-bounds σ_min(J). Captured in the backward pass (see the monitor).
 
 All metrics compute local values only; cross-rank aggregation is handled
 by training_logs.gather_and_aggregate().
@@ -94,6 +99,54 @@ def compute_spectral_norm_bounds(
     if include_activation_rms:
         metrics["activation_rms"] = pre_rms.square().mean().sqrt()
     return metrics
+
+
+def compute_grad_gain_bounds(
+    grad_in: torch.Tensor,
+    grad_out: torch.Tensor,
+    eps: float = 1e-8,
+) -> dict[str, torch.Tensor]:
+    """Per-token backward gradient-gain ratio (‖∂L/∂x‖ / ‖∂L/∂y‖) reduced to
+    max/min bounds on the layer's Jacobian singular values (its Lipschitz constant).
+
+    ``grad_in`` is the gradient of the loss w.r.t. the layer INPUT hidden states
+    (∂L/∂x); ``grad_out`` is the gradient w.r.t. the layer OUTPUT hidden states
+    (∂L/∂y). Backprop through the layer map ``f: x -> y`` gives ``∂L/∂x = Jᵀ·∂L/∂y``
+    with ``J = ∂y/∂x``, so per token
+
+        ``rms(grad_in_t) / rms(grad_out_t) == ‖∂L/∂x_t‖ / ‖∂L/∂y_t‖ == ‖Jᵀ dy_t‖ / ‖dy_t‖``
+
+    (the ``sqrt(H)`` cancels), the gain of ``Jᵀ`` on the observed gradient. Over all
+    tokens, and since ``J`` and ``Jᵀ`` share singular values:
+
+    - ``lipschitz_max`` (max ratio) lower-bounds ``σ_max(J)`` — the layer's spectral
+      norm, i.e. its Lipschitz constant: every observed gain is <= sup_v ‖Jᵀv‖/‖v‖.
+    - ``lipschitz_min`` (min ratio) upper-bounds ``σ_min(J)``: every observed gain is
+      >= inf_v ‖Jᵀv‖/‖v‖.
+
+    It also reads directly as the layer's gradient amplification in backprop:
+    ``lipschitz_max > 1`` => gradients grow passing backward through the layer
+    (explosion risk); ``<< 1`` => they shrink (vanishing risk).
+
+    Both inputs are the full-H hidden-state gradient ([S, B, H] or [B, S, H]); the RMS
+    is a true full-vector RMS, so no TP channel reduction is needed. The max/min compose
+    across token-partitioned ranks via ``training_logs.gather_and_aggregate``.
+
+    The per-token decomposition ignores the sequence coupling introduced by attention
+    (the true Jacobian mixes tokens); it is the same simplification the forward
+    ``compute_spectral_norm_bounds`` metric makes.
+
+    Returns 0-dim GPU tensors (no host sync).
+    """
+    gin = grad_in.reshape(-1, grad_in.shape[-1]).float()
+    gout = grad_out.reshape(-1, grad_out.shape[-1]).float()
+    in_rms = gin.square().mean(dim=-1).sqrt()
+    out_rms = gout.square().mean(dim=-1).sqrt()
+    ratio = in_rms / out_rms.clamp(min=eps)
+    return {
+        "lipschitz_max": ratio.max(),
+        "lipschitz_min": ratio.min(),
+    }
 
 
 def _nearest_quantile_from_sorted(sorted_values: torch.Tensor, q: float) -> torch.Tensor:

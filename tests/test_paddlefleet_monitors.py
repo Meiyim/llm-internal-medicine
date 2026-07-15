@@ -124,6 +124,43 @@ class PaddleLayerDiscoveryTest(unittest.TestCase):
 
         self.assertEqual(layer_discovery.get_decoder_layers(model), [layer])
 
+    def test_classify_attn_type_reads_is_swa_flag(self):
+        """classify_attn_type returns swa/full based on self_attn.is_swa, None if absent."""
+        swa_layer = SimpleNamespace(self_attn=SimpleNamespace(is_swa=True))
+        full_layer = SimpleNamespace(self_attn=SimpleNamespace(is_swa=False))
+        untagged_layer = SimpleNamespace(self_attn=SimpleNamespace())  # no is_swa
+        no_attn_layer = SimpleNamespace()  # no self_attn at all
+
+        self.assertEqual(layer_discovery.classify_attn_type(swa_layer), "swa")
+        self.assertEqual(layer_discovery.classify_attn_type(full_layer), "full")
+        self.assertIsNone(layer_discovery.classify_attn_type(untagged_layer))
+        self.assertIsNone(layer_discovery.classify_attn_type(no_attn_layer))
+
+    def test_classify_attn_type_falls_back_to_self_attention(self):
+        """Some models expose the module as ``self_attention`` instead of ``self_attn``."""
+        swa_layer = SimpleNamespace(self_attention=SimpleNamespace(is_swa=True))
+        self.assertEqual(layer_discovery.classify_attn_type(swa_layer), "swa")
+
+    def test_iter_monitor_layers_populates_attn_type_for_swa_and_full(self):
+        """MonitorLayer.attn_type is populated per layer for models that mix SWA and full."""
+        # Simulate ernie-lite: layer 0 full, layer 1 SWA, layer 2 full
+        full_layer_a = SimpleNamespace(self_attn=SimpleNamespace(is_swa=False))
+        swa_layer = SimpleNamespace(self_attn=SimpleNamespace(is_swa=True))
+        full_layer_b = SimpleNamespace(self_attn=SimpleNamespace(is_swa=False))
+
+        result = layer_discovery.iter_monitor_layers(
+            [full_layer_a, swa_layer, full_layer_b], lambda layer: hasattr(layer, "self_attn")
+        )
+
+        self.assertEqual([item.attn_type for item in result], ["full", "swa", "full"])
+
+    def test_iter_monitor_layers_attn_type_is_none_for_backward_compat_models(self):
+        """Models without an is_swa flag (eb5_v2 / dsv4) must yield attn_type=None."""
+        layer = SimpleNamespace(self_attn=SimpleNamespace())  # no is_swa
+        result = layer_discovery.iter_monitor_layers([layer], lambda x: hasattr(x, "self_attn"))
+        self.assertEqual(len(result), 1)
+        self.assertIsNone(result[0].attn_type)
+
 
 class PaddleMoEMonitorTest(unittest.TestCase):
     def setUp(self):
@@ -165,6 +202,38 @@ class PaddleMoEMonitorTest(unittest.TestCase):
         latest = training_logs.get_latest(prefix="moe_health")
         self.assertAlmostEqual(latest["moe_health/global_router_entropy"], 3.0, places=4)
         self.assertAlmostEqual(latest["moe_health/global_score_sum_max"], 0.9, places=4)
+
+    def test_attn_type_tag_produces_typed_keys_and_split_global_aggregation(self):
+        """When declare/record_layer_metric receives attn_type, keys are
+        ``{prefix}/layer_N/{type}_{metric}`` and ``{prefix}/global_{type}_{metric}``.
+        SWA and full aggregate independently -- window vs full never mix.
+
+        MoE monitor is used here as a convenient concrete PaddleProbe subclass;
+        in production attn_type only flows through attention-family monitors.
+        """
+        monitor = PaddleMoEMonitor(log_per_layer=True, log_global=True)
+        # layer 0 is full, layer 1 is swa, layer 2 is full
+        monitor.declare_layer_metric(0, "router_entropy", attn_type="full")
+        monitor.declare_layer_metric(1, "router_entropy", attn_type="swa")
+        monitor.declare_layer_metric(2, "router_entropy", attn_type="full")
+        monitor.allocate_buffers()
+
+        monitor.record_layer_metric(0, "router_entropy", paddle.to_tensor(2.0), attn_type="full")
+        monitor.record_layer_metric(1, "router_entropy", paddle.to_tensor(10.0), attn_type="swa")
+        monitor.record_layer_metric(2, "router_entropy", paddle.to_tensor(4.0), attn_type="full")
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="moe_health")
+        # Per-layer keys carry the attn_type prefix on the metric name.
+        self.assertAlmostEqual(latest["moe_health/layer_0/full_router_entropy"], 2.0, places=4)
+        self.assertAlmostEqual(latest["moe_health/layer_1/swa_router_entropy"], 10.0, places=4)
+        self.assertAlmostEqual(latest["moe_health/layer_2/full_router_entropy"], 4.0, places=4)
+        # Global aggregations split by attn_type: SWA global uses only layer 1;
+        # full global averages layer 0 and layer 2. There is no untagged
+        # ``global_router_entropy`` when all layers are typed.
+        self.assertAlmostEqual(latest["moe_health/global_swa_router_entropy"], 10.0, places=4)
+        self.assertAlmostEqual(latest["moe_health/global_full_router_entropy"], 3.0, places=4)
+        self.assertNotIn("moe_health/global_router_entropy", latest)
 
     def test_fused_expert_norm_matches_per_expert_concat_norm(self):
         """Vectorized per-expert norm equals the old concat([w1_i, w2_i]).norm()."""

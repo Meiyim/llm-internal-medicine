@@ -164,7 +164,7 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
             if self.sample_layers and item.idx not in self.sample_layers:
                 continue
             for m in metric_names:
-                self.declare_layer_metric(item.idx, m)
+                self.declare_layer_metric(item.idx, m, attn_type=item.attn_type)
             registered += 1
 
         self.allocate_buffers()
@@ -172,12 +172,12 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
         for item in monitor_layers:
             if self.sample_layers and item.idx not in self.sample_layers:
                 continue
-            hook = item.layer.register_forward_pre_hook(self._make_residual_hook(item.idx))
+            hook = item.layer.register_forward_pre_hook(self._make_residual_hook(item.idx, item.attn_type))
             self.hooks.append(hook)
 
         logger.info(f"[MassiveActMonitor] Registered {registered} hooks.")
 
-    def _make_residual_hook(self, layer_idx: int):
+    def _make_residual_hook(self, layer_idx: int, attn_type: str | None = None):
         def hook_fn(module, inputs):
             if not module.training:
                 return
@@ -189,7 +189,7 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
                     return
 
                 with paddle.no_grad():
-                    self._compute_and_log(layer_idx, hidden_states.detach(), module)
+                    self._compute_and_log(layer_idx, hidden_states.detach(), module, attn_type=attn_type)
             except Exception as e:
                 if self.verbose:
                     logger.error(f"[MassiveActMonitor] Error at layer {layer_idx}: {e}")
@@ -213,7 +213,9 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
             return first
         return None
 
-    def _compute_and_log(self, layer_idx: int, hidden_states: paddle.Tensor, module: nn.Layer):
+    def _compute_and_log(
+        self, layer_idx: int, hidden_states: paddle.Tensor, module: nn.Layer, attn_type: str | None = None
+    ):
         # HyperConnection (e.g. DSv4): the residual stream is expanded to [..., n*h].
         hc = getattr(module, "self_attention_hyper_connection", None)
         analysis_input = hidden_states
@@ -241,9 +243,9 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
         scale_stats = compute_activation_scale_stats(analysis_input)
 
         for name, val in stats.items():
-            self.record_layer_metric(layer_idx, name, val)
+            self.record_layer_metric(layer_idx, name, val, attn_type=attn_type)
         for name, val in scale_stats.items():
-            self.record_layer_metric(layer_idx, name, val)
+            self.record_layer_metric(layer_idx, name, val, attn_type=attn_type)
 
         norm_layer = getattr(module, "input_layernorm", None)
         if norm_layer is not None:
@@ -255,11 +257,13 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
                     layer_idx,
                     "post_norm_sparsity",
                     compute_post_norm_sparsity(normalized, epsilon=self.sparsity_epsilon),
+                    attn_type=attn_type,
                 )
                 self.record_layer_metric(
                     layer_idx,
                     "post_norm_cosine",
                     compute_post_norm_cosine_stability(normalized, num_sample_pairs=self.cosine_sample_pairs),
+                    attn_type=attn_type,
                 )
             except Exception as e:
                 if self.verbose and layer_idx not in self._post_norm_failed_layers:

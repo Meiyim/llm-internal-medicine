@@ -131,28 +131,41 @@ class PaddleProbe(Probe):
     # Convenience: declare/record using class-level aggregation rules
     # ------------------------------------------------------------------
 
-    def _layer_key(self, layer_idx: int, metric_name: str) -> str:
+    def _layer_key(self, layer_idx: int, metric_name: str, attn_type: str | None = None) -> str:
+        # Attention-type prefix (``swa_`` / ``full_``) goes on the metric name,
+        # not the layer number, so the viewer's ``layer_(\d+)/(sub)`` regex
+        # still matches and its per-(monitor, sub) grouping naturally splits
+        # window vs full charts. ``attn_type=None`` keeps the legacy key.
+        if attn_type is not None:
+            return f"{self.METRIC_PREFIX}/layer_{layer_idx}/{attn_type}_{metric_name}"
         return f"{self.METRIC_PREFIX}/layer_{layer_idx}/{metric_name}"
 
-    def _global_key(self, metric_name: str) -> str:
+    def _global_key(self, metric_name: str, attn_type: str | None = None) -> str:
+        if attn_type is not None:
+            return f"{self.METRIC_PREFIX}/global_{attn_type}_{metric_name}"
         return f"{self.METRIC_PREFIX}/global_{metric_name}"
 
     def _should_disable_explicit_key(self, key: str) -> bool:
         return key.startswith(f"{self.METRIC_PREFIX}/global_") and not self.log_global
 
-    def declare_layer_metric(self, layer_idx: int, metric_name: str) -> None:
+    def declare_layer_metric(self, layer_idx: int, metric_name: str, attn_type: str | None = None) -> None:
         """声明一个 per-layer 指标。
 
         1. 根据 MAX_AGGREGATED/MIN_AGGREGATED 选择聚合方式，注册 layer key
         2. 建立 layer_key → global_key 的分组映射，flush 时自动推导 global
+
+        ``attn_type`` (optional): when set (``"swa"`` / ``"full"``), the tag is
+        prepended to ``metric_name`` in both layer and global keys so the
+        viewer renders window vs full statistics in separate charts. When
+        ``None``, legacy key layout is preserved.
         """
         if not (self.log_per_layer or self.log_global):
             return
-        layer_key = self._layer_key(layer_idx, metric_name)
-        global_key = self._global_key(metric_name)
+        layer_key = self._layer_key(layer_idx, metric_name, attn_type=attn_type)
+        global_key = self._global_key(metric_name, attn_type=attn_type)
         all_declared = self._mean_keys | self._max_keys | self._min_keys
         assert global_key not in all_declared
-        # 根据类级别聚合规则选择 declare 方式
+        # 根据类级别聚合规则选择 declare 方式 (基于原始 metric_name，attn_type 不改变聚合语义)
         if self._is_max_aggregated(metric_name):
             agg = "max"
             if layer_key not in all_declared:
@@ -176,11 +189,13 @@ class PaddleProbe(Probe):
             assert existing[0] == agg
             existing[1].append(layer_key)
 
-    def record_layer_metric(self, layer_idx: int, metric_name: str, val: paddle.Tensor) -> None:
+    def record_layer_metric(
+        self, layer_idx: int, metric_name: str, val: paddle.Tensor, attn_type: str | None = None
+    ) -> None:
         """热路径：只写 per-layer 累加器，global 在 flush 时从各层推导。"""
         if not (self.log_per_layer or self.log_global):
             return
-        layer_key = self._layer_key(layer_idx, metric_name)
+        layer_key = self._layer_key(layer_idx, metric_name, attn_type=attn_type)
         if self._is_max_aggregated(metric_name):
             self.record_max(layer_key, val)
         elif metric_name in self.MIN_AGGREGATED:

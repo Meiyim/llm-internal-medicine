@@ -98,6 +98,8 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
         }
         self.tp_size = 1
         self.tp_group = None
+        self.cp_size = 1
+        self.cp_group = None
         self._warned_per_channel_aggregate = False
         self._post_norm_failed_layers: set[int] = set()
         self._hc_aggregate_failed_layers: set[int] = set()
@@ -116,6 +118,15 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
             pg = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp"])
             self.tp_group = pg.tp
             self.tp_size = get_pg_size(pg.tp)
+        except Exception:
+            pass
+        try:
+            from paddlefleet.process_groups_config import ProcessGroupCollection
+            from paddlefleet.utils import get_pg_size
+
+            pg = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["cp"])
+            self.cp_group = pg.cp
+            self.cp_size = get_pg_size(pg.cp)
         except Exception:
             pass
 
@@ -256,17 +267,39 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
                     self._post_norm_failed_layers.add(layer_idx)
 
     def _aggregate_per_channel_max(self, per_channel_max: paddle.Tensor) -> paddle.Tensor:
-        """Aggregate token-sharded per-channel maxima across the TP group when available."""
-        if self.tp_size <= 1 or self.tp_group is None:
-            return per_channel_max
+        """Aggregate token-sharded per-channel maxima across TP + CP groups when available.
+
+        - TP MAX all_reduce: covers SP-in-TP (residual stream sharded along seq
+          within the TP group under PaddleFleet's SP convention).
+        - CP MAX all_reduce: covers Context Parallel, which shards the sequence
+          dim over an independent CP group. Without this, each CP rank only sees
+          its local S/CP tokens and per-channel-max is a strict lower bound of
+          the true global max.
+
+        Both collectives are correctness-required (see monitor-hook-perf-rules
+        exception clause) and use MAX ops that are safe under repeated calls.
+        """
         try:
             import paddle.distributed as dist
-
-            dist.all_reduce(per_channel_max, op=dist.ReduceOp.MAX, group=self.tp_group)
         except Exception as e:
             if self.verbose and not self._warned_per_channel_aggregate:
-                logger.warning(f"[MassiveActMonitor] TP per-channel aggregation failed; using local values: {e}")
+                logger.warning(f"[MassiveActMonitor] paddle.distributed unavailable: {e}")
                 self._warned_per_channel_aggregate = True
+            return per_channel_max
+        if self.tp_size > 1 and self.tp_group is not None:
+            try:
+                dist.all_reduce(per_channel_max, op=dist.ReduceOp.MAX, group=self.tp_group)
+            except Exception as e:
+                if self.verbose and not self._warned_per_channel_aggregate:
+                    logger.warning(f"[MassiveActMonitor] TP per-channel aggregation failed: {e}")
+                    self._warned_per_channel_aggregate = True
+        if self.cp_size > 1 and self.cp_group is not None:
+            try:
+                dist.all_reduce(per_channel_max, op=dist.ReduceOp.MAX, group=self.cp_group)
+            except Exception as e:
+                if self.verbose and not self._warned_per_channel_aggregate:
+                    logger.warning(f"[MassiveActMonitor] CP per-channel aggregation failed: {e}")
+                    self._warned_per_channel_aggregate = True
         return per_channel_max
 
 

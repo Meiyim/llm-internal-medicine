@@ -236,6 +236,8 @@ class PaddleQKStatsMonitor(PaddleProbe):
         )
         self.causal = causal
         self.tp_size = 1
+        self.cp_size = 1
+        self.cp_group = None
         self.pp_rank = 0
         self.sink_head_threshold = sink_head_threshold
         if int(row_stride) < 1:
@@ -243,6 +245,9 @@ class PaddleQKStatsMonitor(PaddleProbe):
         self.row_stride = int(row_stride)
         # Warn at most once if a runtime seq_len ends up smaller than row_stride.
         self._warned_row_stride_gt_seqlen = False
+        # Warn at most once if the CP-gather path fails at runtime (fallback:
+        # skip this hook invocation entirely to preserve correctness).
+        self._warned_cp_gather_failed = False
 
     def register_hooks(self, model: nn.Layer):
         try:
@@ -251,6 +256,16 @@ class PaddleQKStatsMonitor(PaddleProbe):
 
             pg = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp"])
             self.tp_size = get_pg_size(pg.tp)
+        except Exception:
+            pass
+
+        try:
+            from paddlefleet.process_groups_config import ProcessGroupCollection
+            from paddlefleet.utils import get_pg_size
+
+            pg = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["cp"])
+            self.cp_group = pg.cp
+            self.cp_size = get_pg_size(pg.cp)
         except Exception:
             pass
 
@@ -267,7 +282,21 @@ class PaddleQKStatsMonitor(PaddleProbe):
             return
 
         if self.verbose:
-            logger.info(f"[PaddleQKMonitor] Found {len(attention_layers)} attention layers. TP={self.tp_size}")
+            logger.info(
+                f"[PaddleQKMonitor] Found {len(attention_layers)} attention layers. "
+                f"TP={self.tp_size} CP={self.cp_size}"
+            )
+
+        if self.cp_size > 1:
+            logger.warning(
+                "[PaddleQKMonitor] CP=%d detected. To preserve exact metric "
+                "semantics the hook will all_gather Q/K across the CP group on "
+                "every monitored step; this adds significant traffic and "
+                "compute. If you do not need qk_stats under CP, remove "
+                "'qk_stats' from internal_medicine_monitors, or raise "
+                "internal_medicine_monitor_interval to sample less often.",
+                self.cp_size,
+            )
 
         for layer_idx, _ in attention_layers:
             for m in (
@@ -312,7 +341,33 @@ class PaddleQKStatsMonitor(PaddleProbe):
                 attention_layers.append((item.idx, attn))
         return attention_layers
 
-    def _make_compute_hook(self, layer_idx: int):
+    def _cp_gather_seq(self, tensor: paddle.Tensor) -> paddle.Tensor | None:
+        """All-gather ``tensor`` along its seq dim across the CP group."""
+        if self.cp_group is None or self.cp_size <= 1:
+            return tensor
+        try:
+            import paddle.distributed as dist
+
+            # all_gather concatenates along axis=0. Move seq to axis 0 first,
+            # gather, then reshape back to [B, S_full, H, D].
+            # tensor: [B, S_local, H, D] -> [S_local, B, H, D]
+            t = tensor.transpose([1, 0, 2, 3]).contiguous()
+            gathered = paddle.empty([self.cp_size * t.shape[0], *t.shape[1:]], dtype=t.dtype)
+            dist.all_gather(gathered, t, group=self.cp_group)
+            # gathered: [S_full, B, H, D] -> [B, S_full, H, D]
+            return gathered.transpose([1, 0, 2, 3]).contiguous()
+        except Exception as e:
+            if not self._warned_cp_gather_failed:
+                logger.warning(
+                    "[PaddleQKMonitor] CP all_gather failed (%s); skipping qk_stats "
+                    "for this step to preserve correctness. Consider removing "
+                    "qk_stats from internal_medicine_monitors under CP.",
+                    e,
+                )
+                self._warned_cp_gather_failed = True
+            return None
+
+    def _make_compute_hook(self, layer_idx: int, attn_type: str | None = None):
         def hook_fn(layer, inputs):
             if not layer.training:
                 return
@@ -321,6 +376,13 @@ class PaddleQKStatsMonitor(PaddleProbe):
             try:
                 query, key = inputs[0], inputs[1]
                 with paddle.no_grad():
+                    if self.cp_size > 1:
+                        gathered_q = self._cp_gather_seq(query.detach())
+                        gathered_k = self._cp_gather_seq(key.detach())
+                        if gathered_q is None or gathered_k is None:
+                            return
+                        query, key = gathered_q, gathered_k
+
                     # query: [B, S, H, D]; seq_len is a static shape int (no D2H sync).
                     seq_len = query.shape[1]
                     effective_stride = self.row_stride

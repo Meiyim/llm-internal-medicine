@@ -2,6 +2,11 @@
 
 Computes per-head: max logit, mean logit, entropy, sink weight
 using online softmax (O(S) memory, no S×S materialization).
+
+Supports asymmetric Q/K sequence lengths for Context-Parallel (CP) monitoring:
+each CP rank keeps its local Q shard (``seq_len_q = S/CP``) but sees the
+full-sequence K (``seq_len_k = S``) after an all_gather. Passing
+``q_row_offset = cp_rank * seq_len_q`` restores correct causal masking.
 """
 
 import triton
@@ -21,10 +26,13 @@ def qk_stats_kernel(
     # Shapes
     batch,
     num_heads,
-    seq_len,
+    seq_len_q,
+    seq_len_k,
     head_dim,
     # GQA: number of query heads sharing one KV head (1 == MHA)
     heads_per_group,
+    # Query row offset in the global sequence (0 unless CP > 1)
+    q_row_offset,
     # Strides
     stride_q_batch,
     stride_q_head,
@@ -49,6 +57,10 @@ def qk_stats_kernel(
     Grid: (batch * num_heads,) — one program per (batch, query-head).
     Input layout: [B, H, S, D].
 
+    Asymmetric Q/K seq lens (for CP): ``seq_len_q`` may be smaller than
+    ``seq_len_k``. Row m in Q corresponds to *global* row ``m + q_row_offset``
+    which is used only for causal masking against K columns.
+
     GQA: K is indexed by ``head_idx // heads_per_group`` so the caller does
     NOT need to materialize a ``repeat_interleave`` of the KV tensor. Pass
     ``heads_per_group=1`` for MHA (no grouping).
@@ -71,6 +83,7 @@ def qk_stats_kernel(
 
     head_max_logit = -1e10
     head_sum_logit = 0.0
+    head_sum_row_mean = 0.0  # sum over valid rows of (per-row mean logit)
     head_valid_count = 0.0
     head_sum_entropy = 0.0
     head_sum_sink = 0.0
@@ -78,9 +91,11 @@ def qk_stats_kernel(
 
     # Stride between consecutive visited query rows within a block.
     m_block_span = BLOCK_M * ROW_STRIDE
-    for m_start in range(0, seq_len, m_block_span):
+    for m_start in range(0, seq_len_q, m_block_span):
         m_offsets = m_start + tl.arange(0, BLOCK_M) * ROW_STRIDE
-        m_mask = m_offsets < seq_len
+        m_mask = m_offsets < seq_len_q
+        # Global row index used for causal masking against K columns
+        m_global = m_offsets + q_row_offset
 
         m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - 1e10
         d_i = tl.zeros([BLOCK_M], dtype=tl.float32)
@@ -92,13 +107,16 @@ def qk_stats_kernel(
         row_count_raw = tl.zeros([BLOCK_M], dtype=tl.float32)
 
         if apply_causal_mask:
-            n_stop = tl.minimum(m_start + (BLOCK_M - 1) * ROW_STRIDE + BLOCK_N, seq_len)
+            n_stop = tl.minimum(
+                q_row_offset + m_start + (BLOCK_M - 1) * ROW_STRIDE + BLOCK_N,
+                seq_len_k,
+            )
         else:
-            n_stop = seq_len
+            n_stop = seq_len_k
 
         for n_start in range(0, n_stop, BLOCK_N):
             n_offsets = n_start + tl.arange(0, BLOCK_N)
-            n_mask = n_offsets < seq_len
+            n_mask = n_offsets < seq_len_k
 
             acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
@@ -118,7 +136,7 @@ def qk_stats_kernel(
 
             mask_val = n_mask[None, :] & m_mask[:, None]
             if apply_causal_mask:
-                causal = m_offsets[:, None] >= n_offsets[None, :]
+                causal = m_global[:, None] >= n_offsets[None, :]
                 mask_val = mask_val & causal
 
             logits = tl.where(mask_val, logits, -1e10)
@@ -169,6 +187,11 @@ def qk_stats_kernel(
         head_sum_logit += tl.sum(tl.where(row_has_data, row_sum_logit_raw, 0.0))
         head_valid_count += tl.sum(row_count_raw)
 
+        # Per-row mean logit (accumulated across M-blocks for row-first mean).
+        safe_row_count = tl.where(row_count_raw > 0, row_count_raw, 1.0)
+        row_mean_logit = row_sum_logit_raw / safe_row_count
+        head_sum_row_mean += tl.sum(tl.where(row_has_data & m_mask, row_mean_logit, 0.0))
+
         head_sum_entropy += tl.sum(tl.where(row_has_data & m_mask, row_entropy, 0.0))
         head_sum_sink += tl.sum(tl.where(row_has_data & m_mask, row_sink, 0.0))
         head_valid_rows += tl.sum((row_has_data & m_mask).to(tl.float32))
@@ -176,11 +199,13 @@ def qk_stats_kernel(
     # Write output
     out_offset = batch_idx * stride_out_batch + head_idx * stride_out_head
 
+    # NOTE: mean_logit uses row-first semantics (mean over valid rows of the
+    # per-row mean logit) rather than count-weighted position mean. 
     safe_count = tl.maximum(head_valid_count, 1.0)
     safe_rows = tl.maximum(head_valid_rows, 1.0)
 
     tl.store(max_logits_ptr + out_offset, head_max_logit)
-    tl.store(mean_logits_ptr + out_offset, head_sum_logit / safe_count)
+    tl.store(mean_logits_ptr + out_offset, head_sum_row_mean / safe_rows)
     tl.store(entropy_ptr + out_offset, head_sum_entropy / safe_rows)
     tl.store(sink_ptr + out_offset, head_sum_sink / safe_rows)
     tl.store(count_ptr + out_offset, head_valid_count)
@@ -193,6 +218,7 @@ def qk_stats_partial_kernel(
     K_ptr,
     partial_max_ptr,
     partial_sum_logit_ptr,
+    partial_sum_row_mean_ptr,
     partial_count_ptr,
     partial_sum_entropy_ptr,
     partial_sum_sink_ptr,
@@ -200,10 +226,13 @@ def qk_stats_partial_kernel(
     # Shapes
     batch,
     num_heads,
-    seq_len,
+    seq_len_q,
+    seq_len_k,
     head_dim,
     heads_per_group,
     num_m_blocks,
+    # Query row offset in the global sequence (0 unless CP > 1)
+    q_row_offset,
     # Strides for Q/K (input layout [B, H, S, D])
     stride_q_batch,
     stride_q_head,
@@ -229,6 +258,10 @@ def qk_stats_partial_kernel(
     Grid: (batch * num_heads, num_m_blocks). Each program handles exactly one
     M-block, replacing the outer ``for m_start in range(...)`` loop of the
     legacy single-program kernel.
+
+    Asymmetric Q/K seq lens (for CP): ``seq_len_q`` may be smaller than
+    ``seq_len_k``. Row m in Q corresponds to *global* row ``m + q_row_offset``
+    which is used only for causal masking against K columns.
     """
     pid_bh = tl.program_id(0)
     pid_m = tl.program_id(1)
@@ -244,7 +277,9 @@ def qk_stats_partial_kernel(
     m_start = pid_m * m_block_span
 
     m_offsets = m_start + tl.arange(0, BLOCK_M) * ROW_STRIDE
-    m_mask = m_offsets < seq_len
+    m_mask = m_offsets < seq_len_q
+    # Global row index used for causal masking against K columns
+    m_global = m_offsets + q_row_offset
 
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - 1e10
     d_i = tl.zeros([BLOCK_M], dtype=tl.float32)
@@ -256,13 +291,16 @@ def qk_stats_partial_kernel(
     row_count_raw = tl.zeros([BLOCK_M], dtype=tl.float32)
 
     if apply_causal_mask:
-        n_stop = tl.minimum(m_start + (BLOCK_M - 1) * ROW_STRIDE + BLOCK_N, seq_len)
+        n_stop = tl.minimum(
+            q_row_offset + m_start + (BLOCK_M - 1) * ROW_STRIDE + BLOCK_N,
+            seq_len_k,
+        )
     else:
-        n_stop = seq_len
+        n_stop = seq_len_k
 
     for n_start in range(0, n_stop, BLOCK_N):
         n_offsets = n_start + tl.arange(0, BLOCK_N)
-        n_mask = n_offsets < seq_len
+        n_mask = n_offsets < seq_len_k
 
         acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
@@ -282,7 +320,7 @@ def qk_stats_partial_kernel(
 
         mask_val = n_mask[None, :] & m_mask[:, None]
         if apply_causal_mask:
-            causal = m_offsets[:, None] >= n_offsets[None, :]
+            causal = m_global[:, None] >= n_offsets[None, :]
             mask_val = mask_val & causal
 
         logits = tl.where(mask_val, logits, -1e10)
@@ -332,6 +370,10 @@ def qk_stats_partial_kernel(
 
     block_max_logit = tl.max(tl.where(m_mask, row_max_logit_raw, -1e10))
     block_sum_logit = tl.sum(tl.where(valid_mask, row_sum_logit_raw, 0.0))
+    # Row-first mean: sum of per-row means (needed so CP composes via mean-of-means).
+    safe_row_count = tl.where(row_count_raw > 0, row_count_raw, 1.0)
+    row_mean_logit = row_sum_logit_raw / safe_row_count
+    block_sum_row_mean = tl.sum(tl.where(valid_mask, row_mean_logit, 0.0))
     block_count = tl.sum(tl.where(m_mask, row_count_raw, 0.0))
     block_sum_entropy = tl.sum(tl.where(valid_mask, row_entropy, 0.0))
     block_sum_sink = tl.sum(tl.where(valid_mask, row_sink, 0.0))
@@ -341,6 +383,7 @@ def qk_stats_partial_kernel(
 
     tl.store(partial_max_ptr + out_offset, block_max_logit)
     tl.store(partial_sum_logit_ptr + out_offset, block_sum_logit)
+    tl.store(partial_sum_row_mean_ptr + out_offset, block_sum_row_mean)
     tl.store(partial_count_ptr + out_offset, block_count)
     tl.store(partial_sum_entropy_ptr + out_offset, block_sum_entropy)
     tl.store(partial_sum_sink_ptr + out_offset, block_sum_sink)

@@ -99,31 +99,40 @@ def _compute_qk_stats_triton(
     causal: bool = True,
     heads_per_group: int = 1,
     row_stride: int = 1,
+    q_row_offset: int = 0,
 ) -> dict:
     """Triton kernel path for paddle tensors.
 
-    q: [B, H, S, D] (query heads). k: [B, H_kv, S, D] (KV heads, NOT expanded).
+    q: [B, H, S_q, D] (query heads). k: [B, H_kv, S_k, D] (KV heads, NOT expanded).
     ``heads_per_group = H // H_kv``; the kernel maps each query head to its KV
     head internally so we never materialize a repeat_interleave of k.
     ``row_stride`` subsamples query rows (see kernel docstring).
+
+    Under Context-Parallel (CP > 1), Q may stay local (``S_q = S/CP``) while
+    K has been all_gather'd to full seq (``S_k = S``). ``q_row_offset`` is the
+    starting global row index of the local Q shard, used only by the kernel's
+    causal masking so that local row m compares against key col ``m + offset``
+    rather than the ambiguous local ``m``.
     """
     _ensure_triton_driver()
     from ...core.triton_qk_kernel import qk_stats_partial_kernel
 
-    batch, num_heads, seq_len, head_dim = q.shape
+    batch, num_heads, seq_len_q, head_dim = q.shape
+    seq_len_k = k.shape[2]
     scale = 1.0 / (head_dim**0.5)
 
     BLOCK_M = 64
     BLOCK_N = 64
     BLOCK_K = 64 if head_dim <= 64 else 128
 
-    # Stage-1 grid: parallelize over (B*H, num_M_blocks) instead of (B*H,) only.
+    # Stage-1 grid: parallelize over (B*H, num_M_blocks_over_Q) instead of (B*H,) only.
     m_block_span = BLOCK_M * row_stride
-    num_m_blocks = (seq_len + m_block_span - 1) // m_block_span
+    num_m_blocks = (seq_len_q + m_block_span - 1) // m_block_span
 
     partial_shape = [batch, num_heads, num_m_blocks]
     partial_max = paddle.empty(partial_shape, dtype="float32")
     partial_sum_logit = paddle.empty(partial_shape, dtype="float32")
+    partial_sum_row_mean = paddle.empty(partial_shape, dtype="float32")
     partial_count = paddle.empty(partial_shape, dtype="float32")
     partial_sum_entropy = paddle.empty(partial_shape, dtype="float32")
     partial_sum_sink = paddle.empty(partial_shape, dtype="float32")
@@ -136,16 +145,19 @@ def _compute_qk_stats_triton(
         k,
         partial_max,
         partial_sum_logit,
+        partial_sum_row_mean,
         partial_count,
         partial_sum_entropy,
         partial_sum_sink,
         partial_valid_rows,
         batch,
         num_heads,
-        seq_len,
+        seq_len_q,
+        seq_len_k,
         head_dim,
         heads_per_group,
         num_m_blocks,
+        q_row_offset,
         q.strides[0],
         q.strides[1],
         q.strides[2],
@@ -167,9 +179,8 @@ def _compute_qk_stats_triton(
 
     # reduce: pure paddle GPU ops, deterministic reduction order, no D2H sync.
     max_logits = partial_max.max(axis=-1)  # [B, H]
-    total_count = partial_count.sum(axis=-1).clip(min=1.0)
     total_rows = partial_valid_rows.sum(axis=-1).clip(min=1.0)
-    mean_logits = partial_sum_logit.sum(axis=-1) / total_count
+    mean_logits = partial_sum_row_mean.sum(axis=-1) / total_rows
     entropy = partial_sum_entropy.sum(axis=-1) / total_rows
     sink = partial_sum_sink.sum(axis=-1) / total_rows
 
@@ -190,13 +201,17 @@ def compute_qk_stats_paddle(
     k: paddle.Tensor,
     causal: bool = True,
     row_stride: int = 1,
+    q_row_offset: int = 0,
 ) -> dict:
     """Compute QK stats via Triton kernel.
 
     Args:
-        q: [B, S, H, D] — PaddleFleet core_attention input format
-        k: [B, S, H_kv, D] — KV heads (may be fewer than query heads for GQA)
+        q: [B, S_q, H, D] — PaddleFleet core_attention input format
+        k: [B, S_k, H_kv, D] — KV heads (may be fewer than query heads for GQA)
         row_stride: subsample every ``row_stride``-th query row (1 == exact)
+        q_row_offset: global row-index start for this Q shard. Zero unless the
+            caller is running with Context-Parallel and Q is kept local. Used
+            only by the kernel's causal-mask logic.
 
     The [B, S, H, D] -> [B, H, S, D] reordering is expressed via strides
     (no contiguous copy); the triton kernel reads strided memory directly.
@@ -213,7 +228,14 @@ def compute_qk_stats_paddle(
     q = q.transpose([0, 2, 1, 3])
     k = k.transpose([0, 2, 1, 3])
 
-    return _compute_qk_stats_triton(q, k, causal=causal, heads_per_group=heads_per_group, row_stride=row_stride)
+    return _compute_qk_stats_triton(
+        q,
+        k,
+        causal=causal,
+        heads_per_group=heads_per_group,
+        row_stride=row_stride,
+        q_row_offset=q_row_offset,
+    )
 
 
 class PaddleQKStatsMonitor(PaddleProbe):
@@ -237,6 +259,7 @@ class PaddleQKStatsMonitor(PaddleProbe):
         self.causal = causal
         self.tp_size = 1
         self.cp_size = 1
+        self.cp_rank = 0
         self.cp_group = None
         self.pp_rank = 0
         self.sink_head_threshold = sink_head_threshold
@@ -266,6 +289,12 @@ class PaddleQKStatsMonitor(PaddleProbe):
             pg = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["cp"])
             self.cp_group = pg.cp
             self.cp_size = get_pg_size(pg.cp)
+            if self.cp_group is not None and self.cp_size > 1:
+                # ``paddle.distributed.get_rank(group=...)`` returns the rank
+                # within the given group, which is the seq-shard index we need.
+                import paddle.distributed as dist
+
+                self.cp_rank = dist.get_rank(group=self.cp_group)
         except Exception:
             pass
 
@@ -289,12 +318,11 @@ class PaddleQKStatsMonitor(PaddleProbe):
 
         if self.cp_size > 1:
             logger.warning(
-                "[PaddleQKMonitor] CP=%d detected. To preserve exact metric "
-                "semantics the hook will all_gather Q/K across the CP group on "
-                "every monitored step; this adds significant traffic and "
-                "compute. If you do not need qk_stats under CP, remove "
-                "'qk_stats' from internal_medicine_monitors, or raise "
-                "internal_medicine_monitor_interval to sample less often.",
+                "[PaddleQKMonitor] CP=%d detected. Using K-only all_gather + "
+                "per-head CP mean-reduce to preserve exact metric semantics "
+                "while keeping Q local. If qk_stats overhead is still too high, raise "
+                "internal_medicine_monitor_interval or remove 'qk_stats' from "
+                "internal_medicine_monitors.",
                 self.cp_size,
             )
 
@@ -379,13 +407,18 @@ class PaddleQKStatsMonitor(PaddleProbe):
                 query, key = inputs[0], inputs[1]
                 with paddle.no_grad():
                     if self.cp_size > 1:
-                        gathered_q = self._cp_gather_seq(query.detach())
+                        # CP > 1: gather K only, keep Q local.
+                        query = query.detach()
+                        q_local_seq = query.shape[1]  # rows on this rank
+                        q_row_offset = self.cp_rank * q_local_seq
                         gathered_k = self._cp_gather_seq(key.detach())
-                        if gathered_q is None or gathered_k is None:
+                        if gathered_k is None:
                             return
-                        query, key = gathered_q, gathered_k
+                        key = gathered_k
+                    else:
+                        q_row_offset = 0
 
-                    # query: [B, S, H, D]; seq_len is a static shape int (no D2H sync).
+                    # query: [B, S_q, H, D]; seq_len is a static shape int (no D2H sync).
                     seq_len = query.shape[1]
                     effective_stride = self.row_stride
                     if effective_stride > seq_len:
@@ -403,7 +436,21 @@ class PaddleQKStatsMonitor(PaddleProbe):
                         effective_stride = 1
                     # GQA grouping is handled inside the kernel; do NOT
                     # repeat_interleave the KV tensor on the hot path.
-                    stats = compute_qk_stats_paddle(query, key, causal=self.causal, row_stride=effective_stride)
+                    stats = compute_qk_stats_paddle(
+                        query,
+                        key,
+                        causal=self.causal,
+                        row_stride=effective_stride,
+                        q_row_offset=q_row_offset,
+                    )
+
+                    if self.cp_size > 1 and self.cp_group is not None:
+                        import paddle.distributed as dist
+
+                        for key_name in ("entropy_per_head", "sink_per_head"):
+                            t = stats[key_name].astype("float32")
+                            dist.all_reduce(t, op=dist.ReduceOp.SUM, group=self.cp_group)
+                            stats[key_name] = t / float(self.cp_size)
 
                 all_heads = stats["entropy_per_head"]
                 self.record_layer_metric(layer_idx, "max", stats["max_global"], attn_type=attn_type)

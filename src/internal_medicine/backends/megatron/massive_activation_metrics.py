@@ -83,7 +83,8 @@ def compute_spectral_norm_bounds(
     When ``include_activation_rms`` is set, the input residual's global RMS
     (``activation_rms``) is derived from the same per-token ``pre_rms`` for free
     (``activation_rms == sqrt(mean_t(pre_rms_t**2))``), so callers that already run
-    this function need not recompute it in a separate pass.
+    this function need not recompute it in a separate pass. ``activation_rms_std``
+    is the std of ``pre_rms`` across tokens (per-token RMS dispersion).
 
     Returns 0-dim GPU tensors (no host sync).
     """
@@ -98,6 +99,7 @@ def compute_spectral_norm_bounds(
     }
     if include_activation_rms:
         metrics["activation_rms"] = pre_rms.square().mean().sqrt()
+        metrics["activation_rms_std"] = pre_rms.std()
     return metrics
 
 

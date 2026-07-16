@@ -110,7 +110,7 @@ class MassiveActivationMonitor(TorchProbe):
         if self.log_post_norm_metrics:
             names.extend(["post_norm_sparsity", "post_norm_cosine"])
         if self.log_activation_rms:
-            names.extend(["activation_rms", "spectral_norm_max", "spectral_norm_min"])
+            names.extend(["activation_rms", "activation_rms_std", "spectral_norm_max", "spectral_norm_min"])
         if self.log_lipschitz:
             names.extend(["lipschitz_max", "lipschitz_min"])
         for t in self.absolute_thresholds:

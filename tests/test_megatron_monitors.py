@@ -288,6 +288,10 @@ class MegatronMassiveActivationMonitorTest(unittest.TestCase):
         self.assertIn("massive_act/layer_0/activation_rms", latest)
         expected_rms = pre.reshape(-1, pre.shape[-1]).float().square().mean().sqrt().item()
         self.assertAlmostEqual(latest["massive_act/layer_0/activation_rms"], expected_rms, places=5)
+        # activation_rms_std is the std of the per-token pre-RMS (dispersion).
+        self.assertIn("massive_act/layer_0/activation_rms_std", latest)
+        expected_rms_std = pre.reshape(-1, pre.shape[-1]).float().square().mean(dim=-1).sqrt().std().item()
+        self.assertAlmostEqual(latest["massive_act/layer_0/activation_rms_std"], expected_rms_std, places=5)
 
     def test_derived_activation_rms_matches_original_formula(self):
         # Regression guard: the merged/derived activation_rms (from the spectral

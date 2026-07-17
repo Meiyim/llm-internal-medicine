@@ -144,6 +144,7 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
             return
 
         monitor_layers = iter_monitor_layers(layers, is_transformer_layer, pp_rank=self.pp_rank)
+        self.mark_mtp_layers(item.idx for item in monitor_layers if item.is_mtp)
 
         # Declare metric schema
         metric_names = [

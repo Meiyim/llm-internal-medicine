@@ -250,6 +250,7 @@ class PaddleMoEMonitor(PaddleProbe):
                 return []
 
         monitor_layers = iter_monitor_layers(layers, has_moe, pp_rank=self.pp_rank)
+        self.mark_mtp_layers(item.idx for item in monitor_layers if item.is_mtp)
         moe_layers = []
         for item in monitor_layers:
             layer = item.layer

@@ -119,12 +119,14 @@ setup_internal_medicine()
 所有指标遵循统一的命名格式：
 
 ```
-{monitor_name}/layer_{global_idx}/{metric_name}    # 逐层指标
-{monitor_name}/global_{metric_name}                 # 全局聚合指标
+{monitor_name}/layer_{global_idx}/{metric_name}        # 普通层逐层指标
+{monitor_name}/layer_{global_idx}_mtp/{metric_name}    # MTP 层逐层指标
+{monitor_name}/global_{metric_name}                     # 全局聚合指标
 ```
 
 - `monitor_name`: `moe_health` | `qk_stats` | `massive_act` | `ple_health`
 - `global_idx`: 考虑 PP (Pipeline Parallelism) 的全局层索引 = `pp_rank × local_layers + local_idx`
+- `_mtp`: 仅 MTP layer 带有的层类型标记，随指标走现有聚合和日志链路
 
 ---
 

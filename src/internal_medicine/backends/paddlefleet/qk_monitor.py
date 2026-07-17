@@ -364,6 +364,7 @@ class PaddleQKStatsMonitor(PaddleProbe):
             return []
 
         monitor_layers = iter_monitor_layers(layers, has_attention, pp_rank=self.pp_rank)
+        self.mark_mtp_layers(item.idx for item in monitor_layers if item.is_mtp)
         attention_layers = []
         for item in monitor_layers:
             attn = getattr(item.layer, "self_attn", None) or getattr(item.layer, "self_attention", None)

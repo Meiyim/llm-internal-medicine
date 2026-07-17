@@ -161,6 +161,19 @@ class PaddleLayerDiscoveryTest(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertIsNone(result[0].attn_type)
 
+    def test_iter_monitor_layers_marks_unwrapped_mtp_layer(self):
+        main_layer = SimpleNamespace(self_attn=SimpleNamespace(is_swa=False))
+        mtp_layer = SimpleNamespace(self_attn=SimpleNamespace(is_swa=False))
+        mtp_wrapper = SimpleNamespace(transformer_layer=mtp_layer)
+
+        result = layer_discovery.iter_monitor_layers(
+            [main_layer, mtp_wrapper],
+            lambda layer: hasattr(layer, "self_attn"),
+        )
+
+        self.assertEqual([item.idx for item in result], [0, 1])
+        self.assertEqual([item.is_mtp for item in result], [False, True])
+
 
 class PaddleMoEMonitorTest(unittest.TestCase):
     def setUp(self):
@@ -184,6 +197,22 @@ class PaddleMoEMonitorTest(unittest.TestCase):
         latest = training_logs.get_latest(prefix="moe_health")
         self.assertAlmostEqual(latest["moe_health/layer_0/router_entropy"], 2.0, places=4)
         self.assertAlmostEqual(latest["moe_health/global_router_entropy"], 2.0, places=4)
+
+    def test_mtp_layer_marker_is_encoded_in_metric_key(self):
+        monitor = PaddleMoEMonitor(log_per_layer=True, log_global=True)
+        monitor.mark_mtp_layers([1])
+        monitor.declare_layer_metric(0, "router_entropy")
+        monitor.declare_layer_metric(1, "router_entropy")
+        monitor.allocate_buffers()
+
+        monitor.record_layer_metric(0, "router_entropy", paddle.to_tensor(2.0))
+        monitor.record_layer_metric(1, "router_entropy", paddle.to_tensor(4.0))
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="moe_health")
+        self.assertAlmostEqual(latest["moe_health/layer_0/router_entropy"], 2.0, places=4)
+        self.assertAlmostEqual(latest["moe_health/layer_1_mtp/router_entropy"], 4.0, places=4)
+        self.assertAlmostEqual(latest["moe_health/global_router_entropy"], 3.0, places=4)
 
     def test_gpu_buffer_multi_layer_global_aggregation(self):
         """Global metrics are derived from layer accumulators at flush time."""

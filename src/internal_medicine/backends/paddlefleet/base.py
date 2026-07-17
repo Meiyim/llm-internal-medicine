@@ -36,6 +36,7 @@ class PaddleProbe(Probe):
         self._layer_metric_groups: dict[str, tuple[str, list[str]]] = {}
         self._layer_metric_keys: set[str] = set()  # 所有 per-layer key，用于 flush 时判断是否输出
         self._disabled_keys: set[str] = set()  # log_global=False 时被禁用的 global keys
+        self._mtp_layer_ids: set[int] = set()
         self._buffers_allocated = False
 
     def _should_monitor(self) -> bool:
@@ -131,14 +132,21 @@ class PaddleProbe(Probe):
     # Convenience: declare/record using class-level aggregation rules
     # ------------------------------------------------------------------
 
+    def mark_mtp_layers(self, layer_ids) -> None:
+        """Mark MTP layers before declaring the metric schema."""
+        assert not self._buffers_allocated, "mark_mtp_layers after allocate_buffers"
+        self._mtp_layer_ids.update(int(layer_idx) for layer_idx in layer_ids)
+
     def _layer_key(self, layer_idx: int, metric_name: str, attn_type: str | None = None) -> str:
-        # Attention-type prefix (``swa_`` / ``full_``) goes on the metric name,
-        # not the layer number, so the viewer's ``layer_(\d+)/(sub)`` regex
-        # still matches and its per-(monitor, sub) grouping naturally splits
-        # window vs full charts. ``attn_type=None`` keeps the legacy key.
+        # Attention type stays on the metric name so window/full charts split
+        # naturally. MTP identity stays on the layer token and follows the
+        # existing metric gather/JSONL path without separate metadata.
+        layer_token = f"layer_{layer_idx}"
+        if layer_idx in self._mtp_layer_ids:
+            layer_token += "_mtp"
         if attn_type is not None:
-            return f"{self.METRIC_PREFIX}/layer_{layer_idx}/{attn_type}_{metric_name}"
-        return f"{self.METRIC_PREFIX}/layer_{layer_idx}/{metric_name}"
+            return f"{self.METRIC_PREFIX}/{layer_token}/{attn_type}_{metric_name}"
+        return f"{self.METRIC_PREFIX}/{layer_token}/{metric_name}"
 
     def _global_key(self, metric_name: str, attn_type: str | None = None) -> str:
         if attn_type is not None:

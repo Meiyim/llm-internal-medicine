@@ -5,7 +5,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 AVAILABLE_MONITORS = {
-    "megatron": ["qk_stats", "moe_health", "ple_health", "massive_act"],
+    "megatron": ["qk_stats", "moe_health", "ple_health", "massive_act", "mhc_health"],
     "paddlefleet": ["qk_stats", "moe_health", "massive_act"],
 }
 

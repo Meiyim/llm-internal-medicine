@@ -288,6 +288,10 @@ class MegatronMassiveActivationMonitorTest(unittest.TestCase):
         self.assertIn("massive_act/layer_0/activation_rms", latest)
         expected_rms = pre.reshape(-1, pre.shape[-1]).float().square().mean().sqrt().item()
         self.assertAlmostEqual(latest["massive_act/layer_0/activation_rms"], expected_rms, places=5)
+        # activation_rms_std is the std of the per-token pre-RMS (dispersion).
+        self.assertIn("massive_act/layer_0/activation_rms_std", latest)
+        expected_rms_std = pre.reshape(-1, pre.shape[-1]).float().square().mean(dim=-1).sqrt().std().item()
+        self.assertAlmostEqual(latest["massive_act/layer_0/activation_rms_std"], expected_rms_std, places=5)
 
     def test_derived_activation_rms_matches_original_formula(self):
         # Regression guard: the merged/derived activation_rms (from the spectral
@@ -303,6 +307,56 @@ class MegatronMassiveActivationMonitorTest(unittest.TestCase):
         )["activation_rms"]
 
         self.assertTrue(torch.allclose(original, derived, rtol=0, atol=1e-6), f"{original} != {derived}")
+
+    def test_grad_gain_bounds_equal_scaled_gradients(self):
+        # grad_in = 2 * grad_out per token => the per-token ratio ‖dx‖/‖dy‖ is exactly
+        # 2.0 for every token, so both the Lipschitz max and min bound collapse to 2.0.
+        torch.manual_seed(0)
+        grad_out = torch.randn(5, 3, 4)  # [S, B, H]
+        grad_in = grad_out * 2.0
+
+        bounds = massive_activation_metrics.compute_grad_gain_bounds(grad_in, grad_out)
+
+        self.assertAlmostEqual(bounds["lipschitz_max"].item(), 2.0, places=5)
+        self.assertAlmostEqual(bounds["lipschitz_min"].item(), 2.0, places=5)
+
+    def test_grad_gain_hook_records_lipschitz_from_backward(self):
+        # End-to-end: a scalar-mul layer y = 2*x has ∂L/∂x = 2·∂L/∂y for any loss, so
+        # the backward-captured gradient-gain ratio is exactly 2.0 regardless of the
+        # gradient direction. This also proves the tensor grad-hook path fires and
+        # records (a module full_backward_hook would see an empty grad_input here,
+        # since the layer is called all-keyword like Megatron does).
+        monitor = MassiveActivationMonitor(
+            log_per_layer=True,
+            log_global=True,
+            log_post_norm_metrics=False,
+            log_activation_rms=False,
+            log_lipschitz=True,
+        )
+        for name in monitor._layer_metric_names():
+            monitor.declare_layer_metric(0, name)
+        monitor.allocate_buffers(torch.device("cpu"))
+
+        class ScalarMul(nn.Module):
+            def forward(self, hidden_states):
+                return hidden_states * 2.0, None  # (output, context) like a Megatron layer
+
+        layer = ScalarMul()
+        hook = layer.register_forward_hook(monitor._make_grad_gain_hook(0), with_kwargs=True)
+
+        x = torch.randn(3, 2, 4, requires_grad=True)  # [S, B, H]
+        out, _ = layer(hidden_states=x)  # all-keyword call, as the Megatron block does
+        out.sum().backward()
+        hook.remove()
+
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="massive_act")
+        for key in ("lipschitz_max", "lipschitz_min"):
+            self.assertIn(f"massive_act/layer_0/{key}", latest)
+            self.assertIn(f"massive_act/global_{key}", latest)
+        self.assertAlmostEqual(latest["massive_act/layer_0/lipschitz_max"], 2.0, places=5)
+        self.assertAlmostEqual(latest["massive_act/layer_0/lipschitz_min"], 2.0, places=5)
 
 
 class SinkHeadClassificationTest(unittest.TestCase):

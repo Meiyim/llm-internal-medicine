@@ -15,6 +15,7 @@ from .base import TorchProbe
 from .massive_activation_metrics import (
     DEFAULT_ABSOLUTE_THRESHOLDS,
     _threshold_key,
+    compute_grad_gain_bounds,
     compute_per_channel_max,
     compute_post_norm_cosine_stability,
     compute_post_norm_sparsity,
@@ -39,9 +40,11 @@ class MassiveActivationMonitor(TorchProbe):
         "activation_rms",
         "massive_act_channel_count",
         "spectral_norm_max",
+        "lipschitz_max",
     }
     MIN_AGGREGATED = {
         "spectral_norm_min",
+        "lipschitz_min",
     }
 
     def __init__(
@@ -58,6 +61,7 @@ class MassiveActivationMonitor(TorchProbe):
         absolute_thresholds: tuple[float, ...] = DEFAULT_ABSOLUTE_THRESHOLDS,
         log_post_norm_metrics: bool = True,
         log_activation_rms: bool = True,
+        log_lipschitz: bool = True,
         hook_timing_enabled: bool = False,
     ):
         super().__init__(
@@ -78,6 +82,13 @@ class MassiveActivationMonitor(TorchProbe):
         # per-token spectral-norm bounds. activation_rms is derived from the same
         # per-token pre-RMS the spectral hook computes, so they share one flag.
         self.log_activation_rms = log_activation_rms
+        # Per-layer Lipschitz constant estimate, captured in the backward pass: the
+        # per-token gradient-gain ratio ‖∂L/∂x‖/‖∂L/∂y‖ bounds the layer Jacobian's
+        # singular values (max -> σ_max lower bound = Lipschitz const; min -> σ_min
+        # upper bound). Rides a forward hook that registers tensor grad hooks on the
+        # input/output hidden states — module full_backward_hook cannot see the input
+        # grad because Megatron calls layers with all-keyword args.
+        self.log_lipschitz = log_lipschitz
         self.MAX_AGGREGATED = self.MAX_AGGREGATED | {
             f"channel_count_gt_{_threshold_key(t)}" for t in self.absolute_thresholds
         }
@@ -99,7 +110,9 @@ class MassiveActivationMonitor(TorchProbe):
         if self.log_post_norm_metrics:
             names.extend(["post_norm_sparsity", "post_norm_cosine"])
         if self.log_activation_rms:
-            names.extend(["activation_rms", "spectral_norm_max", "spectral_norm_min"])
+            names.extend(["activation_rms", "activation_rms_std", "spectral_norm_max", "spectral_norm_min"])
+        if self.log_lipschitz:
+            names.extend(["lipschitz_max", "lipschitz_min"])
         for t in self.absolute_thresholds:
             names.append(f"channel_count_gt_{_threshold_key(t)}")
         return tuple(names)
@@ -168,6 +181,17 @@ class MassiveActivationMonitor(TorchProbe):
                     self.timed_hook("spectral_norm", self._make_spectral_norm_hook(global_idx)), with_kwargs=True
                 )
                 self.hooks.append(spec_hook)
+            # Lipschitz / gradient-gain bounds are a backward-pass quantity, but we
+            # attach from a forward hook that registers tensor grad hooks on the input
+            # and output hidden states. A module full_backward_hook cannot recover the
+            # input gradient here (Megatron calls layers all-keyword, so grad_input is
+            # empty). The forward-hook grad guard also selects the recompute pass under
+            # activation checkpointing, so the grad hooks fire exactly once.
+            if self.log_lipschitz:
+                grad_hook = layer.register_forward_hook(
+                    self.timed_hook("grad_gain", self._make_grad_gain_hook(global_idx)), with_kwargs=True
+                )
+                self.hooks.append(grad_hook)
             registered += 1
         logger.info(f"[MassiveActMonitor] Registered {registered} hooks.")
 
@@ -276,6 +300,50 @@ class MassiveActivationMonitor(TorchProbe):
         for name, val in tensor_metrics.items():
             self.record_layer_metric(layer_idx, name, val)
 
+    def _make_grad_gain_hook(self, layer_idx: int):
+        """Forward hook that captures the layer's backward gradient-gain (Lipschitz).
+
+        It registers tensor grad hooks on the input (``pre``) and output (``post``)
+        hidden states. In the backward pass ``post``'s hook fires first (output->input)
+        and stashes ∂L/∂y; ``pre``'s hook then reads it and records the per-token ratio
+        ‖∂L/∂x‖/‖∂L/∂y‖ bounds. The per-invocation ``state`` dict isolates concurrent
+        microbatch/pipeline backwards.
+        """
+
+        def hook_fn(module, args, kwargs, output):
+            # _should_monitor() requires grad enabled, so the initial no-grad forward
+            # under activation recompute is skipped and only the recompute (grad-enabled)
+            # forward registers the grad hooks — they fire exactly once.
+            if not self._should_monitor():
+                return
+            try:
+                pre = self._extract_hidden_states(args, kwargs)
+                post = self._first_tensor(output)
+                if pre is None or post is None or not pre.requires_grad or not post.requires_grad:
+                    return
+
+                state: dict[str, torch.Tensor] = {}
+
+                def save_grad_out(grad):
+                    state["dy"] = grad.detach()
+
+                def record_grad_gain(grad):
+                    grad_out = state.pop("dy", None)
+                    if grad_out is None:
+                        return
+                    with torch.no_grad():
+                        tensor_metrics = compute_grad_gain_bounds(grad_in=grad.detach(), grad_out=grad_out)
+                    for name, val in tensor_metrics.items():
+                        self.record_layer_metric(layer_idx, name, val)
+
+                post.register_hook(save_grad_out)
+                pre.register_hook(record_grad_gain)
+            except Exception as e:
+                if self.verbose:
+                    logger.error(f"[MassiveActMonitor] Grad-gain error at layer {layer_idx}: {e}")
+
+        return hook_fn
+
     def _compute_residual_metrics(self, layer_idx: int, hidden_states: torch.Tensor):
         per_channel_max = compute_per_channel_max(hidden_states)
         per_channel_max = self._aggregate_per_channel_max(per_channel_max)
@@ -336,6 +404,7 @@ def setup_massive_activation_monitor(
     absolute_thresholds: tuple[float, ...] = DEFAULT_ABSOLUTE_THRESHOLDS,
     log_post_norm_metrics: bool = True,
     log_activation_rms: bool = True,
+    log_lipschitz: bool = True,
     hook_timing_enabled: bool = False,
     monitor_dict: dict | None = None,
 ):
@@ -352,6 +421,7 @@ def setup_massive_activation_monitor(
         absolute_thresholds=absolute_thresholds,
         log_post_norm_metrics=log_post_norm_metrics,
         log_activation_rms=log_activation_rms,
+        log_lipschitz=log_lipschitz,
         hook_timing_enabled=hook_timing_enabled,
     )
 

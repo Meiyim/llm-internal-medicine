@@ -2,11 +2,12 @@
 
 训练时模型健康的实时监控框架，通过 forward hook 零侵入式采集指标，不影响训练梯度。
 
-包含四大监控模块：
+包含五大监控模块：
 - **[MoE Health](./docs/moe_specialist.md)** — MoE 专家系统健康监控 (13 指标)
 - **[QK Stats](./docs/qk_logits.md)** — 注意力 QK 统计监控 (9 指标)
-- **[Massive Activation Health](./docs/massive_activation.md)** — Residual Stream Massive Activation 健康监控 (15 指标)
+- **[Massive Activation Health](./docs/massive_activation.md)** — Residual Stream Massive Activation 健康监控 (17 指标)
 - **[PLE Health](./docs/ple_health.md)** — Per-Layer Embedding 健康监控 (7 指标)
+- **[mHC Health](./docs/mhc_health.md)** — Manifold-Constrained Hyper-Connections 映射监控 (每 hc 模块 8 指标；仅在开启 mHC 层时生效)
 
 ---
 
@@ -68,6 +69,7 @@ internal_medicine_monitors:
 `true` 表示启用该 monitor 并使用默认参数；嵌套 dict 会作为该 monitor 的 kwargs 透传，例如上面的 `massive_act` 等价于
 `setup_internal_medicine(..., massive_act={"log_activation_rms": False, "log_post_norm_metrics": False})`。
 `log_activation_rms` 统一控制残差尺度/增益一组指标（`activation_rms` + `spectral_norm_max/min`）——`activation_rms` 由 spectral hook 的 per-token pre-RMS 免费导出，故合用一个开关。
+`log_lipschitz`（默认 `true`）控制每层 Lipschitz/梯度增益指标（`lipschitz_max/min`）——由 forward hook 在输入/输出 hidden 上注册 tensor grad hook，在反向传播采集 `‖∂L/∂x‖/‖∂L/∂y‖`。
 list 形式仍兼容，但需要按 monitor 传参时不要再额外加 `internal_medicine_monitor_kwargs` 字段。
 
 ### 读取指标
@@ -124,7 +126,7 @@ setup_internal_medicine()
 {monitor_name}/global_{metric_name}                     # 全局聚合指标
 ```
 
-- `monitor_name`: `moe_health` | `qk_stats` | `massive_act` | `ple_health`
+- `monitor_name`: `moe_health` | `qk_stats` | `massive_act` | `ple_health` | `mhc_health`
 - `global_idx`: 考虑 PP (Pipeline Parallelism) 的全局层索引 = `pp_rank × local_layers + local_idx`
 - `_mtp`: 仅 MTP layer 带有的层类型标记，随指标走现有聚合和日志链路
 
@@ -218,6 +220,8 @@ setup_internal_medicine()
 | 13 | `post_norm_cosine` | `massive_act/.../post_norm_cosine` | `cos_sim(tokens)` | 每层+全局 | 近常量向量检测 |
 | 14 | `spectral_norm_max` | `massive_act/.../spectral_norm_max` | `max(post_rms / pre_rms)` | 每层+全局 | 层增益比上界，谱范数(σ_max)下界 |
 | 15 | `spectral_norm_min` | `massive_act/.../spectral_norm_min` | `min(post_rms / pre_rms)` | 每层+全局 | 层增益比下界，最小奇异值(σ_min)上界 |
+| 16 | `lipschitz_max` | `massive_act/.../lipschitz_max` | `max(‖∂L/∂x‖ / ‖∂L/∂y‖)` | 每层+全局 | 反向梯度增益上界，σ_max(J)下界 = Lipschitz 常数 |
+| 17 | `lipschitz_min` | `massive_act/.../lipschitz_min` | `min(‖∂L/∂x‖ / ‖∂L/∂y‖)` | 每层+全局 | 反向梯度增益下界，σ_min(J)上界 |
 
 ### 核心洞察
 
@@ -244,6 +248,31 @@ Massive activations 是 pre-norm Transformer 的**架构副产品**，独立于�
 | 5 | `residual_ratio` | `ple_health/layer_{i}/residual_ratio` | `\|\|output - input\|\| / \|\|input\|\|` | 每层+全局 | PLE 贡献幅度 |
 | 6 | `gate_activation_mean` | `ple_health/layer_{i}/gate_activation_mean` | `mean(\|act_fn(gate_out)\|)` | 每层+全局 | 门控激活强度 |
 | 7 | `gate_sparsity` | `ple_health/layer_{i}/gate_sparsity` | `(\|act\| < 0.01).mean()` | 每层+全局 | 死门控单元占比 |
+
+---
+
+## 五、mHC Health Monitor (mhc_health)
+
+> 详细文档: [mhc_health.md](./docs/mhc_health.md)
+
+监控 mHC (Manifold-Constrained Hyper-Connections) 层的三个 per-token 映射 `h_pre` / `h_post` / `h_res`。
+只在模型开启 mHC 层时生效——mHC 类无法 import 或模型不含 `HyperConnectionTransformerLayer` 时该 monitor 为
+彻底 no-op（不 wrap、不产生指标）。每层含两个 hyper-connection 模块（`attn` / `mlp`），各产出以下 8 个指标，
+指标名以 `attn_` / `mlp_` 前缀区分；全部按 token/batch 求均值。
+
+| # | 指标 | 日志键 | 公式 | 级别 | 诊断意义 |
+|---|------|--------|------|------|----------|
+| 1 | `{c}_h_pre_mean` | `mhc_health/layer_{i}/{c}_h_pre_mean` | `mean(h_pre)` | 每层+全局 | 聚合门均值 |
+| 2 | `{c}_h_pre_std` | `mhc_health/layer_{i}/{c}_h_pre_std` | `std(h_pre)` | 每层+全局 | 聚合门离散度 |
+| 3 | `{c}_h_post_mean` | `mhc_health/layer_{i}/{c}_h_post_mean` | `mean(h_post)` | 每层+全局 | 扩展门均值 |
+| 4 | `{c}_h_post_std` | `mhc_health/layer_{i}/{c}_h_post_std` | `std(h_post)` | 每层+全局 | 扩展门离散度 |
+| 5 | `{c}_amax_gain_fwd` | `mhc_health/layer_{i}/{c}_amax_gain_fwd` | `mean_t(max_i \|Σ_j h_res_ij\|)` | 每层+全局 | 单层前向最坏放大 (≈1) |
+| 6 | `{c}_amax_gain_bwd` | `mhc_health/layer_{i}/{c}_amax_gain_bwd` | `mean_t(max_j \|Σ_i h_res_ij\|)` | 每层+全局 | 单层反向最坏放大 (≈1) |
+| 7 | `{c}_composite_amax_gain_fwd` | `mhc_health/layer_{i}/{c}_composite_amax_gain_fwd` | 复合映射 `∏ h_res` 的行和 | 每层+全局 | 跨层累积前向放大 |
+| 8 | `{c}_composite_amax_gain_bwd` | `mhc_health/layer_{i}/{c}_composite_amax_gain_bwd` | 复合映射 `∏ h_res` 的列和 | 每层+全局 | 跨层累积反向放大 |
+
+`{c}` ∈ `{attn, mlp}`。复合映射为本 pipeline stage / VPP chunk 内 `h_res` 的累乘（每次 forward 在本 stage 首个
+hc 模块处重置）——PP=1 时精确，PP>1 时为 stage 局部近似。
 
 ---
 
@@ -299,7 +328,7 @@ NeMo Trainer 对应字段为 `internal_medicine_hook_timing`。开启后 trainer
 
 ## 附录: 完整指标速查表
 
-共 44 个指标键 (13 MoE + 9 QK + 15 MassiveAct + 7 PLE)。
+共 46 个指标键 (13 MoE + 9 QK + 17 MassiveAct + 7 PLE)。
 
 | Monitor | 指标 | 公式 | SmoothedValue 模式 | 健康信号 |
 |---------|------|------|--------------------|----------|
@@ -343,6 +372,8 @@ NeMo Trainer 对应字段为 `internal_medicine_hook_timing`。开启后 trainer
 | **MassiveAct** | `post_norm_cosine` | `cos_sim(tokens)` | mean | 近常量向量检测 |
 | **MassiveAct** | `spectral_norm_max` | `max(post_rms / pre_rms)` | max | 谱范数(σ_max)下界 |
 | **MassiveAct** | `spectral_norm_min` | `min(post_rms / pre_rms)` | min | 最小奇异值(σ_min)上界 |
+| **MassiveAct** | `lipschitz_max` | `max(‖∂L/∂x‖ / ‖∂L/∂y‖)` | max | σ_max(J)下界 = Lipschitz 常数 |
+| **MassiveAct** | `lipschitz_min` | `min(‖∂L/∂x‖ / ‖∂L/∂y‖)` | min | σ_min(J)上界 |
 | **PLE** | `token_ple_norm` | `mean(\|\|token_ple\|\|₂)` | mean | 量级稳定 |
 | **PLE** | `proj_ple_norm` | `mean(\|\|proj × H^{-0.5}\|\|₂)` | mean | 与 token 分支匹配 |
 | **PLE** | `per_layer_inputs_norm` | `mean(\|\|(t+p)×2^{-0.5}\|\|₂)` | mean | 量级稳定 |

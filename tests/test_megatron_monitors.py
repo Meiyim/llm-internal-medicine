@@ -41,6 +41,52 @@ class FakeMoELayer(nn.Module):
         self.shared_experts = None
 
 
+class FakeLogitLensLayer(nn.Module):
+    """Minimal Megatron-style layer: called all-keyword, returns (output, context)."""
+
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.linear = nn.Linear(hidden_size, hidden_size)
+
+    def forward(self, hidden_states):
+        return self.linear(hidden_states), None
+
+
+class FakeDecoder(nn.Module):
+    def __init__(self, num_layers, hidden_size):
+        super().__init__()
+        self.layers = nn.ModuleList([FakeLogitLensLayer(hidden_size) for _ in range(num_layers)])
+        self.final_layernorm = nn.LayerNorm(hidden_size)
+
+    def forward(self, x):
+        for layer in self.layers:
+            x, _ = layer(hidden_states=x)
+        return x
+
+
+class FakeGPTModel(nn.Module):
+    """Fake GPTModel exposing decoder.layers/final_layernorm + output_layer (head stage)."""
+
+    def __init__(self, num_layers, hidden_size, vocab_size):
+        super().__init__()
+        self.decoder = FakeDecoder(num_layers, hidden_size)
+        self.output_layer = nn.Linear(hidden_size, vocab_size, bias=False)  # weight [vocab, hidden]
+
+    def forward(self, x):
+        return self.decoder(x)
+
+
+class FakeHeadlessGPTModel(nn.Module):
+    """Non-head PP stage: decoder present but no output_layer / tied weight accessor."""
+
+    def __init__(self, num_layers, hidden_size):
+        super().__init__()
+        self.decoder = FakeDecoder(num_layers, hidden_size)
+
+    def forward(self, x):
+        return self.decoder(x)
+
+
 class MegatronMoEMonitorTest(unittest.TestCase):
     def setUp(self):
         training_logs.reset()
@@ -357,6 +403,143 @@ class MegatronMassiveActivationMonitorTest(unittest.TestCase):
             self.assertIn(f"massive_act/global_{key}", latest)
         self.assertAlmostEqual(latest["massive_act/layer_0/lipschitz_max"], 2.0, places=5)
         self.assertAlmostEqual(latest["massive_act/layer_0/lipschitz_min"], 2.0, places=5)
+
+    def test_logit_lens_entropy_uniform_is_log_vocab(self):
+        # Zero weight => every logit is 0 => uniform softmax => H == log(vocab).
+        import math
+
+        vocab, hidden = 8, 4
+        h = torch.randn(3, 2, hidden)
+        weight = torch.zeros(vocab, hidden)
+        out = massive_activation_metrics.compute_logit_lens_entropy(h, weight, chunk_size=2)
+        for key in ("logit_lens_entropy_mean", "logit_lens_entropy_min", "logit_lens_entropy_max"):
+            self.assertIn(key, out)
+            self.assertAlmostEqual(out[key].item(), math.log(vocab), places=5)
+
+    def test_logit_lens_entropy_peaked_is_near_zero(self):
+        # One vocab logit dominates => softmax ~ one-hot => H ~ 0.
+        h = torch.tensor([[[1.0, 0.0]]])  # [s=1, b=1, hidden=2]
+        weight = torch.tensor([[100.0, 0.0], [0.0, 0.0], [0.0, 0.0]])  # [vocab=3, hidden=2]
+        out = massive_activation_metrics.compute_logit_lens_entropy(h, weight)
+        self.assertLess(out["logit_lens_entropy_mean"].item(), 1e-3)
+        self.assertGreaterEqual(out["logit_lens_entropy_min"].item(), 0.0)
+
+    def test_logit_lens_entropy_chunking_matches_single_pass(self):
+        import math
+
+        torch.manual_seed(0)
+        vocab, hidden = 16, 5
+        h = torch.randn(9, 2, hidden)
+        weight = torch.randn(vocab, hidden)
+        full = massive_activation_metrics.compute_logit_lens_entropy(h, weight, chunk_size=1000)
+        chunked = massive_activation_metrics.compute_logit_lens_entropy(h, weight, chunk_size=4)
+        for key in full:
+            self.assertAlmostEqual(full[key].item(), chunked[key].item(), places=5)
+        # Bounds: 0 <= H <= log(vocab).
+        self.assertGreaterEqual(full["logit_lens_entropy_min"].item(), -1e-5)
+        self.assertLessEqual(full["logit_lens_entropy_max"].item(), math.log(vocab) + 1e-4)
+
+    def test_logit_lens_entropy_applies_final_norm(self):
+        # A norm that zeros its input makes every logit 0 => uniform => log(vocab),
+        # regardless of the (large) hidden values: proves final_norm is applied.
+        import math
+
+        vocab, hidden = 4, 3
+        h = torch.randn(2, 2, hidden) * 10.0
+        weight = torch.randn(vocab, hidden)
+        zero_norm = nn.Linear(hidden, hidden, bias=False)
+        with torch.no_grad():
+            zero_norm.weight.zero_()
+        out = massive_activation_metrics.compute_logit_lens_entropy(h, weight, final_norm=zero_norm)
+        self.assertAlmostEqual(out["logit_lens_entropy_mean"].item(), math.log(vocab), places=5)
+
+    def test_logit_lens_entropy_empty_input_is_zero(self):
+        out = massive_activation_metrics.compute_logit_lens_entropy(torch.zeros(0, 4), torch.randn(6, 4))
+        for key in ("logit_lens_entropy_mean", "logit_lens_entropy_min", "logit_lens_entropy_max"):
+            self.assertEqual(out[key].item(), 0.0)
+
+    def test_logit_lens_entropy_end_to_end_records_keys(self):
+        import math
+
+        torch.manual_seed(0)
+        num_layers, hidden, vocab = 2, 6, 10
+        model = FakeGPTModel(num_layers, hidden, vocab)
+        monitor = MassiveActivationMonitor(
+            log_post_norm_metrics=False,
+            log_activation_rms=False,
+            log_lipschitz=False,
+            log_logit_lens_entropy=True,
+            logit_lens_chunk_size=3,
+        )
+        monitor.register_hooks(model)
+        model(torch.randn(4, 2, hidden))  # [S, B, H], grad enabled so _should_monitor fires
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="massive_act")
+        for i in range(num_layers):
+            for key in ("logit_lens_entropy_mean", "logit_lens_entropy_min", "logit_lens_entropy_max"):
+                full_key = f"massive_act/layer_{i}/{key}"
+                self.assertIn(full_key, latest)
+                self.assertTrue(math.isfinite(latest[full_key]))
+            self.assertGreaterEqual(latest[f"massive_act/layer_{i}/logit_lens_entropy_min"], -1e-4)
+            self.assertLessEqual(latest[f"massive_act/layer_{i}/logit_lens_entropy_max"], math.log(vocab) + 1e-3)
+        self.assertIn("massive_act/global_logit_lens_entropy_mean", latest)
+        monitor.remove_hooks()
+
+    def test_logit_lens_entropy_absent_when_disabled(self):
+        model = FakeGPTModel(2, 6, 10)
+        monitor = MassiveActivationMonitor(
+            log_post_norm_metrics=False,
+            log_activation_rms=False,
+            log_lipschitz=False,
+            log_logit_lens_entropy=False,
+        )
+        monitor.register_hooks(model)
+        model(torch.randn(4, 2, 6))
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="massive_act")
+        self.assertFalse(any("logit_lens_entropy" in key for key in latest))
+        monitor.remove_hooks()
+
+    def test_logit_lens_entropy_no_head_stage_is_noop(self):
+        # A PP stage without the LM head: _resolve_lm_head -> (None, None), no entropy
+        # hook attaches, no entropy keys declared, and the forward runs without error.
+        model = FakeHeadlessGPTModel(2, 6)
+        monitor = MassiveActivationMonitor(
+            log_post_norm_metrics=False,
+            log_activation_rms=False,
+            log_lipschitz=False,
+            log_logit_lens_entropy=True,
+        )
+        self.assertEqual(monitor._resolve_lm_head(model), (None, None))
+        monitor.register_hooks(model)
+        model(torch.randn(4, 2, 6))
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="massive_act")
+        self.assertFalse(any("logit_lens_entropy" in key for key in latest))
+        monitor.remove_hooks()
+
+    def test_logit_lens_entropy_layer_filter_restricts_declared_layers(self):
+        # logit_lens_layers restricts the entropy metric to the listed global indices.
+        model = FakeGPTModel(3, 6, 10)
+        monitor = MassiveActivationMonitor(
+            log_post_norm_metrics=False,
+            log_activation_rms=False,
+            log_lipschitz=False,
+            log_logit_lens_entropy=True,
+            logit_lens_layers=[1],
+        )
+        monitor.register_hooks(model)
+        model(torch.randn(4, 2, 6))
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="massive_act")
+        self.assertIn("massive_act/layer_1/logit_lens_entropy_mean", latest)
+        self.assertNotIn("massive_act/layer_0/logit_lens_entropy_mean", latest)
+        self.assertNotIn("massive_act/layer_2/logit_lens_entropy_mean", latest)
+        monitor.remove_hooks()
 
 
 class SinkHeadClassificationTest(unittest.TestCase):

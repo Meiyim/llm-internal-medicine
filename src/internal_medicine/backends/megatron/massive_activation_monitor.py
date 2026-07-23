@@ -16,11 +16,18 @@ from .massive_activation_metrics import (
     DEFAULT_ABSOLUTE_THRESHOLDS,
     _threshold_key,
     compute_grad_gain_bounds,
+    compute_logit_lens_entropy,
     compute_per_channel_max,
     compute_post_norm_cosine_stability,
     compute_post_norm_sparsity,
     compute_spectral_norm_bounds,
     summarize_per_channel_max,
+)
+
+_LOGIT_LENS_METRIC_NAMES = (
+    "logit_lens_entropy_mean",
+    "logit_lens_entropy_min",
+    "logit_lens_entropy_max",
 )
 
 logger = logging.getLogger(__name__)
@@ -41,10 +48,12 @@ class MassiveActivationMonitor(TorchProbe):
         "massive_act_channel_count",
         "spectral_norm_max",
         "lipschitz_max",
+        "logit_lens_entropy_max",
     }
     MIN_AGGREGATED = {
         "spectral_norm_min",
         "lipschitz_min",
+        "logit_lens_entropy_min",
     }
 
     def __init__(
@@ -62,6 +71,10 @@ class MassiveActivationMonitor(TorchProbe):
         log_post_norm_metrics: bool = True,
         log_activation_rms: bool = True,
         log_lipschitz: bool = True,
+        log_logit_lens_entropy: bool = False,
+        logit_lens_chunk_size: int = 1024,
+        logit_lens_apply_final_norm: bool = True,
+        logit_lens_layers: list[int] | None = None,
         hook_timing_enabled: bool = False,
     ):
         super().__init__(
@@ -89,6 +102,17 @@ class MassiveActivationMonitor(TorchProbe):
         # input/output hidden states — module full_backward_hook cannot see the input
         # grad because Megatron calls layers with all-keyword args.
         self.log_lipschitz = log_lipschitz
+        # Logit-lens predictive entropy H(p) of each layer's residual, projected
+        # through the LM head. Opt-in / default off: the projection is ~one LM-head
+        # forward per monitored layer per monitored step. Only attached on the PP
+        # stage that owns the head weight (non-head stages are a clean no-op).
+        self.log_logit_lens_entropy = log_logit_lens_entropy
+        self.logit_lens_chunk_size = logit_lens_chunk_size
+        self.logit_lens_apply_final_norm = logit_lens_apply_final_norm
+        self.logit_lens_layers = set(logit_lens_layers) if logit_lens_layers else None
+        # global_idx -> (lm_head_weight, final_norm) for head-owning, eligible layers.
+        # Populated in _prepare_layers; read in _attach_hooks to decide the entropy hook.
+        self._layer_head_info: dict[int, tuple] = {}
         self.MAX_AGGREGATED = self.MAX_AGGREGATED | {
             f"channel_count_gt_{_threshold_key(t)}" for t in self.absolute_thresholds
         }
@@ -155,9 +179,23 @@ class MassiveActivationMonitor(TorchProbe):
                 continue
             targets.append((global_idx, layer))
 
+        # Resolve the LM head once per chunk for the logit-lens entropy metric.
+        # Returns (None, None) on PP stages that don't own the head weight, which
+        # keeps the metric a clean no-op there (no weight broadcast).
+        head_weight, head_norm = (None, None)
+        if self.log_logit_lens_entropy:
+            head_weight, head_norm = self._resolve_lm_head(model)
+
         for global_idx, _ in targets:
             for name in self._layer_metric_names():
                 self.declare_layer_metric(global_idx, name)
+            # Entropy keys are declared ONLY on the head-owning chunk, and only for
+            # the (optionally logit_lens_layers-filtered) eligible layers. Non-head
+            # PP stages declare nothing here and attach no entropy hook.
+            if head_weight is not None and (self.logit_lens_layers is None or global_idx in self.logit_lens_layers):
+                self._layer_head_info[global_idx] = (head_weight, head_norm)
+                for name in _LOGIT_LENS_METRIC_NAMES:
+                    self.declare_layer_metric(global_idx, name)
         return targets
 
     def _attach_hooks(self, targets: list[tuple[int, nn.Module]]):
@@ -192,6 +230,18 @@ class MassiveActivationMonitor(TorchProbe):
                     self.timed_hook("grad_gain", self._make_grad_gain_hook(global_idx)), with_kwargs=True
                 )
                 self.hooks.append(grad_hook)
+            # Logit-lens entropy rides its own forward hook on the layer output, but
+            # only for layers on the head-owning chunk (populated in _prepare_layers).
+            # The weight captured here is a live Parameter, so each step reads the
+            # current (optimizer-updated) weight without a per-hook lookup.
+            head_info = self._layer_head_info.get(global_idx)
+            if head_info is not None:
+                weight, final_norm = head_info
+                ll_hook = layer.register_forward_hook(
+                    self.timed_hook("logit_lens", self._make_logit_lens_hook(global_idx, weight, final_norm)),
+                    with_kwargs=True,
+                )
+                self.hooks.append(ll_hook)
             registered += 1
         logger.info(f"[MassiveActMonitor] Registered {registered} hooks.")
 
@@ -215,6 +265,39 @@ class MassiveActivationMonitor(TorchProbe):
             return []
 
         return list(enumerate(layers))
+
+    def _resolve_lm_head(self, model: nn.Module):
+        """Return ``(lm_head_weight, final_norm)`` for this model chunk, else ``(None, None)``.
+
+        Only the PP stage that owns the LM head (the last stage, or a tied-embedding
+        stage) exposes the output weight; every other stage returns ``(None, None)``
+        so the logit-lens metric is a clean no-op there — no weight is broadcast.
+        Uses the tie-safe ``shared_embedding_or_output_weight()`` accessor when present
+        (handles tied input/output embeddings), falling back to ``output_layer.weight``.
+        The final norm (``decoder.final_layernorm``) is what the LM head was trained on,
+        so intermediate residuals are normed through it before projection.
+        """
+        if hasattr(model, "module"):
+            model = model.module
+
+        weight = None
+        getter = getattr(model, "shared_embedding_or_output_weight", None)
+        if callable(getter):
+            try:
+                weight = getter()
+            except Exception:
+                weight = None
+        if weight is None:
+            output_layer = getattr(model, "output_layer", None)
+            weight = getattr(output_layer, "weight", None) if output_layer is not None else None
+        if weight is None:
+            return None, None
+
+        final_norm = None
+        decoder = getattr(model, "decoder", None)
+        if decoder is not None:
+            final_norm = getattr(decoder, "final_layernorm", None)
+        return weight, final_norm
 
     def _extract_hidden_states(self, args, kwargs=None):
         if args:
@@ -344,6 +427,41 @@ class MassiveActivationMonitor(TorchProbe):
 
         return hook_fn
 
+    def _make_logit_lens_hook(self, layer_idx: int, lm_head_weight: torch.Tensor, final_norm):
+        """Forward hook: predictive entropy of this layer's output via the logit lens.
+
+        Projects the layer output residual through the LM head to vocab logits and
+        records per-token entropy mean/min/max. Chunked over tokens, so the full
+        ``[tokens, vocab]`` logits are never materialized. Attached only on the
+        head-owning PP stage; the weight is a live Parameter captured at attach time.
+        Vocab-parallel TP is not supported yet — ``compute_logit_lens_entropy`` asserts
+        ``tp_size <= 1``.
+        """
+        norm = final_norm if self.logit_lens_apply_final_norm else None
+
+        def hook_fn(module, args, kwargs, output):
+            if not self._should_monitor():
+                return
+            try:
+                post = self._first_tensor(output)
+                if post is None:
+                    return
+                with torch.no_grad():
+                    tensor_metrics = compute_logit_lens_entropy(
+                        post.detach(),
+                        lm_head_weight,
+                        final_norm=norm,
+                        chunk_size=self.logit_lens_chunk_size,
+                        tp_size=self.tp_size,
+                    )
+                for name, val in tensor_metrics.items():
+                    self.record_layer_metric(layer_idx, name, val)
+            except Exception as e:
+                if self.verbose:
+                    logger.error(f"[MassiveActMonitor] Logit-lens error at layer {layer_idx}: {e}")
+
+        return hook_fn
+
     def _compute_residual_metrics(self, layer_idx: int, hidden_states: torch.Tensor):
         per_channel_max = compute_per_channel_max(hidden_states)
         per_channel_max = self._aggregate_per_channel_max(per_channel_max)
@@ -405,6 +523,10 @@ def setup_massive_activation_monitor(
     log_post_norm_metrics: bool = True,
     log_activation_rms: bool = True,
     log_lipschitz: bool = True,
+    log_logit_lens_entropy: bool = False,
+    logit_lens_chunk_size: int = 1024,
+    logit_lens_apply_final_norm: bool = True,
+    logit_lens_layers: list[int] | None = None,
     hook_timing_enabled: bool = False,
     monitor_dict: dict | None = None,
 ):
@@ -422,6 +544,10 @@ def setup_massive_activation_monitor(
         log_post_norm_metrics=log_post_norm_metrics,
         log_activation_rms=log_activation_rms,
         log_lipschitz=log_lipschitz,
+        log_logit_lens_entropy=log_logit_lens_entropy,
+        logit_lens_chunk_size=logit_lens_chunk_size,
+        logit_lens_apply_final_norm=logit_lens_apply_final_norm,
+        logit_lens_layers=logit_lens_layers,
         hook_timing_enabled=hook_timing_enabled,
     )
 

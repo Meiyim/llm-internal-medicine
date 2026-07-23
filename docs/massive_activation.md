@@ -1,6 +1,6 @@
 # Massive Activation Monitor
 
-**Residual Stream Massive Activation 健康监控模块**，监控 17 个核心指标。
+**Residual Stream Massive Activation 健康监控模块**，监控 20 个核心指标。
 
 基于论文发现实现：
 
@@ -272,6 +272,48 @@ lipschitz_min = min_t(ratio_t)   # 一个 global batch 内对所有 token 取 mi
 
 ---
 
+### 12. Logit-Lens Predictive Entropy (逐层 logit-lens 预测熵，可选)
+
+> **默认关闭**（`log_logit_lens_entropy=True` 开启）。开销较大：每监控层每监控步做一次 LM-head 前向。
+
+**数学公式：**
+```
+l_t = final_norm(h_t) · Wᵀ          # 第 t 个 token 经 LM head 投影到 vocab logits
+p_t = softmax(l_t)
+H(p_t) = -Σ_v p_t[v] · log p_t[v] ∈ [0, log(vocab)]
+logit_lens_entropy_{mean,min,max} = {mean_t, min_t, max_t} H(p_t)
+```
+
+用 *logit lens* 把每层残差 `h`（先过 `decoder.final_layernorm`，因为 LM head 是在 final-norm 后的
+表征上训练的）投影到 vocab logits，求 softmax 的 Shannon 熵。它衡量"这一层的表征对下一个 token 的
+预测有多笃定"——熵通常随深度下降（模型逐层收敛到预测），突变是有用的健康/异常信号，与 spike 生命周期、
+谱范数/Lipschitz 增益互补。
+
+**实现要点（VRAM + 数值 + 并行）：**
+- **分块**：投影 `final_norm(h) @ Wᵀ` 按 token 切成 `[chunk_size, vocab]` 的 tile 逐块计算并丢弃
+  （`logit_lens_chunk_size`，默认 1024），任一时刻只物化一个 tile，**绝不 materialize 完整
+  `[tokens, vocab]` logits**；跨块只累积每 token 一个 float 的熵。
+- **数值（用 torch.logsumexp）**：写成 `H = log_z − E_p[l]`，其中 `log_z = torch.logsumexp(l)`、
+  `E_p[l] = Σ softmax(l)·l`。直接用 `torch.logsumexp` / `torch.softmax` 这两个融合且数值稳定的原语，
+  **不手写 `shifted.exp()` 也不单独 `.log()`**。
+- **vocab-parallel TP（暂不支持）**：`compute_logit_lens_entropy` 断言 `tp_size <= 1`。vocab 维被 TP
+  切分时 softmax 归一化跨 rank，需要 MAX + SUM all-reduce，而这两步无法与 `torch.logsumexp` 融合
+  （log 域的 partial 不能直接 SUM），因此当前**先断言关闭**，后续再补。caller 只在持有 head 的 stage
+  attach，且假定该 head 未按 vocab 切分。
+- **PP 覆盖**：只有持有 LM head 权重的 PP stage（最后 stage / tied-embedding stage）计算此指标；
+  其余 stage `_resolve_lm_head` 返回 `(None, None)`——不 attach hook、不声明 key、彻底 no-op，
+  **不做任何权重广播**。这是有意设计，不是待修复的限制。
+- **权重引用**：hook attach 时捕获 LM head 的 live `Parameter` 引用，optimizer 就地更新它，因此每步
+  读到的都是当前权重，无需每 hook 查找。
+- `logit_lens_layers`（默认 `None`=持有 head 的全部层）可只监控指定 global 层索引，进一步降开销。
+
+**诊断意义：**
+- 熵随深度**单调下降**是健康的"逐层定型"；某层熵**异常回升**说明该层表征偏离预测方向
+- 全程熵**过高**（接近 `log(vocab)`）说明表征几乎不携带预测信息；**过低**说明过早 over-commit
+- `logit_lens_entropy_min` 抓最笃定 token，`_max` 抓最犹豫 token，两者裂开说明 batch 内预测确定性分化
+
+---
+
 ## 健康阈值参考
 
 | 指标 | 值 | 状态 | 说明 |
@@ -302,6 +344,9 @@ lipschitz_min = min_t(ratio_t)   # 一个 global batch 内对所有 token 取 mi
 | | 持续 > 1 且上升 | WARNING | 反向梯度放大，Lipschitz 增大，关注梯度爆炸 |
 | `lipschitz_min` | ~1.0 | NORMAL | 层 Jacobian 增益接近恒等 |
 | | << 1.0 | WARNING | 对部分方向强烈压缩梯度，关注梯度消失 |
+| `logit_lens_entropy_mean` | 随深度下降 | NORMAL | 表征逐层收敛到预测 |
+| | 某层异常回升 | WARNING | 该层表征偏离预测方向 |
+| | 全程接近 `log(vocab)` | WARNING | 表征几乎不携带预测信息 |
 
 ---
 
@@ -324,6 +369,7 @@ lipschitz_min = min_t(ratio_t)   # 一个 global batch 内对所有 token 取 mi
 - **TP per-channel 聚合**：Megatron/PaddleFleet TP 切通道维时会在 hook 内对 per-channel max 做一次 `MAX all_reduce`，这是正确性所需
 - **Post-norm 指标**：需要额外一次 RMSNorm forward（无梯度），开销约等于一个 norm 层
 - **Cosine stability**：采样 256 对，O(256×H)，通常较小
+- **Logit-lens entropy**（可选，默认关）：每监控层每监控步一次 LM-head 前向，复杂度约 O(S×H×vocab)，是本 monitor 中**最重**的指标；按 token 分块把峰值显存限制在一个 `[chunk, vocab]` tile，但计算量仍显著，建议配合大 `monitor_interval` 与 `logit_lens_layers` 使用
 
 ### 内存开销
 - 不保存激活值，不影响梯度计算
@@ -405,3 +451,7 @@ for key, val in sorted(spike_metrics.items()):
 | `sparsity_epsilon` | `0.01` | post-norm sparsity 判定阈值 |
 | `cosine_sample_pairs` | `256` | cosine stability 的采样对数 |
 | `sample_layers` | `None` | 要监控的层索引列表，None=全部 |
+| `log_logit_lens_entropy` | `False` | 是否开启 logit-lens 预测熵指标（开销大，默认关） |
+| `logit_lens_chunk_size` | `1024` | logit-lens 投影按 token 分块的 tile 大小 |
+| `logit_lens_apply_final_norm` | `True` | 投影前是否过 `decoder.final_layernorm` |
+| `logit_lens_layers` | `None` | logit-lens 只监控的 global 层索引列表，None=持有 head 的全部层 |

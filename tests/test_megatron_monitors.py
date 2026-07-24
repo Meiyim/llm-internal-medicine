@@ -34,6 +34,14 @@ class FakePLESublayer:
     act_fn = F.gelu
 
 
+class WeakRefable:
+    """Attribute bag that (unlike SimpleNamespace) supports weakref, so it can
+    stand in for a router module in _load_balance_routers."""
+
+    def __init__(self, **attrs):
+        self.__dict__.update(attrs)
+
+
 class FakeMoELayer(nn.Module):
     def __init__(self, experts):
         super().__init__()
@@ -158,7 +166,7 @@ class MegatronMoEMonitorTest(unittest.TestCase):
         # layer 0: [5,3,2,2] -> max/min=5/2=2.5, max/median=5/2=2.5
         # layer 1: [10,0,4,6] -> max/min=10/1(clamp)=10, max/median=10/4=2.5
         reduced = torch.tensor([[5.0, 3.0, 2.0, 2.0], [10.0, 0.0, 4.0, 6.0]])
-        monitor._record_load_balance_metrics(reduced)
+        monitor._record_load_balance_metrics(reduced, monitor._load_balance_layer_order)
         monitor.step()
 
         latest = training_logs.get_latest(prefix="moe_health")
@@ -171,15 +179,123 @@ class MegatronMoEMonitorTest(unittest.TestCase):
         self.assertIn("moe_health/global_load_max_min_ratio", latest)
         self.assertIn("moe_health/global_load_cv", latest)
 
-    def test_load_balance_metrics_absent_without_expert_bias(self):
-        # When no router has expert-bias enabled, the metric must not be
-        # declared (schema stays clean) — nothing to record or patch.
+    def test_load_balance_metrics_absent_without_any_source(self):
+        # When no router exposes global_tokens_per_expert and none has expert-bias
+        # enabled, the metric must not be declared (schema stays clean) — nothing
+        # to record or patch.
         monitor = MoESpecialistMonitor(log_per_layer=True, log_global=True)
         self.assertFalse(monitor._expert_bias_enabled)
+        self.assertFalse(monitor._global_lb_enabled)
         self.assertEqual(monitor._load_balance_layer_order, [])
-        # Idempotent no-op when expert-bias is off.
+        self.assertEqual(monitor._load_balance_routers, [])
+        # Both global patches are idempotent no-ops when no source is present.
         monitor._patch_expert_bias_update()
+        monitor._patch_reset_temporary_tensors()
         self.assertIsNone(monitor._orig_get_updated_expert_bias)
+        self.assertIsNone(monitor._orig_reset_model_temporary_tensors)
+
+    def test_prepare_layers_prefers_global_over_expert_bias(self):
+        # A router exposing both global_tokens_per_expert and enable_expert_bias
+        # must be routed to the global source, not the expert-bias fallback.
+        monitor = MoESpecialistMonitor(log_per_layer=True, log_global=True)
+        router = WeakRefable(
+            global_tokens_per_expert=torch.zeros(4),
+            ga_steps=torch.tensor(0.0),
+            enable_expert_bias=True,
+        )
+        moe_layer = SimpleNamespace(router=router)
+        monitor._find_moe_layers = lambda _model: [(0, moe_layer)]
+        monitor._prepare_layers(object())
+        self.assertTrue(monitor._global_lb_enabled)
+        self.assertEqual([idx for idx, _ in monitor._load_balance_routers], [0])
+        self.assertFalse(monitor._expert_bias_enabled)
+        self.assertEqual(monitor._load_balance_layer_order, [])
+
+    def test_load_balance_metrics_from_global_tokens_per_expert(self):
+        # Preferred path: counts sourced from each router's own
+        # global_tokens_per_expert buffer (already TPxCPxDP-reduced).
+        monitor = MoESpecialistMonitor(log_per_layer=True, log_global=True)
+        routers = [
+            WeakRefable(global_tokens_per_expert=torch.tensor([5.0, 3.0, 2.0, 2.0]), ga_steps=torch.tensor(4.0)),
+            WeakRefable(global_tokens_per_expert=torch.tensor([10.0, 0.0, 4.0, 6.0]), ga_steps=torch.tensor(4.0)),
+        ]
+        monitor._global_lb_enabled = True
+        monitor._load_balance_routers = [(idx, weakref.ref(r)) for idx, r in enumerate(routers)]
+        for layer_idx in (0, 1):
+            for name in moe_monitor_module._LOAD_BALANCE_METRICS:
+                monitor.declare_layer_metric(layer_idx, name)
+        monitor.allocate_buffers(torch.device("cpu"))
+
+        monitor._record_global_load_balance_metrics()
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="moe_health")
+        # Ratios are scale-invariant, so raw sums give the same values as the
+        # expert-bias test rows: layer 0 -> 2.5, layer 1 -> 10 / 2.5.
+        self.assertAlmostEqual(latest["moe_health/layer_0/load_max_min_ratio"], 2.5, places=5)
+        self.assertAlmostEqual(latest["moe_health/layer_1/load_max_min_ratio"], 10.0, places=5)
+        self.assertAlmostEqual(latest["moe_health/layer_0/load_max_median_ratio"], 2.5, places=5)
+        self.assertAlmostEqual(latest["moe_health/layer_1/load_max_median_ratio"], 2.5, places=5)
+        self.assertIn("moe_health/global_load_max_min_ratio", latest)
+
+    def test_global_load_balance_skips_uninitialized_ga_steps(self):
+        # A router whose global_aux_loss buffer has not accumulated yet
+        # (ga_steps == 0) must be skipped, not divide-by-zero or emit garbage.
+        monitor = MoESpecialistMonitor(log_per_layer=True, log_global=True)
+        router = WeakRefable(global_tokens_per_expert=torch.zeros(4), ga_steps=torch.tensor(0.0))
+        monitor._global_lb_enabled = True
+        monitor._load_balance_routers = [(0, weakref.ref(router))]
+        for name in moe_monitor_module._LOAD_BALANCE_METRICS:
+            monitor.declare_layer_metric(0, name)
+        monitor.allocate_buffers(torch.device("cpu"))
+
+        monitor._record_global_load_balance_metrics()
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="moe_health")
+        self.assertNotIn("moe_health/layer_0/load_max_min_ratio", latest)
+
+    def test_reset_temporary_tensors_patch_reads_before_zero(self):
+        # The wrapper must rebind reset_model_temporary_tensors in
+        # finalize_model_grads and read global_tokens_per_expert BEFORE the
+        # original zeroes it.
+        fmg = moe_monitor_module._finalize_model_grads
+        original = fmg.reset_model_temporary_tensors
+
+        router = WeakRefable(
+            global_tokens_per_expert=torch.tensor([6.0, 2.0, 3.0, 3.0]),  # max/min=3, max/median=2
+            ga_steps=torch.tensor(4.0),
+        )
+
+        # Stub original to zero the buffer, proving the wrapper read it first.
+        def zeroing_reset(*_a, **_k):
+            router.global_tokens_per_expert.zero_()
+            router.ga_steps.zero_()
+
+        fmg.reset_model_temporary_tensors = zeroing_reset
+
+        monitor = MoESpecialistMonitor(log_per_layer=True, log_global=True)
+        monitor._global_lb_enabled = True
+        monitor._load_balance_routers = [(0, weakref.ref(router))]
+        for name in moe_monitor_module._LOAD_BALANCE_METRICS:
+            monitor.declare_layer_metric(0, name)
+        monitor.allocate_buffers(torch.device("cpu"))
+
+        try:
+            monitor._patch_reset_temporary_tensors()
+            self.assertTrue(getattr(fmg.reset_model_temporary_tensors, "_im_patched", False))
+
+            fmg.reset_model_temporary_tensors(None, None)  # config, model
+            # Buffer was zeroed by the original, proving order.
+            self.assertEqual(float(router.global_tokens_per_expert.sum()), 0.0)
+            monitor.step()
+
+            latest = training_logs.get_latest(prefix="moe_health")
+            self.assertAlmostEqual(latest["moe_health/layer_0/load_max_min_ratio"], 3.0, places=5)
+            self.assertAlmostEqual(latest["moe_health/layer_0/load_max_median_ratio"], 2.0, places=5)
+        finally:
+            monitor.remove_hooks()
+            fmg.reset_model_temporary_tensors = original
 
     def test_expert_bias_patch_rebinds_caller_and_fires(self):
         # The wrapper must rebind the name in finalize_model_grads (the caller),

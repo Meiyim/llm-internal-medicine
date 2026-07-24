@@ -41,11 +41,17 @@ _ROUTER_METRICS = (
     "bias_affinity_jaccard",
 )
 
-# Emitted only when moe_router_enable_expert_bias is on. mcore already
-# all-reduces tokens-per-expert across TPxCPxDP inside get_updated_expert_bias
-# (once per global batch, off the hot path); we piggyback on that reduced
-# tensor rather than adding any monitor-side collective. See
-# _patch_expert_bias_update / _record_load_balance_metrics.
+# Emitted from globally-reduced per-expert token counts. Two sources, no
+# monitor-side collective in either case (mcore already all-reduces across
+# TPxCPxDP once per global batch, off the hot path):
+#   1. Preferred: router.global_tokens_per_expert, the running TPxCPxDP-reduced
+#      sum maintained by the global_aux_loss path. Read at finalize time, just
+#      before reset_model_temporary_tensors zeroes it. See
+#      _patch_reset_temporary_tensors / _record_global_load_balance_metrics.
+#   2. Fallback: the tokens_per_expert tensor get_updated_expert_bias reduces
+#      in-place, for models running moe_router_enable_expert_bias (e.g. sigmoid
+#      DeepSeek-style) without global_aux_loss. See _patch_expert_bias_update.
+# Both feed _record_load_balance_metrics, which needs no cross-rank aggregation.
 _LOAD_BALANCE_METRICS = (
     "load_max_min_ratio",
     "load_max_median_ratio",
@@ -85,6 +91,12 @@ class MoESpecialistMonitor(TorchProbe):
         self._expert_bias_enabled = False
         self._load_balance_layer_order: list[int] = []
         self._orig_get_updated_expert_bias = None
+        # Preferred load-balance source: routers exposing global_tokens_per_expert
+        # (the global_aux_loss path). Each owns its own reduced buffer, so we keep
+        # (layer_idx, weakref(router)) rather than a stacking order.
+        self._global_lb_enabled = False
+        self._load_balance_routers: list[tuple[int, weakref.ref]] = []
+        self._orig_reset_model_temporary_tensors = None
 
     def register_hooks(self, model: nn.Module):
         self._init_parallel_state()
@@ -94,6 +106,7 @@ class MoESpecialistMonitor(TorchProbe):
         self.allocate_buffers(next(model.parameters()).device)
         self._attach_hooks(targets)
         self._patch_expert_bias_update()
+        self._patch_reset_temporary_tensors()
 
     def _init_parallel_state(self):
         try:
@@ -115,11 +128,19 @@ class MoESpecialistMonitor(TorchProbe):
         for layer_idx, moe_layer in moe_layers:
             for name in (*_ROUTER_METRICS, *_EXPERT_METRICS):
                 self.declare_layer_metric(layer_idx, name)
-            # Load-balance ratios are only observable when expert-bias is on
-            # (mcore all-reduces tokens-per-expert only in that path). Declare
-            # them here so the schema is locked before allocate_buffers.
+            # Load-balance ratios need globally-reduced per-expert counts. Prefer
+            # router.global_tokens_per_expert (global_aux_loss path); fall back to
+            # the expert-bias path when only that is available. Declare the metrics
+            # here so the schema is locked before allocate_buffers.
             router = getattr(moe_layer, "router", None)
-            if router is not None and getattr(router, "enable_expert_bias", False):
+            if router is None:
+                continue
+            if getattr(router, "global_tokens_per_expert", None) is not None:
+                self._global_lb_enabled = True
+                self._load_balance_routers.append((layer_idx, weakref.ref(router)))
+                for name in _LOAD_BALANCE_METRICS:
+                    self.declare_layer_metric(layer_idx, name)
+            elif getattr(router, "enable_expert_bias", False):
                 self._expert_bias_enabled = True
                 self._load_balance_layer_order.append(layer_idx)
                 for name in _LOAD_BALANCE_METRICS:
@@ -174,7 +195,7 @@ class MoESpecialistMonitor(TorchProbe):
             # monitor-interval gate.
             try:
                 if monitor._should_monitor(in_forward=False):
-                    monitor._record_load_balance_metrics(tokens_per_expert.detach())
+                    monitor._record_load_balance_metrics(tokens_per_expert.detach(), monitor._load_balance_layer_order)
             except Exception as e:
                 if monitor.verbose:
                     logger.error(f"[MoEMonitor] load-balance metric error: {e}")
@@ -184,21 +205,91 @@ class MoESpecialistMonitor(TorchProbe):
         patched._im_original = original
         fmg.get_updated_expert_bias = patched
         self._orig_get_updated_expert_bias = (fmg, original)
-        if self.verbose:
-            logger.info(
-                f"[MoEMonitor] Patched get_updated_expert_bias for "
-                f"{len(self._load_balance_layer_order)} bias-enabled layers."
-            )
+        logger.info(
+            f"[MoEMonitor] Successfully patched get_updated_expert_bias for "
+            f"{len(self._load_balance_layer_order)} bias-enabled layers."
+        )
 
-    def _record_load_balance_metrics(self, tokens_per_expert: torch.Tensor):
+    def _patch_reset_temporary_tensors(self):
+        """Snapshot router.global_tokens_per_expert at finalize time, just before
+        mcore zeroes it, to emit load-balance ratios without any monitor-side
+        collective.
+
+        The global_aux_loss path keeps a per-router ``global_tokens_per_expert``
+        buffer, already all-reduced across TPxCPxDP and summed over the global
+        batch. It is zeroed inside ``finalize_model_grads`` via
+        ``reset_model_temporary_tensors`` (end of forward-backward, before the
+        optimizer step and before ``training_log``), so it must be read *before*
+        that reset — a post-step read would see zeros.
+
+        ``reset_model_temporary_tensors`` is defined in the ``finalize_model_grads``
+        module and called there via module-global lookup, so rebinding the module
+        attribute is picked up by the caller — same mechanism as the
+        ``get_updated_expert_bias`` patch below.
+        """
+        if not self._global_lb_enabled:
+            return
+        fmg = _finalize_model_grads
+        if getattr(fmg.reset_model_temporary_tensors, "_im_patched", False):
+            return
+
+        original = fmg.reset_model_temporary_tensors
+        monitor = self
+
+        def patched(*args, **kwargs):
+            # Read the counts BEFORE the original zeroes them. in_forward=False:
+            # this runs at finalize time, outside any forward, so keep the
+            # monitor-interval gate but skip the recompute grad guard.
+            try:
+                if monitor._should_monitor(in_forward=False):
+                    monitor._record_global_load_balance_metrics()
+            except Exception as e:
+                if monitor.verbose:
+                    logger.error(f"[MoEMonitor] global load-balance metric error: {e}")
+            return original(*args, **kwargs)
+
+        patched._im_patched = True
+        patched._im_original = original
+        fmg.reset_model_temporary_tensors = patched
+        self._orig_reset_model_temporary_tensors = (fmg, original)
+        logger.info(
+            f"[MoEMonitor] Successfully patched reset_model_temporary_tensors for "
+            f"{len(self._load_balance_routers)} global-aux-loss layers."
+        )
+
+    def _record_global_load_balance_metrics(self):
+        """Stack live routers' global_tokens_per_expert and record load ratios.
+
+        Counts are already TPxCPxDP-reduced and identical across that group, so
+        the ratios are globally correct with no cross-rank aggregation. Ratios are
+        scale-invariant, so the raw accumulated sum is used directly (no /ga_steps).
+        """
+        counts = []
+        layer_order = []
+        for layer_idx, router_ref in self._load_balance_routers:
+            router = router_ref()
+            if router is None:
+                continue
+            tpe = getattr(router, "global_tokens_per_expert", None)
+            ga_steps = getattr(router, "ga_steps", None)
+            if tpe is None or (ga_steps is not None and float(ga_steps) == 0.0):
+                continue
+            counts.append(tpe.detach())
+            layer_order.append(layer_idx)
+        if not counts:
+            return
+        stacked = torch.stack(counts, dim=0)
+        self._record_load_balance_metrics(stacked, layer_order)
+
+    def _record_load_balance_metrics(self, tokens_per_expert: torch.Tensor, layer_order: list[int]):
         ratios = compute_load_balance_ratios(tokens_per_expert)
         if ratios is None:
             return
         max_min = ratios["load_max_min_ratio"]
         max_median = ratios["load_max_median_ratio"]
         load_cv = ratios["load_cv"]
-        n = min(max_min.shape[0], len(self._load_balance_layer_order))
-        for row, layer_idx in zip(range(n), self._load_balance_layer_order[:n], strict=False):
+        n = min(max_min.shape[0], len(layer_order))
+        for row, layer_idx in zip(range(n), layer_order[:n], strict=False):
             self.record_layer_metric(layer_idx, "load_max_min_ratio", max_min[row])
             self.record_layer_metric(layer_idx, "load_max_median_ratio", max_median[row])
             self.record_layer_metric(layer_idx, "load_cv", load_cv[row])
@@ -228,6 +319,7 @@ class MoESpecialistMonitor(TorchProbe):
         router._apply_aux_loss = patched_apply
         router._im_patched = True
         self._patched_routers.append(weakref.ref(router))
+        logger.info("[MoEMonitor] Successfully patched router._apply_aux_loss for score/routing-map caching.")
 
     def _find_moe_layers(self, model: nn.Module) -> list[tuple[int, nn.Module]]:
         moe_layers = []
@@ -389,6 +481,11 @@ class MoESpecialistMonitor(TorchProbe):
             if getattr(fmg.get_updated_expert_bias, "_im_patched", False):
                 fmg.get_updated_expert_bias = original
             self._orig_get_updated_expert_bias = None
+        if self._orig_reset_model_temporary_tensors is not None:
+            fmg, original = self._orig_reset_model_temporary_tensors
+            if getattr(fmg.reset_model_temporary_tensors, "_im_patched", False):
+                fmg.reset_model_temporary_tensors = original
+            self._orig_reset_model_temporary_tensors = None
         for router_ref in self._patched_routers:
             router = router_ref()
             if router is None:
@@ -406,6 +503,7 @@ class MoESpecialistMonitor(TorchProbe):
                     delattr(router, attr)
         self._monitored_moe_layers = []
         self._patched_routers = []
+        self._load_balance_routers = []
 
     def get_health_summary(self) -> dict[str, Any]:
         metrics = training_logs.get_latest(prefix="moe_health")
@@ -447,6 +545,7 @@ def setup_moe_monitor(
             monitor._attach_hooks(targets)
         # Idempotent global patch; call once after all chunks' schemas are locked.
         monitor._patch_expert_bias_update()
+        monitor._patch_reset_temporary_tensors()
     logger.info(f"[MoEMonitor] Setup complete. Monitoring {len(monitor.hooks)} hooks.")
     if monitor_dict is not None:
         monitor_dict["moe_health"] = monitor

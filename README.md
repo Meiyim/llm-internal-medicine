@@ -5,7 +5,7 @@
 包含五大监控模块：
 - **[MoE Health](./docs/moe_specialist.md)** — MoE 专家系统健康监控 (13 指标)
 - **[QK Stats](./docs/qk_logits.md)** — 注意力 QK 统计监控 (9 指标)
-- **[Massive Activation Health](./docs/massive_activation.md)** — Residual Stream Massive Activation 健康监控 (17 指标)
+- **[Massive Activation Health](./docs/massive_activation.md)** — Residual Stream Massive Activation 健康监控 (20 指标)
 - **[PLE Health](./docs/ple_health.md)** — Per-Layer Embedding 健康监控 (7 指标)
 - **[mHC Health](./docs/mhc_health.md)** — Manifold-Constrained Hyper-Connections 映射监控 (每 hc 模块 8 指标；仅在开启 mHC 层时生效)
 
@@ -70,6 +70,7 @@ internal_medicine_monitors:
 `setup_internal_medicine(..., massive_act={"log_activation_rms": False, "log_post_norm_metrics": False})`。
 `log_activation_rms` 统一控制残差尺度/增益一组指标（`activation_rms` + `spectral_norm_max/min`）——`activation_rms` 由 spectral hook 的 per-token pre-RMS 免费导出，故合用一个开关。
 `log_lipschitz`（默认 `true`）控制每层 Lipschitz/梯度增益指标（`lipschitz_max/min`）——由 forward hook 在输入/输出 hidden 上注册 tensor grad hook，在反向传播采集 `‖∂L/∂x‖/‖∂L/∂y‖`。
+`log_logit_lens_entropy`（默认 **`false`**）控制 logit-lens 预测熵指标（`logit_lens_entropy_mean/min/max`）——将每层残差经 LM head 投影求 softmax 熵，**开销较大**故默认关闭。配套参数：`logit_lens_chunk_size`（默认 `1024`，按 token 分块的 tile 大小）、`logit_lens_apply_final_norm`（默认 `true`，投影前是否过 `decoder.final_layernorm`）、`logit_lens_layers`（默认 `None`=全部持有 head 的层；传 list 只监控指定 global 层索引）。PP 下仅持有 LM head 的 stage 生效，其余 stage 为 no-op。
 list 形式仍兼容，但需要按 monitor 传参时不要再额外加 `internal_medicine_monitor_kwargs` 字段。
 
 ### 读取指标
@@ -157,10 +158,17 @@ setup_internal_medicine()
 | 15 | `load_max_median_ratio` | `moe_health/.../load_max_median_ratio` | `max(tokens) / median(tokens)` | 每层+全局 | 最忙/中位专家 token 数比值 |
 | 16 | `load_cv` | `moe_health/.../load_cv` | `std(tokens) / mean(tokens)` | 每层+全局 | 专家负载变异系数 (均衡=0) |
 
-> **注**: 指标 14-16 (`load_*`) 仅在 `moe_router_enable_expert_bias=true` 时输出。
-> 它们复用 mcore 在 `get_updated_expert_bias` 中已做的 TPxCPxDP all-reduce
-> (每个 global batch 一次, 不在 forward hook 热路径上), 因此无需 monitor 侧
-> collective, 统计值已是全局正确值。
+> **注**: 指标 14-16 (`load_*`) 在满足以下**任一**条件时输出, 优先使用前者:
+> 1. `global_aux_loss` 已开启 (`get_aux_loss_coeff("global_aux_loss") > 0`): 复用
+>    router 的 `global_tokens_per_expert` 缓冲区 (已跨 TPxDPxCP all-reduce 并在
+>    global batch 内累加)。该缓冲区在 `finalize_model_grads` →
+>    `reset_model_temporary_tensors` 中被清零, 因此在清零**之前**读取。
+> 2. `moe_router_enable_expert_bias=true`: 复用 mcore 在 `get_updated_expert_bias`
+>    中已做的 TPxCPxDP all-reduce (softmax 模型无法开启 expert-bias, 属此路径回退项)。
+>
+> 两种来源都在 global batch 级读取 (不在 forward hook 热路径上), 且计数已跨 rank
+> reduce, 因此无需 monitor 侧 collective, 统计值已是全局正确值。load 比值本身
+> scale-invariant, 直接用累加计数即可。
 
 ### 健康阈值
 
@@ -222,6 +230,22 @@ setup_internal_medicine()
 | 15 | `spectral_norm_min` | `massive_act/.../spectral_norm_min` | `min(post_rms / pre_rms)` | 每层+全局 | 层增益比下界，最小奇异值(σ_min)上界 |
 | 16 | `lipschitz_max` | `massive_act/.../lipschitz_max` | `max(‖∂L/∂x‖ / ‖∂L/∂y‖)` | 每层+全局 | 反向梯度增益上界，σ_max(J)下界 = Lipschitz 常数 |
 | 17 | `lipschitz_min` | `massive_act/.../lipschitz_min` | `min(‖∂L/∂x‖ / ‖∂L/∂y‖)` | 每层+全局 | 反向梯度增益下界，σ_min(J)上界 |
+| 18 | `logit_lens_entropy_mean` | `massive_act/.../logit_lens_entropy_mean` | `mean_t(H(softmax(final_norm(h)·Wᵀ)))` | 每层+全局 | logit-lens 预测熵均值，随深度下降=表征逐层"定型" |
+| 19 | `logit_lens_entropy_min` | `massive_act/.../logit_lens_entropy_min` | `min_t H(p)` | 每层+全局 | 最"笃定"token 的熵 |
+| 20 | `logit_lens_entropy_max` | `massive_act/.../logit_lens_entropy_max` | `max_t H(p)` | 每层+全局 | 最"犹豫"token 的熵 |
+
+> **注**: 指标 18-20 (`logit_lens_entropy_*`) 为**默认关闭**的可选项（`log_logit_lens_entropy=True` 开启）。
+> 将每层残差经 LM head 投影到 vocab logits 求 softmax 熵 `H(p) = -Σ p·log p ∈ [0, log(vocab)]`——
+> 相当于每监控层每监控步做一次 LM-head 前向，开销较大，建议配合 `monitor_interval` 与 `logit_lens_layers`
+> （只监控指定层）使用。投影**按 token 分块**（`logit_lens_chunk_size`，默认 1024），任一时刻只物化一个
+> `[chunk, vocab]` tile，绝不materialize 完整 `[tokens, vocab]` logits。默认先过 `decoder.final_layernorm`
+> （`logit_lens_apply_final_norm=True`，LM head 是在 final-norm 后的表征上训练的）。熵用 `H = log_z − E_p[l]`
+> 写法（`log_z = torch.logsumexp(l)`、`E_p[l] = Σ softmax(l)·l`），直接用 `torch.logsumexp` / `torch.softmax`，
+> 无手写 exp/log。
+> **PP 覆盖**: 只有持有 LM head 权重的 PP stage（最后 stage / tied-embedding stage）会计算此指标；
+> 其余 stage `_resolve_lm_head` 返回 `(None, None)`，不 attach hook、不声明 key、彻底 no-op（不做权重广播）。
+> **暂不支持 vocab-parallel TP**：`compute_logit_lens_entropy` 断言 `tp_size <= 1`（TP 切 vocab 时归一化需跨 rank
+> reduce，无法与 `torch.logsumexp` 融合，后续再加）。
 
 ### 核心洞察
 
@@ -328,7 +352,7 @@ NeMo Trainer 对应字段为 `internal_medicine_hook_timing`。开启后 trainer
 
 ## 附录: 完整指标速查表
 
-共 46 个指标键 (13 MoE + 9 QK + 17 MassiveAct + 7 PLE)。
+共 49 个指标键 (13 MoE + 9 QK + 20 MassiveAct + 7 PLE)。
 
 | Monitor | 指标 | 公式 | SmoothedValue 模式 | 健康信号 |
 |---------|------|------|--------------------|----------|
@@ -345,9 +369,9 @@ NeMo Trainer 对应字段为 `internal_medicine_hook_timing`。开启后 trainer
 | **MoE** | `expert_norm_max` | `max(L2)` | max | 不应过载 |
 | **MoE** | `shared_expert_norm` | `\|\|shared\|\|₂` | mean | 稳定 |
 | **MoE** | `shared_routed_ratio` | `shared/routed` | mean | 0.3 ~ 3.0 OK |
-| **MoE** | `load_max_min_ratio` | `max/min(tokens)` | mean | 越接近 1 越均衡 (仅 expert_bias) |
-| **MoE** | `load_max_median_ratio` | `max/median(tokens)` | mean | 越接近 1 越均衡 (仅 expert_bias) |
-| **MoE** | `load_cv` | `std/mean(tokens)` | mean | 越接近 0 越均衡 (仅 expert_bias) |
+| **MoE** | `load_max_min_ratio` | `max/min(tokens)` | mean | 越接近 1 越均衡 (global_aux_loss 或 expert_bias) |
+| **MoE** | `load_max_median_ratio` | `max/median(tokens)` | mean | 越接近 1 越均衡 (global_aux_loss 或 expert_bias) |
+| **MoE** | `load_cv` | `std/mean(tokens)` | mean | 越接近 0 越均衡 (global_aux_loss 或 expert_bias) |
 | **QK** | `max` | `max(QK^T/√d)` | max | 不应暴增 |
 | **QK** | `mean` | `mean(logits)` | mean | 稳定 |
 | **QK** | `entropy_avg` | `-Σ(p log p)` avg | mean | 适中 |
@@ -374,6 +398,9 @@ NeMo Trainer 对应字段为 `internal_medicine_hook_timing`。开启后 trainer
 | **MassiveAct** | `spectral_norm_min` | `min(post_rms / pre_rms)` | min | 最小奇异值(σ_min)上界 |
 | **MassiveAct** | `lipschitz_max` | `max(‖∂L/∂x‖ / ‖∂L/∂y‖)` | max | σ_max(J)下界 = Lipschitz 常数 |
 | **MassiveAct** | `lipschitz_min` | `min(‖∂L/∂x‖ / ‖∂L/∂y‖)` | min | σ_min(J)上界 |
+| **MassiveAct** | `logit_lens_entropy_mean` | `mean_t H(softmax(final_norm(h)·Wᵀ))` | mean | 预测熵均值 (可选, 默认关) |
+| **MassiveAct** | `logit_lens_entropy_min` | `min_t H(p)` | min | 最笃定 token 熵 (可选) |
+| **MassiveAct** | `logit_lens_entropy_max` | `max_t H(p)` | max | 最犹豫 token 熵 (可选) |
 | **PLE** | `token_ple_norm` | `mean(\|\|token_ple\|\|₂)` | mean | 量级稳定 |
 | **PLE** | `proj_ple_norm` | `mean(\|\|proj × H^{-0.5}\|\|₂)` | mean | 与 token 分支匹配 |
 | **PLE** | `per_layer_inputs_norm` | `mean(\|\|(t+p)×2^{-0.5}\|\|₂)` | mean | 量级稳定 |

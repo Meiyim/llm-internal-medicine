@@ -151,6 +151,85 @@ def compute_grad_gain_bounds(
     }
 
 
+@torch.no_grad()
+def compute_logit_lens_entropy(
+    hidden: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    final_norm=None,
+    chunk_size: int = 1024,
+    tp_size: int = 1,
+) -> dict[str, torch.Tensor]:
+    """Per-token predictive entropy H(p) via the *logit lens*, chunked over tokens.
+
+    Projects each token's residual through the LM head to vocab logits and returns
+    the softmax entropy ``H(p) = -Σ p·log p`` reduced to mean/min/max over tokens —
+    "how committed is this layer to a next-token prediction" (entropy falls with depth).
+
+    Chunked so the full ``[tokens, vocab]`` logits are never materialized: one
+    ``[chunk_size, vocab]`` tile at a time, keeping only per-token entropy. Written as
+    ``H = log_z − E_p[l]`` with ``log_z = logsumexp(l)`` and ``E_p[l] = Σ softmax(l)·l``,
+    using ``torch.logsumexp`` / ``torch.softmax`` directly (no hand-rolled exp/log).
+    Values lie in ``[0, log(vocab)]``.
+
+    Vocab-parallel TP is NOT supported yet (asserted off): a TP-sharded vocab would need
+    the softmax normalizer reduced across ranks (a MAX + SUM all-reduce that can't fuse
+    with ``torch.logsumexp``). The caller only attaches this metric on the head-owning
+    stage and assumes the head is vocab-unsharded.
+
+    Args:
+        hidden: ``[s, b, h]`` layer output residual (caller passes it detached).
+        lm_head_weight: LM-head weight ``[vocab, h]`` (``.detach()``ed here).
+        final_norm: norm applied before projection (LM head is trained on final-normed
+            states); ``None`` projects the raw residual.
+        chunk_size: tokens per projection tile.
+        tp_size: tensor-parallel world size; must be 1 (asserted — no TP support yet).
+
+    Runs under ``@torch.no_grad()`` and detaches ``hidden`` / ``lm_head_weight``, so it
+    never builds autograd graph or retains references into the training forward's graph.
+    Returns 0-dim GPU tensors (no host sync).
+    """
+    assert tp_size <= 1, "compute_logit_lens_entropy does not support vocab-parallel TP (tp_size > 1) yet"
+
+    hidden_dim = hidden.shape[-1]
+    # Detach + @torch.no_grad() above: this is a monitoring probe, it must never
+    # build autograd graph or hold references into the training forward's graph.
+    h = hidden.detach().reshape(-1, hidden_dim)
+    if final_norm is not None:
+        h = final_norm(h)
+    num_tokens = h.shape[0]
+    if num_tokens == 0:
+        z = hidden.new_zeros(())
+        return {
+            "logit_lens_entropy_mean": z,
+            "logit_lens_entropy_min": z,
+            "logit_lens_entropy_max": z,
+        }
+
+    weight = lm_head_weight.detach()  # [vocab, h]
+
+    per_token_entropy = []
+    for start in range(0, num_tokens, chunk_size):
+        h_chunk = h[start : start + chunk_size]
+        # Matmul in the weight dtype (cheap); reduce in fp32 (stable).
+        logits = torch.matmul(h_chunk, weight.t()).float()  # [t, vocab]
+        # Fused, numerically-stable primitives (no hand-rolled exp on shifted logits,
+        # no separate log). H = log_z − E_p[l], E_p[l] = Σ softmax(l)·l.
+        log_z = torch.logsumexp(logits, dim=-1)  # [t]
+        probs = torch.softmax(logits, dim=-1)  # [t, vocab]
+        # In-place weight into the `probs` buffer (safe: under @torch.no_grad) so the
+        # `probs·logits` product reuses it instead of allocating a third [t, vocab] tile.
+        probs.mul_(logits)  # probs now holds softmax(l)·l
+        entropy = log_z - probs.sum(dim=-1)  # [t]
+        per_token_entropy.append(entropy)
+
+    ent = torch.cat(per_token_entropy)  # [num_tokens] — tiny (one float per token)
+    return {
+        "logit_lens_entropy_mean": ent.mean(),
+        "logit_lens_entropy_min": ent.min(),
+        "logit_lens_entropy_max": ent.max(),
+    }
+
+
 def _nearest_quantile_from_sorted(sorted_values: torch.Tensor, q: float) -> torch.Tensor:
     idx = round((sorted_values.shape[0] - 1) * q)
     idx = min(max(idx, 0), sorted_values.shape[0] - 1)

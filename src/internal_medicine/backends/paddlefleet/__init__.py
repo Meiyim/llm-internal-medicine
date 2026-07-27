@@ -5,6 +5,7 @@ import logging
 from .base import PaddleProbe
 from .gather import install_gather_fn
 from .massive_activation_monitor import PaddleMassiveActivationMonitor, setup_massive_activation_monitor
+from .mhc_monitor import PaddleMHCHealthMonitor, setup_mhc_monitor
 from .moe_monitor import PaddleMoEMonitor, setup_moe_monitor
 from .qk_monitor import PaddleQKStatsMonitor, setup_qk_monitor
 
@@ -14,6 +15,7 @@ _MONITOR_MAP = {
     "qk_stats": setup_qk_monitor,
     "moe_health": setup_moe_monitor,
     "massive_act": setup_massive_activation_monitor,
+    "mhc_health": setup_mhc_monitor,
 }
 
 _MODEL_MONITOR_ATTR = "_internal_medicine_paddlefleet_monitors"
@@ -30,7 +32,12 @@ def _monitor_config(monitor_interval, verbose, options):
 
 def _monitor_has_active_hooks(monitor):
     hooks = getattr(monitor, "hooks", None)
-    return bool(hooks)
+    if hooks:
+        return True
+    # mhc_health does not register forward hooks; it wraps ``compute_mappings``.
+    # Fall back to its wrapped-method registry to detect an active setup.
+    wrapped = getattr(monitor, "_wrapped", None)
+    return bool(wrapped)
 
 
 def setup_monitors(model, monitors=None, monitor_dict=None, monitor_interval=1, verbose=False, **kwargs):
@@ -60,9 +67,7 @@ def setup_monitors(model, monitors=None, monitor_dict=None, monitor_interval=1, 
             existing_config = getattr(existing_monitor, _MONITOR_CONFIG_ATTR, None)
             if _monitor_has_active_hooks(existing_monitor) and existing_config == expected_config:
                 monitor_dict[name] = existing_monitor
-                logger.info(
-                    f"[InternalMedicine/paddlefleet] Monitor already enabled: {name}, skipping duplicate setup"
-                )
+                logger.info(f"[InternalMedicine/paddlefleet] Monitor already enabled: {name}, skipping duplicate setup")
                 continue
             existing_monitor.remove_hooks()
             model_monitor_dict.pop(name, None)
@@ -95,4 +100,6 @@ __all__ = [
     "setup_moe_monitor",
     "PaddleMassiveActivationMonitor",
     "setup_massive_activation_monitor",
+    "PaddleMHCHealthMonitor",
+    "setup_mhc_monitor",
 ]

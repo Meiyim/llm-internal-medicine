@@ -47,9 +47,11 @@ def compute_qk_stats_triton(q: torch.Tensor, k: torch.Tensor, causal: bool = Tru
         count,
         batch,
         num_heads,
-        seq_len,
+        seq_len,  # seq_len_q
+        seq_len,  # seq_len_k: symmetric (no CP sharding in this monitor path)
         head_dim,
         1,  # heads_per_group: k is already repeat_interleave-expanded above
+        0,  # q_row_offset: 0 without CP (Q is the full local sequence)
         q.stride(0),
         q.stride(1),
         q.stride(2),

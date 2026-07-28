@@ -1,6 +1,6 @@
 # Massive Activation Monitor
 
-**Residual Stream Massive Activation 健康监控模块**，监控 20 个核心指标。
+**Residual Stream Massive Activation 健康监控模块**，监控 21 个核心指标。
 
 基于论文发现实现：
 
@@ -272,35 +272,53 @@ lipschitz_min = min_t(ratio_t)   # 一个 global batch 内对所有 token 取 mi
 
 ---
 
-### 12. Logit-Lens Predictive Entropy (逐层 logit-lens 预测熵，可选)
+### 12. Logit-Lens Predictive Entropy + Logsumexp + Cross-Entropy (逐层 logit-lens 预测熵 / 对数配分 / 交叉熵，可选)
 
-> **默认关闭**（`log_logit_lens_entropy=True` 开启）。开销较大：每监控层每监控步做一次 LM-head 前向。
+> **默认关闭**（熵/logsumexp 由 `log_logit_lens_entropy=True` 开启；交叉熵由 `log_logit_lens_cross_entropy=True` 开启）。开销较大：每监控层每监控步做一次 LM-head 前向（三个指标共用同一次投影）。
 
 **数学公式：**
 ```
 l_t = final_norm(h_t) · Wᵀ          # 第 t 个 token 经 LM head 投影到 vocab logits
 p_t = softmax(l_t)
-H(p_t) = -Σ_v p_t[v] · log p_t[v] ∈ [0, log(vocab)]
-logit_lens_entropy_{mean,min,max} = {mean_t, min_t, max_t} H(p_t)
+H(p_t)  = -Σ_v p_t[v] · log p_t[v] ∈ [0, log(vocab)]
+log Z_t = logsumexp(l_t) = log Σ_v exp(l_t[v])     # 对数配分 / softmax 归一化项
+CE_t    = log Z_t − l_t[y_t]                       # 对真实下一个 token y_t 的交叉熵
+logit_lens_entropy_mean        = mean_t H(p_t)     # 仅报告 token 均值
+logit_lens_logsumexp_mean      = mean_t log Z_t    # 仅报告 token 均值
+logit_lens_cross_entropy_mean  = mean_t CE_t       # 仅报告 token 均值
 ```
 
 用 *logit lens* 把每层残差 `h`（先过 `decoder.final_layernorm`，因为 LM head 是在 final-norm 后的
-表征上训练的）投影到 vocab logits，求 softmax 的 Shannon 熵。它衡量"这一层的表征对下一个 token 的
-预测有多笃定"——熵通常随深度下降（模型逐层收敛到预测），突变是有用的健康/异常信号，与 spike 生命周期、
-谱范数/Lipschitz 增益互补。
+表征上训练的）投影到 vocab logits，同一次投影里求三组量（**仅报告 token 均值**）：
+
+- **softmax 熵 `H(p)`**：衡量"这一层的表征对下一个 token 的预测有多笃定"——熵通常随深度下降（模型逐层
+  收敛到预测），突变是有用的健康/异常信号，与 spike 生命周期、谱范数/Lipschitz 增益互补。
+- **对数配分 `log Z = logsumexp(l)`**：softmax 的归一化项，也是 logits 的 soft-max，追踪该层在 lens 下
+  累积出的**原始 logit 尺度**（`log Z ≥ max_v l_v`，且当某个 logit 明显占优时紧贴 max logit）。它与熵互补：
+  熵刻画分布形状，`log Z` 刻画分布的绝对尺度/置信幅度。`log Z` 直接复用熵计算里已经算好的 `log_z`，**零额外开销**。
+- **交叉熵 `CE = log Z − l[y]`**：把 logit lens 当成 loss——衡量"这一层的表征直接拿去预测真实下一个 token
+  会有多大损失"。**最后一层的 CE 就是 LM loss**（up to loss-mask 加权，见下），随深度下降说明模型逐层把表征
+  推向正确答案；某层 CE 异常回升说明该层表征偏离目标。CE 复用同一次投影里的 `log_z`，只多一次
+  `gather`（**近零额外开销**）。
+
+**Loss-mask 说明（交叉熵）：** label 通过一个挂在 head-owning chunk 上的顶层 forward pre-hook 从
+`model.forward(..., labels=...)` 的 kwargs 中捕获，并按 `labels[b,s].transpose→[s,b].reshape(-1)` 对齐到
+seq-major 展平的 hidden。但 **loss_mask 是在模型 forward 之外**（`masked_next_token_loss`）施加的，monitor
+拿不到它，因此报告的是**未加权的 token 均值 CE**——它等于 LM loss up to loss-mask 加权。若某步 label 缺失
+（eval/inference）或对齐失败（形状不符），当步直接不产出 CE（不报错）。
 
 **实现要点（VRAM + 数值 + 并行）：**
 - **分块**：投影 `final_norm(h) @ Wᵀ` 按 token 切成 `[chunk_size, vocab]` 的 tile 逐块计算并丢弃
   （`logit_lens_chunk_size`，默认 1024），任一时刻只物化一个 tile，**绝不 materialize 完整
-  `[tokens, vocab]` logits**；跨块只累积每 token 一个 float 的熵。
+  `[tokens, vocab]` logits**；三个指标跨块只累积标量运行和。
 - **数值（用 torch.logsumexp）**：写成 `H = log_z − E_p[l]`，其中 `log_z = torch.logsumexp(l)`、
   `E_p[l] = Σ softmax(l)·l`。直接用 `torch.logsumexp` / `torch.softmax` 这两个融合且数值稳定的原语，
-  **不手写 `shifted.exp()` 也不单独 `.log()`**。
+  **不手写 `shifted.exp()` 也不单独 `.log()`**；`log Z` 与 `CE` 都复用这里的 `log_z`。
 - **vocab-parallel TP（暂不支持）**：`compute_logit_lens_entropy` 断言 `tp_size <= 1`。vocab 维被 TP
   切分时 softmax 归一化跨 rank，需要 MAX + SUM all-reduce，而这两步无法与 `torch.logsumexp` 融合
   （log 域的 partial 不能直接 SUM），因此当前**先断言关闭**，后续再补。caller 只在持有 head 的 stage
   attach，且假定该 head 未按 vocab 切分。
-- **PP 覆盖**：只有持有 LM head 权重的 PP stage（最后 stage / tied-embedding stage）计算此指标；
+- **PP 覆盖**：只有持有 LM head 权重的 PP stage（最后 stage / tied-embedding stage）计算这组指标；
   其余 stage `_resolve_lm_head` 返回 `(None, None)`——不 attach hook、不声明 key、彻底 no-op，
   **不做任何权重广播**。这是有意设计，不是待修复的限制。
 - **权重引用**：hook attach 时捕获 LM head 的 live `Parameter` 引用，optimizer 就地更新它，因此每步
@@ -310,7 +328,44 @@ logit_lens_entropy_{mean,min,max} = {mean_t, min_t, max_t} H(p_t)
 **诊断意义：**
 - 熵随深度**单调下降**是健康的"逐层定型"；某层熵**异常回升**说明该层表征偏离预测方向
 - 全程熵**过高**（接近 `log(vocab)`）说明表征几乎不携带预测信息；**过低**说明过早 over-commit
-- `logit_lens_entropy_min` 抓最笃定 token，`_max` 抓最犹豫 token，两者裂开说明 batch 内预测确定性分化
+- `log Z` **随深度攀升**反映 logit 尺度逐层放大；`log Z` 暴涨（配合低熵）= 该层 logit 过度膨胀 / over-confident，
+  是量化/数值健康的预警
+- CE **随深度下降**是健康的"逐层逼近答案"；最后一层 CE ≈ LM loss，可作为 monitor 内部对训练 loss 的一致性核对；
+  某层 CE **异常回升**说明该层表征偏离正确 token
+
+---
+
+### 13. Hidden Spectral Entropy (post-norm 隐状态谱熵 / 有效秩，可选)
+
+> **默认关闭**（`log_hidden_spectral_entropy=True` 开启）。相对轻量：一次 `eigvalsh`，无 LM head、无 full SVD。
+
+**数学公式：**
+```
+h ∈ R^{n,d}          # post-RMSNorm 隐状态，n=token 数, d=通道数
+σ_i                  # h 的奇异值
+p_i = σ_i² / Σ_k σ_k² = σ_i² / ‖h‖_F²
+hidden_spectral_entropy = -Σ_i p_i log p_i ∈ [0, log(min(n, d))]
+```
+
+对该层 **post-RMSNorm** 隐状态（caller 传入 `input_layernorm` 的输出，per-token RMS 缩放已被移除）计算谱（矩阵 /
+von Neumann）熵。`p_i` 是把奇异值平方归一化成的分布（合法，因 `‖h‖_F² = Σ σ_i²`），熵衡量 token 集张成多少个
+**有效方向**：低=坍缩到少数方向（秩坍缩），高=方向丰富；`exp(H)` 即**有效秩**（Roy–Vetterli）。
+
+**实现要点：**
+- **无 full SVD**：`σ_i²` 恰为较小 Gram 矩阵（`n≥d` 时 `hᵀh`，否则 `h hᵀ`）的特征值，用 `torch.linalg.eigvalsh`
+  一次 GPU 调用求出，成本 `O(min(n,d)³)` 而非完整 `[n,d]` SVD，**无 host sync**。数值负特征值 clamp 到 0，`log`
+  内再 clamp `eps` 处理 `0·log0`。
+- **post-norm 位置**：在 `input_layernorm` 输出上计算（"归一化后即中心化"），与 `post_norm_sparsity/cosine`
+  同一 hook；因此仅在存在 `input_layernorm` 的层记录（fallback 的 residual pre-hook 无归一化张量，同 post-norm
+  指标的限制，可接受）。
+- **set-level 非线性量**：不同于逐 token 均值指标，谱熵是对**整批 token 集**定义的非线性量，故跨 rank / 跨
+  microbatch 的均值只是**近似**（mean-of-per-shard-entropies ≠ 全体 token 的谱熵）。按 per-shard 值在 flush 时
+  平均，作为坍缩趋势信号可接受（设计取舍）。
+
+**诊断意义：**
+- 谱熵 / 有效秩**持续下降** → 表征秩坍缩（token 表示趋同，多样性丧失），常与 `post_norm_cosine → 1` 呼应
+- 某层谱熵**异常低** → 该层把表征压到极少数方向，可能是 attention sink / 信息瓶颈的上游信号
+- 谱熵**过高**（接近 `log(min(n,d))`） → 表征接近各向同性/白噪声，未形成结构
 
 ---
 
@@ -347,6 +402,13 @@ logit_lens_entropy_{mean,min,max} = {mean_t, min_t, max_t} H(p_t)
 | `logit_lens_entropy_mean` | 随深度下降 | NORMAL | 表征逐层收敛到预测 |
 | | 某层异常回升 | WARNING | 该层表征偏离预测方向 |
 | | 全程接近 `log(vocab)` | WARNING | 表征几乎不携带预测信息 |
+| `logit_lens_logsumexp_mean` | 随深度平稳攀升 | NORMAL | logit 尺度逐层放大 |
+| | 某层暴涨(配合低熵) | WARNING | 该层 logit 过度膨胀 / over-confident，量化数值预警 |
+| `logit_lens_cross_entropy_mean` | 随深度下降 | NORMAL | 表征逐层逼近真实 token；末层 ≈ LM loss |
+| | 某层异常回升 | WARNING | 该层表征偏离正确 token |
+| `hidden_spectral_entropy` | 趋势平稳 | NORMAL | 表征有效秩稳定，方向丰富 |
+| | 持续下降 | WARNING | 秩坍缩，表征趋同（配合 post_norm_cosine↑） |
+| | 异常偏低 | WARNING | 压到少数方向，attention sink/瓶颈上游信号 |
 
 ---
 
@@ -369,7 +431,8 @@ logit_lens_entropy_{mean,min,max} = {mean_t, min_t, max_t} H(p_t)
 - **TP per-channel 聚合**：Megatron/PaddleFleet TP 切通道维时会在 hook 内对 per-channel max 做一次 `MAX all_reduce`，这是正确性所需
 - **Post-norm 指标**：需要额外一次 RMSNorm forward（无梯度），开销约等于一个 norm 层
 - **Cosine stability**：采样 256 对，O(256×H)，通常较小
-- **Logit-lens entropy**（可选，默认关）：每监控层每监控步一次 LM-head 前向，复杂度约 O(S×H×vocab)，是本 monitor 中**最重**的指标；按 token 分块把峰值显存限制在一个 `[chunk, vocab]` tile，但计算量仍显著，建议配合大 `monitor_interval` 与 `logit_lens_layers` 使用
+- **Logit-lens entropy + logsumexp + cross-entropy**（可选，默认关）：每监控层每监控步一次 LM-head 前向，复杂度约 O(S×H×vocab)，是本 monitor 中**最重**的指标；熵、`log Z`、CE 共用同一次投影（logsumexp 与 CE 均近零额外开销，CE 只多一次 `gather`）。按 token 分块把峰值显存限制在一个 `[chunk, vocab]` tile，但计算量仍显著，建议配合大 `monitor_interval` 与 `logit_lens_layers` 使用
+- **Hidden spectral entropy**（可选，默认关）：一次 Gram matmul（O(n·d²)）加 `eigvalsh`（O(min(n,d)³)），无 LM head、无 full SVD、无 host sync，比 logit-lens 轻很多；大 batch 下 `eigvalsh` 的立方项可观，建议配合 `monitor_interval`
 
 ### 内存开销
 - 不保存激活值，不影响梯度计算
@@ -451,7 +514,9 @@ for key, val in sorted(spike_metrics.items()):
 | `sparsity_epsilon` | `0.01` | post-norm sparsity 判定阈值 |
 | `cosine_sample_pairs` | `256` | cosine stability 的采样对数 |
 | `sample_layers` | `None` | 要监控的层索引列表，None=全部 |
-| `log_logit_lens_entropy` | `False` | 是否开启 logit-lens 预测熵指标（开销大，默认关） |
+| `log_logit_lens_entropy` | `False` | 是否开启 logit-lens 预测熵 + logsumexp 指标（开销大，默认关） |
+| `log_logit_lens_cross_entropy` | `False` | 是否开启 logit-lens 逐层交叉熵指标（末层≈LM loss；与熵共用投影，默认关） |
 | `logit_lens_chunk_size` | `1024` | logit-lens 投影按 token 分块的 tile 大小 |
 | `logit_lens_apply_final_norm` | `True` | 投影前是否过 `decoder.final_layernorm` |
 | `logit_lens_layers` | `None` | logit-lens 只监控的 global 层索引列表，None=持有 head 的全部层 |
+| `log_hidden_spectral_entropy` | `False` | 是否开启 post-norm 隐状态谱熵/有效秩指标（默认关） |

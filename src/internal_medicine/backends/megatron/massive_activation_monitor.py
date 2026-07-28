@@ -16,18 +16,13 @@ from .massive_activation_metrics import (
     DEFAULT_ABSOLUTE_THRESHOLDS,
     _threshold_key,
     compute_grad_gain_bounds,
+    compute_hidden_spectral_entropy,
     compute_logit_lens_entropy,
     compute_per_channel_max,
     compute_post_norm_cosine_stability,
     compute_post_norm_sparsity,
     compute_spectral_norm_bounds,
     summarize_per_channel_max,
-)
-
-_LOGIT_LENS_METRIC_NAMES = (
-    "logit_lens_entropy_mean",
-    "logit_lens_entropy_min",
-    "logit_lens_entropy_max",
 )
 
 logger = logging.getLogger(__name__)
@@ -48,12 +43,10 @@ class MassiveActivationMonitor(TorchProbe):
         "massive_act_channel_count",
         "spectral_norm_max",
         "lipschitz_max",
-        "logit_lens_entropy_max",
     }
     MIN_AGGREGATED = {
         "spectral_norm_min",
         "lipschitz_min",
-        "logit_lens_entropy_min",
     }
 
     def __init__(
@@ -75,6 +68,8 @@ class MassiveActivationMonitor(TorchProbe):
         logit_lens_chunk_size: int = 1024,
         logit_lens_apply_final_norm: bool = True,
         logit_lens_layers: list[int] | None = None,
+        log_logit_lens_cross_entropy: bool = False,
+        log_hidden_spectral_entropy: bool = False,
         hook_timing_enabled: bool = False,
     ):
         super().__init__(
@@ -110,6 +105,23 @@ class MassiveActivationMonitor(TorchProbe):
         self.logit_lens_chunk_size = logit_lens_chunk_size
         self.logit_lens_apply_final_norm = logit_lens_apply_final_norm
         self.logit_lens_layers = set(logit_lens_layers) if logit_lens_layers else None
+        # Per-layer cross-entropy via the same logit-lens projection: CE = log_z − l[label]
+        # against the ground-truth next token. The final layer's CE equals the LM loss up
+        # to loss-mask weighting (the mask is applied outside the model forward, so this
+        # token-mean is UNWEIGHTED). Labels are captured from the model forward's kwargs by
+        # a top-level pre-hook on the head-owning chunk. Shares the logit-lens hook/head.
+        self.log_logit_lens_cross_entropy = log_logit_lens_cross_entropy
+        # Set by the label-capture forward pre-hook each monitored forward; read by the
+        # logit-lens hook (which fires after it) to align labels to the flattened tokens.
+        self._captured_labels = None
+        # Head-owning model chunks that need a label-capture pre-hook (for cross-entropy).
+        self._label_capture_models: list = []
+        # Matrix (von Neumann) entropy of the post-RMSNorm hidden spectrum — a
+        # representation-diversity / rank-collapse signal computed via eigvalsh of the
+        # smaller Gram (no LM head, no full SVD). SET-LEVEL nonlinear quantity, so the
+        # cross-shard/microbatch mean is only approximate (accepted by design). Rides the
+        # input_layernorm hook, so it only records where an input_layernorm exists.
+        self.log_hidden_spectral_entropy = log_hidden_spectral_entropy
         # global_idx -> (lm_head_weight, final_norm) for head-owning, eligible layers.
         # Populated in _prepare_layers; read in _attach_hooks to decide the entropy hook.
         self._layer_head_info: dict[int, tuple] = {}
@@ -133,6 +145,8 @@ class MassiveActivationMonitor(TorchProbe):
         ]
         if self.log_post_norm_metrics:
             names.extend(["post_norm_sparsity", "post_norm_cosine"])
+        if self.log_hidden_spectral_entropy:
+            names.append("hidden_spectral_entropy")
         if self.log_activation_rms:
             names.extend(["activation_rms", "activation_rms_std", "spectral_norm_max", "spectral_norm_min"])
         if self.log_lipschitz:
@@ -140,6 +154,22 @@ class MassiveActivationMonitor(TorchProbe):
         for t in self.absolute_thresholds:
             names.append(f"channel_count_gt_{_threshold_key(t)}")
         return tuple(names)
+
+    def _logit_lens_metric_names(self) -> tuple[str, ...]:
+        """Logit-lens metric names to declare on head-owning eligible layers.
+
+        Gated by the two logit-lens flags: entropy/logsumexp share the projection with
+        cross-entropy, so a layer may declare any subset depending on which are enabled.
+        """
+        names = []
+        if self.log_logit_lens_entropy:
+            names.extend(["logit_lens_entropy_mean", "logit_lens_logsumexp_mean"])
+        if self.log_logit_lens_cross_entropy:
+            names.append("logit_lens_cross_entropy_mean")
+        return tuple(names)
+
+    def _logit_lens_enabled(self) -> bool:
+        return self.log_logit_lens_entropy or self.log_logit_lens_cross_entropy
 
     def register_hooks(self, model: nn.Module, layer_offset: int = 0):
         """Register forward hooks. Single-chunk path.
@@ -153,7 +183,7 @@ class MassiveActivationMonitor(TorchProbe):
         if not targets:
             return
         self.allocate_buffers(next(model.parameters()).device)
-        self._attach_hooks(targets)
+        self._attach_hooks(targets, model=model)
 
     def _init_parallel_state(self):
         try:
@@ -179,26 +209,43 @@ class MassiveActivationMonitor(TorchProbe):
                 continue
             targets.append((global_idx, layer))
 
-        # Resolve the LM head once per chunk for the logit-lens entropy metric.
-        # Returns (None, None) on PP stages that don't own the head weight, which
-        # keeps the metric a clean no-op there (no weight broadcast).
+        # Resolve the LM head once per chunk for the logit-lens metrics (entropy and/or
+        # cross-entropy share it). Returns (None, None) on PP stages that don't own the
+        # head weight, which keeps the metric a clean no-op there (no weight broadcast).
         head_weight, head_norm = (None, None)
-        if self.log_logit_lens_entropy:
+        if self._logit_lens_enabled():
             head_weight, head_norm = self._resolve_lm_head(model)
 
+        head_owned_eligible = False
         for global_idx, _ in targets:
             for name in self._layer_metric_names():
                 self.declare_layer_metric(global_idx, name)
-            # Entropy keys are declared ONLY on the head-owning chunk, and only for
+            # Logit-lens keys are declared ONLY on the head-owning chunk, and only for
             # the (optionally logit_lens_layers-filtered) eligible layers. Non-head
-            # PP stages declare nothing here and attach no entropy hook.
+            # PP stages declare nothing here and attach no logit-lens hook.
             if head_weight is not None and (self.logit_lens_layers is None or global_idx in self.logit_lens_layers):
                 self._layer_head_info[global_idx] = (head_weight, head_norm)
-                for name in _LOGIT_LENS_METRIC_NAMES:
+                head_owned_eligible = True
+                for name in self._logit_lens_metric_names():
                     self.declare_layer_metric(global_idx, name)
+        # Cross-entropy needs the forward's `labels`; capture them once per head-owning
+        # chunk via a top-level pre-hook (attached in _attach_hooks).
+        if (
+            self.log_logit_lens_cross_entropy
+            and head_owned_eligible
+            and not any(m is model for m in self._label_capture_models)
+        ):
+            self._label_capture_models.append(model)
         return targets
 
-    def _attach_hooks(self, targets: list[tuple[int, nn.Module]]):
+    def _attach_hooks(self, targets: list[tuple[int, nn.Module]], model: nn.Module | None = None):
+        # Cross-entropy: capture the forward's `labels` kwarg once per head-owning chunk.
+        # A model-level pre-hook fires before the layer hooks, so _captured_labels is
+        # fresh when the logit-lens hook reads it. Attaches only where CE is enabled and
+        # this chunk owns the head (recorded in _prepare_layers).
+        if model is not None and any(m is model for m in self._label_capture_models):
+            cap_hook = model.register_forward_pre_hook(self._make_label_capture_hook(), with_kwargs=True)
+            self.hooks.append(cap_hook)
         registered = 0
         for global_idx, layer in targets:
             norm_layer = getattr(layer, "input_layernorm", None)
@@ -230,10 +277,11 @@ class MassiveActivationMonitor(TorchProbe):
                     self.timed_hook("grad_gain", self._make_grad_gain_hook(global_idx)), with_kwargs=True
                 )
                 self.hooks.append(grad_hook)
-            # Logit-lens entropy rides its own forward hook on the layer output, but
-            # only for layers on the head-owning chunk (populated in _prepare_layers).
-            # The weight captured here is a live Parameter, so each step reads the
-            # current (optimizer-updated) weight without a per-hook lookup.
+            # Logit-lens metrics (entropy/logsumexp and/or cross-entropy) ride their own
+            # forward hook on the layer output, but only for layers on the head-owning
+            # chunk (populated in _prepare_layers). The weight captured here is a live
+            # Parameter, so each step reads the current (optimizer-updated) weight
+            # without a per-hook lookup.
             head_info = self._layer_head_info.get(global_idx)
             if head_info is not None:
                 weight, final_norm = head_info
@@ -332,6 +380,8 @@ class MassiveActivationMonitor(TorchProbe):
                     self._compute_residual_metrics(layer_idx, hidden_states.detach())
                     if self.log_post_norm_metrics and normalized is not None:
                         self._compute_post_norm_metrics(layer_idx, normalized.detach())
+                    if self.log_hidden_spectral_entropy and normalized is not None:
+                        self._compute_spectral_entropy(layer_idx, normalized.detach())
             except Exception as e:
                 if self.verbose:
                     logger.error(f"[MassiveActMonitor] Error at layer {layer_idx}: {e}")
@@ -427,17 +477,55 @@ class MassiveActivationMonitor(TorchProbe):
 
         return hook_fn
 
-    def _make_logit_lens_hook(self, layer_idx: int, lm_head_weight: torch.Tensor, final_norm):
-        """Forward hook: predictive entropy of this layer's output via the logit lens.
+    def _make_label_capture_hook(self):
+        """Model-level forward pre-hook: stash the forward's ``labels`` kwarg.
 
-        Projects the layer output residual through the LM head to vocab logits and
-        records per-token entropy mean/min/max. Chunked over tokens, so the full
-        ``[tokens, vocab]`` logits are never materialized. Attached only on the
-        head-owning PP stage; the weight is a live Parameter captured at attach time.
-        Vocab-parallel TP is not supported yet — ``compute_logit_lens_entropy`` asserts
-        ``tp_size <= 1``.
+        Fires before the layer forward hooks, so the logit-lens hook reads a fresh
+        reference each monitored forward. Labels are ``[b, s]`` (Megatron passes them as
+        a keyword); ``None`` on eval/inference forwards without labels — cross-entropy is
+        then simply not emitted that step. Cheap: stashes one small int tensor reference.
+        """
+
+        def hook_fn(module, args, kwargs):
+            self._captured_labels = kwargs.get("labels") if kwargs else None
+            return None
+
+        return hook_fn
+
+    def _aligned_labels(self, post: torch.Tensor):
+        """Align captured labels to ``post.reshape(-1, h)`` row order (seq-major).
+
+        ``post`` is ``[s, b, h]``; Megatron labels are ``[b, s]`` → transpose to ``[s, b]``
+        then flatten so row ``r`` maps to ``(pos=r//b, batch=r%b)``, matching the hidden
+        flatten. Returns ``None`` on any orientation mismatch (compute_fn then skips CE).
+        """
+        labels = self._captured_labels
+        if labels is None or post.dim() != 3:
+            return None
+        s, b = post.shape[0], post.shape[1]
+        if labels.dim() == 2 and labels.shape[0] == b and labels.shape[1] == s:
+            return labels.transpose(0, 1).reshape(-1)
+        if labels.dim() == 2 and labels.shape[0] == s and labels.shape[1] == b:
+            return labels.reshape(-1)
+        if labels.dim() == 1 and labels.numel() == s * b:
+            return labels.reshape(-1)
+        return None
+
+    def _make_logit_lens_hook(self, layer_idx: int, lm_head_weight: torch.Tensor, final_norm):
+        """Forward hook: predictive entropy + logsumexp (+ optional cross-entropy) of this
+        layer's output via the logit lens.
+
+        Projects the layer output residual through the LM head to vocab logits and records
+        the token-mean entropy, logsumexp (log-partition), and — when cross-entropy is
+        enabled and labels were captured — the token-mean cross-entropy against the
+        ground-truth next token. Chunked over tokens, so the full ``[tokens, vocab]``
+        logits are never materialized. Attached only on the head-owning PP stage; the
+        weight is a live Parameter captured at attach time. Vocab-parallel TP is not
+        supported yet — ``compute_logit_lens_entropy`` asserts ``tp_size <= 1``.
         """
         norm = final_norm if self.logit_lens_apply_final_norm else None
+        want_entropy = self.log_logit_lens_entropy
+        want_ce = self.log_logit_lens_cross_entropy
 
         def hook_fn(module, args, kwargs, output):
             if not self._should_monitor():
@@ -446,6 +534,7 @@ class MassiveActivationMonitor(TorchProbe):
                 post = self._first_tensor(output)
                 if post is None:
                     return
+                labels_flat = self._aligned_labels(post) if want_ce else None
                 with torch.no_grad():
                     tensor_metrics = compute_logit_lens_entropy(
                         post.detach(),
@@ -453,6 +542,8 @@ class MassiveActivationMonitor(TorchProbe):
                         final_norm=norm,
                         chunk_size=self.logit_lens_chunk_size,
                         tp_size=self.tp_size,
+                        labels=labels_flat,
+                        want_entropy=want_entropy,
                     )
                 for name, val in tensor_metrics.items():
                     self.record_layer_metric(layer_idx, name, val)
@@ -486,6 +577,12 @@ class MassiveActivationMonitor(TorchProbe):
             if self.verbose and layer_idx not in self._post_norm_failed_layers:
                 logger.warning(f"[MassiveActMonitor] Post-norm metrics disabled at layer {layer_idx}: {e}")
                 self._post_norm_failed_layers.add(layer_idx)
+
+    def _compute_spectral_entropy(self, layer_idx: int, normalized: torch.Tensor):
+        if normalized.shape[-1] == 0 or normalized.numel() == 0:
+            return
+        entropy = compute_hidden_spectral_entropy(normalized)
+        self.record_layer_metric(layer_idx, "hidden_spectral_entropy", entropy)
 
     def _aggregate_per_channel_max(self, per_channel_max: torch.Tensor) -> torch.Tensor:
         """TP all-reduce on the per-channel-max vector.
@@ -527,6 +624,8 @@ def setup_massive_activation_monitor(
     logit_lens_chunk_size: int = 1024,
     logit_lens_apply_final_norm: bool = True,
     logit_lens_layers: list[int] | None = None,
+    log_logit_lens_cross_entropy: bool = False,
+    log_hidden_spectral_entropy: bool = False,
     hook_timing_enabled: bool = False,
     monitor_dict: dict | None = None,
 ):
@@ -548,6 +647,8 @@ def setup_massive_activation_monitor(
         logit_lens_chunk_size=logit_lens_chunk_size,
         logit_lens_apply_final_norm=logit_lens_apply_final_norm,
         logit_lens_layers=logit_lens_layers,
+        log_logit_lens_cross_entropy=log_logit_lens_cross_entropy,
+        log_hidden_spectral_entropy=log_hidden_spectral_entropy,
         hook_timing_enabled=hook_timing_enabled,
     )
 
@@ -563,8 +664,8 @@ def setup_massive_activation_monitor(
         device = next((p.device for m in models for p in m.parameters()), None)
         assert device is not None, "no parameters across model chunks; cannot pick a device"
         monitor.allocate_buffers(device)
-        for _, targets in chunk_targets:
-            monitor._attach_hooks(targets)
+        for m, targets in chunk_targets:
+            monitor._attach_hooks(targets, model=m)
     logger.info(f"[MassiveActMonitor] Setup complete. Monitoring {len(monitor.hooks)} layers.")
 
     if monitor_dict is not None:

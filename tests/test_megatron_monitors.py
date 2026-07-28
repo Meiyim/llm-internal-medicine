@@ -1,4 +1,5 @@
 import importlib
+import math
 import sys
 import unittest
 import weakref
@@ -80,7 +81,9 @@ class FakeGPTModel(nn.Module):
         self.decoder = FakeDecoder(num_layers, hidden_size)
         self.output_layer = nn.Linear(hidden_size, vocab_size, bias=False)  # weight [vocab, hidden]
 
-    def forward(self, x):
+    def forward(self, x, labels=None):
+        # labels is accepted (and ignored) so the monitor's label-capture pre-hook can
+        # read it from kwargs, mirroring Megatron GPTModel.forward(..., labels=...).
         return self.decoder(x)
 
 
@@ -91,7 +94,9 @@ class FakeHeadlessGPTModel(nn.Module):
         super().__init__()
         self.decoder = FakeDecoder(num_layers, hidden_size)
 
-    def forward(self, x):
+    def forward(self, x, labels=None):
+        # labels is accepted (and ignored) so the monitor's label-capture pre-hook can
+        # read it from kwargs, mirroring Megatron GPTModel.forward(..., labels=...).
         return self.decoder(x)
 
 
@@ -528,9 +533,8 @@ class MegatronMassiveActivationMonitorTest(unittest.TestCase):
         h = torch.randn(3, 2, hidden)
         weight = torch.zeros(vocab, hidden)
         out = massive_activation_metrics.compute_logit_lens_entropy(h, weight, chunk_size=2)
-        for key in ("logit_lens_entropy_mean", "logit_lens_entropy_min", "logit_lens_entropy_max"):
-            self.assertIn(key, out)
-            self.assertAlmostEqual(out[key].item(), math.log(vocab), places=5)
+        self.assertIn("logit_lens_entropy_mean", out)
+        self.assertAlmostEqual(out["logit_lens_entropy_mean"].item(), math.log(vocab), places=5)
 
     def test_logit_lens_entropy_peaked_is_near_zero(self):
         # One vocab logit dominates => softmax ~ one-hot => H ~ 0.
@@ -538,7 +542,7 @@ class MegatronMassiveActivationMonitorTest(unittest.TestCase):
         weight = torch.tensor([[100.0, 0.0], [0.0, 0.0], [0.0, 0.0]])  # [vocab=3, hidden=2]
         out = massive_activation_metrics.compute_logit_lens_entropy(h, weight)
         self.assertLess(out["logit_lens_entropy_mean"].item(), 1e-3)
-        self.assertGreaterEqual(out["logit_lens_entropy_min"].item(), 0.0)
+        self.assertGreaterEqual(out["logit_lens_entropy_mean"].item(), 0.0)
 
     def test_logit_lens_entropy_chunking_matches_single_pass(self):
         import math
@@ -551,9 +555,9 @@ class MegatronMassiveActivationMonitorTest(unittest.TestCase):
         chunked = massive_activation_metrics.compute_logit_lens_entropy(h, weight, chunk_size=4)
         for key in full:
             self.assertAlmostEqual(full[key].item(), chunked[key].item(), places=5)
-        # Bounds: 0 <= H <= log(vocab).
-        self.assertGreaterEqual(full["logit_lens_entropy_min"].item(), -1e-5)
-        self.assertLessEqual(full["logit_lens_entropy_max"].item(), math.log(vocab) + 1e-4)
+        # Bounds: 0 <= mean H <= log(vocab).
+        self.assertGreaterEqual(full["logit_lens_entropy_mean"].item(), -1e-5)
+        self.assertLessEqual(full["logit_lens_entropy_mean"].item(), math.log(vocab) + 1e-4)
 
     def test_logit_lens_entropy_applies_final_norm(self):
         # A norm that zeros its input makes every logit 0 => uniform => log(vocab),
@@ -571,8 +575,24 @@ class MegatronMassiveActivationMonitorTest(unittest.TestCase):
 
     def test_logit_lens_entropy_empty_input_is_zero(self):
         out = massive_activation_metrics.compute_logit_lens_entropy(torch.zeros(0, 4), torch.randn(6, 4))
-        for key in ("logit_lens_entropy_mean", "logit_lens_entropy_min", "logit_lens_entropy_max"):
+        for key in ("logit_lens_entropy_mean", "logit_lens_logsumexp_mean"):
             self.assertEqual(out[key].item(), 0.0)
+
+    def test_logit_lens_logsumexp_uniform_equals_c_plus_log_vocab(self):
+        # Constant logit c over vocab V => logsumexp = c + log(V). With a one-hot
+        # weight column of value c and a one-hot hidden, every logit == c.
+        import math
+
+        vocab, hidden = 8, 4
+        c = 3.0
+        h = torch.zeros(3, 2, hidden)
+        h[..., 0] = 1.0  # select column 0 of the weight
+        weight = torch.zeros(vocab, hidden)
+        weight[:, 0] = c  # every vocab logit == c
+        out = massive_activation_metrics.compute_logit_lens_entropy(h, weight, chunk_size=2)
+        expected = c + math.log(vocab)
+        self.assertIn("logit_lens_logsumexp_mean", out)
+        self.assertAlmostEqual(out["logit_lens_logsumexp_mean"].item(), expected, places=4)
 
     def test_logit_lens_entropy_end_to_end_records_keys(self):
         import math
@@ -593,13 +613,15 @@ class MegatronMassiveActivationMonitorTest(unittest.TestCase):
 
         latest = training_logs.get_latest(prefix="massive_act")
         for i in range(num_layers):
-            for key in ("logit_lens_entropy_mean", "logit_lens_entropy_min", "logit_lens_entropy_max"):
+            for key in ("logit_lens_entropy_mean", "logit_lens_logsumexp_mean"):
                 full_key = f"massive_act/layer_{i}/{key}"
                 self.assertIn(full_key, latest)
                 self.assertTrue(math.isfinite(latest[full_key]))
-            self.assertGreaterEqual(latest[f"massive_act/layer_{i}/logit_lens_entropy_min"], -1e-4)
-            self.assertLessEqual(latest[f"massive_act/layer_{i}/logit_lens_entropy_max"], math.log(vocab) + 1e-3)
+            mean_entropy = latest[f"massive_act/layer_{i}/logit_lens_entropy_mean"]
+            self.assertGreaterEqual(mean_entropy, -1e-4)
+            self.assertLessEqual(mean_entropy, math.log(vocab) + 1e-3)
         self.assertIn("massive_act/global_logit_lens_entropy_mean", latest)
+        self.assertIn("massive_act/global_logit_lens_logsumexp_mean", latest)
         monitor.remove_hooks()
 
     def test_logit_lens_entropy_absent_when_disabled(self):
@@ -656,6 +678,173 @@ class MegatronMassiveActivationMonitorTest(unittest.TestCase):
         self.assertNotIn("massive_act/layer_0/logit_lens_entropy_mean", latest)
         self.assertNotIn("massive_act/layer_2/logit_lens_entropy_mean", latest)
         monitor.remove_hooks()
+
+    def test_logit_lens_cross_entropy_matches_reference(self):
+        # CE via the logit lens must equal F.cross_entropy on the same logits.
+        torch.manual_seed(0)
+        tokens, hidden, vocab = 7, 5, 11
+        h = torch.randn(tokens, hidden)
+        weight = torch.randn(vocab, hidden)
+        labels = torch.randint(0, vocab, (tokens,))
+        out = massive_activation_metrics.compute_logit_lens_entropy(
+            h, weight, labels=labels, want_entropy=False, chunk_size=3
+        )
+        self.assertIn("logit_lens_cross_entropy_mean", out)
+        # want_entropy=False -> only the CE metric is produced.
+        self.assertNotIn("logit_lens_entropy_mean", out)
+        self.assertNotIn("logit_lens_logsumexp_mean", out)
+        ref = F.cross_entropy((h @ weight.t()).float(), labels)
+        self.assertAlmostEqual(out["logit_lens_cross_entropy_mean"].item(), ref.item(), places=4)
+
+    def test_logit_lens_cross_entropy_peaked_correct_is_near_zero(self):
+        # Logits sharply peaked at the correct label -> CE ~ 0.
+        vocab = hidden = 8
+        weight = torch.eye(vocab, hidden) * 50.0
+        h = torch.eye(vocab, hidden)  # token i one-hot at coord i
+        labels = torch.arange(vocab)
+        out = massive_activation_metrics.compute_logit_lens_entropy(h, weight, labels=labels, want_entropy=False)
+        self.assertLess(out["logit_lens_cross_entropy_mean"].item(), 1e-3)
+        self.assertGreaterEqual(out["logit_lens_cross_entropy_mean"].item(), 0.0)
+
+    def test_logit_lens_all_three_metrics_together(self):
+        # entropy + logsumexp + cross-entropy share one projection when both flags on.
+        torch.manual_seed(1)
+        h = torch.randn(6, 4)
+        weight = torch.randn(9, 4)
+        labels = torch.randint(0, 9, (6,))
+        out = massive_activation_metrics.compute_logit_lens_entropy(h, weight, labels=labels, want_entropy=True)
+        for key in ("logit_lens_entropy_mean", "logit_lens_logsumexp_mean", "logit_lens_cross_entropy_mean"):
+            self.assertIn(key, out)
+            self.assertTrue(math.isfinite(out[key].item()))
+
+    def test_logit_lens_cross_entropy_label_count_mismatch_skips_ce(self):
+        # A label/token count mismatch drops CE (no crash) but keeps entropy.
+        h = torch.randn(6, 4)
+        weight = torch.randn(9, 4)
+        labels = torch.randint(0, 9, (5,))  # wrong count
+        out = massive_activation_metrics.compute_logit_lens_entropy(h, weight, labels=labels, want_entropy=True)
+        self.assertNotIn("logit_lens_cross_entropy_mean", out)
+        self.assertIn("logit_lens_entropy_mean", out)
+
+    def test_logit_lens_cross_entropy_end_to_end_matches_lm_loss(self):
+        # End-to-end: the final layer's logit-lens CE equals the LM loss (final_norm +
+        # head + F.cross_entropy) computed by hand, validating label alignment.
+        torch.manual_seed(0)
+        num_layers, hidden, vocab = 2, 6, 10
+        seq, batch = 4, 2
+        model = FakeGPTModel(num_layers, hidden, vocab)
+        monitor = MassiveActivationMonitor(
+            log_post_norm_metrics=False,
+            log_activation_rms=False,
+            log_lipschitz=False,
+            log_logit_lens_entropy=False,
+            log_logit_lens_cross_entropy=True,
+            logit_lens_chunk_size=3,
+        )
+        monitor.register_hooks(model)
+        x = torch.randn(seq, batch, hidden)  # [S, B, H]
+        labels = torch.randint(0, vocab, (batch, seq))  # [B, S], like Megatron
+        out_hidden = model(x, labels=labels)  # last layer output (== decoder return)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="massive_act")
+        for i in range(num_layers):
+            key = f"massive_act/layer_{i}/logit_lens_cross_entropy_mean"
+            self.assertIn(key, latest)
+            self.assertTrue(math.isfinite(latest[key]))
+        with torch.no_grad():
+            final = model.decoder.final_layernorm(out_hidden)
+            logits = final.reshape(-1, hidden) @ model.output_layer.weight.t()
+            labels_aligned = labels.transpose(0, 1).reshape(-1)  # seq-major, matches hidden
+            ref = F.cross_entropy(logits.float(), labels_aligned)
+        self.assertAlmostEqual(
+            latest[f"massive_act/layer_{num_layers - 1}/logit_lens_cross_entropy_mean"],
+            ref.item(),
+            places=4,
+        )
+        self.assertIn("massive_act/global_logit_lens_cross_entropy_mean", latest)
+        monitor.remove_hooks()
+
+    def test_logit_lens_cross_entropy_absent_when_disabled(self):
+        model = FakeGPTModel(2, 6, 10)
+        monitor = MassiveActivationMonitor(
+            log_post_norm_metrics=False,
+            log_activation_rms=False,
+            log_lipschitz=False,
+            log_logit_lens_cross_entropy=False,
+        )
+        monitor.register_hooks(model)
+        model(torch.randn(4, 2, 6), labels=torch.randint(0, 10, (2, 4)))
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="massive_act")
+        self.assertFalse(any("cross_entropy" in key for key in latest))
+        monitor.remove_hooks()
+
+    def test_hidden_spectral_entropy_rank_one_is_near_zero(self):
+        # A rank-1 token set (all tokens on one direction) spans one effective
+        # direction -> spectral entropy ~ 0.
+        direction = torch.randn(8)
+        coeffs = torch.randn(16, 1)
+        h = coeffs * direction  # [16, 8], rank 1
+        entropy = massive_activation_metrics.compute_hidden_spectral_entropy(h)
+        self.assertLess(entropy.item(), 1e-4)
+        self.assertGreaterEqual(entropy.item(), -1e-6)
+
+    def test_hidden_spectral_entropy_orthonormal_rows_is_log_k(self):
+        import math
+
+        # k orthonormal rows -> k equal singular values -> uniform p_i -> H = log(k).
+        k = 4
+        h = torch.eye(k, 8)  # 4 orthonormal rows in R^8
+        entropy = massive_activation_metrics.compute_hidden_spectral_entropy(h)
+        self.assertAlmostEqual(entropy.item(), math.log(k), places=5)
+
+    def test_hidden_spectral_entropy_empty_input_is_zero(self):
+        entropy = massive_activation_metrics.compute_hidden_spectral_entropy(torch.zeros(0, 4))
+        self.assertEqual(entropy.item(), 0.0)
+
+    def test_hidden_spectral_entropy_within_bounds(self):
+        import math
+
+        torch.manual_seed(0)
+        n, d = 32, 8
+        h = torch.randn(n, d)
+        entropy = massive_activation_metrics.compute_hidden_spectral_entropy(h)
+        self.assertGreaterEqual(entropy.item(), -1e-5)
+        self.assertLessEqual(entropy.item(), math.log(min(n, d)) + 1e-4)
+
+    def test_hidden_spectral_entropy_end_to_end_records_key(self):
+        import math
+
+        monitor = MassiveActivationMonitor(
+            log_per_layer=True,
+            log_global=True,
+            log_post_norm_metrics=False,
+            log_activation_rms=False,
+            log_lipschitz=False,
+            log_hidden_spectral_entropy=True,
+        )
+        self.assertIn("hidden_spectral_entropy", monitor._layer_metric_names())
+        for name in monitor._layer_metric_names():
+            monitor.declare_layer_metric(0, name)
+        monitor.allocate_buffers(torch.device("cpu"))
+
+        normalized = torch.randn(4, 2, 8)  # [S, B, H], post-RMSNorm hidden
+        monitor._compute_spectral_entropy(0, normalized)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="massive_act")
+        self.assertIn("massive_act/layer_0/hidden_spectral_entropy", latest)
+        self.assertIn("massive_act/global_hidden_spectral_entropy", latest)
+        value = latest["massive_act/layer_0/hidden_spectral_entropy"]
+        self.assertTrue(math.isfinite(value))
+        self.assertGreaterEqual(value, -1e-5)
+        self.assertLessEqual(value, math.log(8) + 1e-4)
+
+    def test_hidden_spectral_entropy_absent_when_disabled(self):
+        monitor = MassiveActivationMonitor(log_hidden_spectral_entropy=False)
+        self.assertNotIn("hidden_spectral_entropy", monitor._layer_metric_names())
 
 
 class SinkHeadClassificationTest(unittest.TestCase):

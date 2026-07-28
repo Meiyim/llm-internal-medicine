@@ -5,7 +5,7 @@
 包含五大监控模块：
 - **[MoE Health](./docs/moe_specialist.md)** — MoE 专家系统健康监控 (13 指标)
 - **[QK Stats](./docs/qk_logits.md)** — 注意力 QK 统计监控 (9 指标)
-- **[Massive Activation Health](./docs/massive_activation.md)** — Residual Stream Massive Activation 健康监控 (20 指标)
+- **[Massive Activation Health](./docs/massive_activation.md)** — Residual Stream Massive Activation 健康监控 (21 指标)
 - **[PLE Health](./docs/ple_health.md)** — Per-Layer Embedding 健康监控 (7 指标)
 - **[mHC Health](./docs/mhc_health.md)** — Manifold-Constrained Hyper-Connections 映射监控 (每 hc 模块 8 指标；仅在开启 mHC 层时生效)
 
@@ -70,7 +70,8 @@ internal_medicine_monitors:
 `setup_internal_medicine(..., massive_act={"log_activation_rms": False, "log_post_norm_metrics": False})`。
 `log_activation_rms` 统一控制残差尺度/增益一组指标（`activation_rms` + `spectral_norm_max/min`）——`activation_rms` 由 spectral hook 的 per-token pre-RMS 免费导出，故合用一个开关。
 `log_lipschitz`（默认 `true`）控制每层 Lipschitz/梯度增益指标（`lipschitz_max/min`）——由 forward hook 在输入/输出 hidden 上注册 tensor grad hook，在反向传播采集 `‖∂L/∂x‖/‖∂L/∂y‖`。
-`log_logit_lens_entropy`（默认 **`false`**）控制 logit-lens 预测熵指标（`logit_lens_entropy_mean/min/max`）——将每层残差经 LM head 投影求 softmax 熵，**开销较大**故默认关闭。配套参数：`logit_lens_chunk_size`（默认 `1024`，按 token 分块的 tile 大小）、`logit_lens_apply_final_norm`（默认 `true`，投影前是否过 `decoder.final_layernorm`）、`logit_lens_layers`（默认 `None`=全部持有 head 的层；传 list 只监控指定 global 层索引）。PP 下仅持有 LM head 的 stage 生效，其余 stage 为 no-op。
+`log_logit_lens_entropy`（默认 **`false`**）控制 logit-lens 熵指标（`logit_lens_entropy_mean` + `logit_lens_logsumexp_mean`，均只报告 token 均值）；`log_logit_lens_cross_entropy`（默认 **`false`**）额外开启逐层交叉熵（`logit_lens_cross_entropy_mean`，末层≈LM loss，与熵共用同一次投影，只多一次 gather）——将每层残差经 LM head 投影求 softmax 熵/对数配分/对真实 token 的交叉熵，**开销较大**故默认关闭。配套参数：`logit_lens_chunk_size`（默认 `1024`，按 token 分块的 tile 大小）、`logit_lens_apply_final_norm`（默认 `true`，投影前是否过 `decoder.final_layernorm`）、`logit_lens_layers`（默认 `None`=全部持有 head 的层；传 list 只监控指定 global 层索引）。交叉熵的 label 由 head-owning chunk 上的顶层 pre-hook 从 `forward(labels=...)` 捕获，loss_mask 在模型外施加故报告未加权 token 均值。PP 下仅持有 LM head 的 stage 生效，其余 stage 为 no-op。
+`log_hidden_spectral_entropy`（默认 **`false`**）控制 post-RMSNorm 隐状态谱熵指标（`hidden_spectral_entropy`）——对归一化后 hidden 的 Gram 矩阵做 `eigvalsh` 求归一化特征值分布的熵（有效秩，衡量表征多样性/秩坍缩），无 full SVD、无 host sync。set-level 非线性量，跨 shard 均值为近似。
 list 形式仍兼容，但需要按 monitor 传参时不要再额外加 `internal_medicine_monitor_kwargs` 字段。
 
 ### 读取指标
@@ -231,21 +232,35 @@ setup_internal_medicine()
 | 16 | `lipschitz_max` | `massive_act/.../lipschitz_max` | `max(‖∂L/∂x‖ / ‖∂L/∂y‖)` | 每层+全局 | 反向梯度增益上界，σ_max(J)下界 = Lipschitz 常数 |
 | 17 | `lipschitz_min` | `massive_act/.../lipschitz_min` | `min(‖∂L/∂x‖ / ‖∂L/∂y‖)` | 每层+全局 | 反向梯度增益下界，σ_min(J)上界 |
 | 18 | `logit_lens_entropy_mean` | `massive_act/.../logit_lens_entropy_mean` | `mean_t(H(softmax(final_norm(h)·Wᵀ)))` | 每层+全局 | logit-lens 预测熵均值，随深度下降=表征逐层"定型" |
-| 19 | `logit_lens_entropy_min` | `massive_act/.../logit_lens_entropy_min` | `min_t H(p)` | 每层+全局 | 最"笃定"token 的熵 |
-| 20 | `logit_lens_entropy_max` | `massive_act/.../logit_lens_entropy_max` | `max_t H(p)` | 每层+全局 | 最"犹豫"token 的熵 |
+| 19 | `logit_lens_logsumexp_mean` | `massive_act/.../logit_lens_logsumexp_mean` | `mean_t(logsumexp(final_norm(h)·Wᵀ))` | 每层+全局 | logit-lens 对数配分均值，追踪 logit 原始尺度 |
+| 20 | `logit_lens_cross_entropy_mean` | `massive_act/.../logit_lens_cross_entropy_mean` | `mean_t(log_z − l[y])` | 每层+全局 | logit-lens 逐层交叉熵，末层≈LM loss |
+| 21 | `hidden_spectral_entropy` | `massive_act/.../hidden_spectral_entropy` | `-Σ p_i log p_i, p_i=σ_i²/‖h‖_F²` | 每层+全局 | post-norm 隐状态谱熵(有效秩)，表征多样性/秩坍缩 |
 
-> **注**: 指标 18-20 (`logit_lens_entropy_*`) 为**默认关闭**的可选项（`log_logit_lens_entropy=True` 开启）。
-> 将每层残差经 LM head 投影到 vocab logits 求 softmax 熵 `H(p) = -Σ p·log p ∈ [0, log(vocab)]`——
-> 相当于每监控层每监控步做一次 LM-head 前向，开销较大，建议配合 `monitor_interval` 与 `logit_lens_layers`
-> （只监控指定层）使用。投影**按 token 分块**（`logit_lens_chunk_size`，默认 1024），任一时刻只物化一个
-> `[chunk, vocab]` tile，绝不materialize 完整 `[tokens, vocab]` logits。默认先过 `decoder.final_layernorm`
+> **注**: 指标 18-20 (`logit_lens_*`) 为**默认关闭**的可选项（熵/logsumexp 由 `log_logit_lens_entropy=True`
+> 开启，交叉熵由 `log_logit_lens_cross_entropy=True` 开启）。
+> 将每层残差经 LM head 投影到 vocab logits，同一次投影求三组量（**仅报告 token 均值**）：softmax 熵
+> `H(p) = -Σ p·log p ∈ [0, log(vocab)]`（随深度下降=逐层定型）、对数配分 `log Z = logsumexp(l)`
+> （softmax 归一化项，追踪 logit 原始尺度，直接复用熵里的 `log_z`，零额外开销），以及对真实下一个 token 的
+> 交叉熵 `CE = log Z − l[y]`（同样复用 `log_z`，只多一次 gather；**末层 CE ≈ LM loss**）。相当于每监控层每监控步
+> 做一次 LM-head 前向，开销较大，建议配合 `monitor_interval` 与 `logit_lens_layers`（只监控指定层）使用。
+> 投影**按 token 分块**（`logit_lens_chunk_size`，默认 1024），任一时刻只物化一个 `[chunk, vocab]` tile，
+> 绝不 materialize 完整 `[tokens, vocab]` logits。默认先过 `decoder.final_layernorm`
 > （`logit_lens_apply_final_norm=True`，LM head 是在 final-norm 后的表征上训练的）。熵用 `H = log_z − E_p[l]`
 > 写法（`log_z = torch.logsumexp(l)`、`E_p[l] = Σ softmax(l)·l`），直接用 `torch.logsumexp` / `torch.softmax`，
-> 无手写 exp/log。
-> **PP 覆盖**: 只有持有 LM head 权重的 PP stage（最后 stage / tied-embedding stage）会计算此指标；
+> 无手写 exp/log。**交叉熵 loss-mask 说明**：label 由 head-owning chunk 上的顶层 forward pre-hook 从
+> `model.forward(labels=...)` 捕获并按 seq-major 对齐；loss_mask 在模型 forward 之外施加，monitor 拿不到，故报告
+> 的是**未加权 token 均值 CE**（= LM loss up to loss-mask 加权）。label 缺失/对齐失败时当步不产出 CE（不报错）。
+> **PP 覆盖**: 只有持有 LM head 权重的 PP stage（最后 stage / tied-embedding stage）会计算这组指标；
 > 其余 stage `_resolve_lm_head` 返回 `(None, None)`，不 attach hook、不声明 key、彻底 no-op（不做权重广播）。
 > **暂不支持 vocab-parallel TP**：`compute_logit_lens_entropy` 断言 `tp_size <= 1`（TP 切 vocab 时归一化需跨 rank
 > reduce，无法与 `torch.logsumexp` 融合，后续再加）。
+>
+> **注**: 指标 21 (`hidden_spectral_entropy`) 为**默认关闭**的可选项（`log_hidden_spectral_entropy=True` 开启）。
+> 对 post-RMSNorm 隐状态 `h∈R^{n,d}` 的谱（矩阵/von Neumann）熵：`p_i=σ_i²/‖h‖_F²` 是较小 Gram 矩阵
+> （`hᵀh` 若 n≥d 否则 `h hᵀ`）的归一化特征值，`H=-Σ p_i log p_i∈[0, log(min(n,d))]`，`exp(H)` 即有效秩——
+> 衡量 token 集张成多少个有效方向（低=秩坍缩，高=方向丰富）。用 `torch.linalg.eigvalsh` 一次 GPU 调用（无
+> full SVD、无 host sync）。这是 **set-level 非线性量**，故跨 rank/microbatch 的均值只是近似（mean-of-shard-
+> entropies ≠ 全 token 熵），按 per-shard 值在 flush 时平均，作为坍缩趋势信号可接受。
 
 ### 核心洞察
 
@@ -352,7 +367,7 @@ NeMo Trainer 对应字段为 `internal_medicine_hook_timing`。开启后 trainer
 
 ## 附录: 完整指标速查表
 
-共 49 个指标键 (13 MoE + 9 QK + 20 MassiveAct + 7 PLE)。
+共 50 个指标键 (13 MoE + 9 QK + 21 MassiveAct + 7 PLE)。
 
 | Monitor | 指标 | 公式 | SmoothedValue 模式 | 健康信号 |
 |---------|------|------|--------------------|----------|
@@ -399,8 +414,9 @@ NeMo Trainer 对应字段为 `internal_medicine_hook_timing`。开启后 trainer
 | **MassiveAct** | `lipschitz_max` | `max(‖∂L/∂x‖ / ‖∂L/∂y‖)` | max | σ_max(J)下界 = Lipschitz 常数 |
 | **MassiveAct** | `lipschitz_min` | `min(‖∂L/∂x‖ / ‖∂L/∂y‖)` | min | σ_min(J)上界 |
 | **MassiveAct** | `logit_lens_entropy_mean` | `mean_t H(softmax(final_norm(h)·Wᵀ))` | mean | 预测熵均值 (可选, 默认关) |
-| **MassiveAct** | `logit_lens_entropy_min` | `min_t H(p)` | min | 最笃定 token 熵 (可选) |
-| **MassiveAct** | `logit_lens_entropy_max` | `max_t H(p)` | max | 最犹豫 token 熵 (可选) |
+| **MassiveAct** | `logit_lens_logsumexp_mean` | `mean_t logsumexp(final_norm(h)·Wᵀ)` | mean | 对数配分均值 (可选, 默认关) |
+| **MassiveAct** | `logit_lens_cross_entropy_mean` | `mean_t(log_z − l[y])` | mean | 逐层交叉熵，末层≈LM loss (可选, 默认关) |
+| **MassiveAct** | `hidden_spectral_entropy` | `-Σ p_i log p_i, p_i=σ_i²/‖h‖_F²` | mean | post-norm 谱熵/有效秩 (可选, 默认关) |
 | **PLE** | `token_ple_norm` | `mean(\|\|token_ple\|\|₂)` | mean | 量级稳定 |
 | **PLE** | `proj_ple_norm` | `mean(\|\|proj × H^{-0.5}\|\|₂)` | mean | 与 token 分支匹配 |
 | **PLE** | `per_layer_inputs_norm` | `mean(\|\|(t+p)×2^{-0.5}\|\|₂)` | mean | 量级稳定 |

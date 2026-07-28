@@ -25,6 +25,11 @@ Core metrics:
     of the layer Jacobian's transpose on the observed gradient; the max over the
     global batch lower-bounds σ_max(J) (the layer's Lipschitz constant) and the
     min upper-bounds σ_min(J). Captured in the backward pass (see the monitor).
+12. Logit-Lens Entropy + Logsumexp — per-layer predictive entropy H(p) and
+    log-partition logsumexp of the residual projected through the LM head (opt-in).
+13. Hidden Spectral Entropy — matrix (von Neumann) entropy of the post-RMSNorm
+    hidden spectrum (effective rank); a representation-diversity / rank-collapse
+    signal computed via eigvalsh of the Gram matrix, no LM head (opt-in).
 
 All metrics compute local values only; cross-rank aggregation is handled
 by training_logs.gather_and_aggregate().
@@ -158,18 +163,32 @@ def compute_logit_lens_entropy(
     final_norm=None,
     chunk_size: int = 1024,
     tp_size: int = 1,
+    labels: torch.Tensor | None = None,
+    want_entropy: bool = True,
 ) -> dict[str, torch.Tensor]:
-    """Per-token predictive entropy H(p) via the *logit lens*, chunked over tokens.
+    """Per-token predictive entropy H(p) + logsumexp (+ optional cross-entropy) via the
+    *logit lens*, chunked over tokens.
 
-    Projects each token's residual through the LM head to vocab logits and returns
-    the softmax entropy ``H(p) = -Σ p·log p`` reduced to mean/min/max over tokens —
-    "how committed is this layer to a next-token prediction" (entropy falls with depth).
+    Projects each token's residual through the LM head to vocab logits and returns,
+    as the token-mean (only the mean is reported):
+
+    - the softmax entropy ``H(p) = -Σ p·log p`` — "how committed is this layer to a
+      next-token prediction" (entropy falls with depth); values in ``[0, log(vocab)]``.
+      (Emitted only when ``want_entropy``.)
+    - the log-partition ``log_z = logsumexp(l) = log Σ exp(l_v)`` — the softmax
+      normalizer / a soft-max over the logits; it tracks the raw logit scale the layer
+      has built up under the lens (it upper-bounds and closely tracks the max logit).
+      (Emitted only when ``want_entropy``.)
+    - the per-token cross-entropy ``CE = log_z − l[label]`` against the ground-truth
+      next-token ``label`` — the logit lens applied as a loss. The final layer's CE
+      equals the LM loss up to loss-mask weighting (the mask is applied outside the
+      model, so this token-mean is unweighted). Emitted only when ``labels`` is given.
 
     Chunked so the full ``[tokens, vocab]`` logits are never materialized: one
-    ``[chunk_size, vocab]`` tile at a time, keeping only per-token entropy. Written as
-    ``H = log_z − E_p[l]`` with ``log_z = logsumexp(l)`` and ``E_p[l] = Σ softmax(l)·l``,
-    using ``torch.logsumexp`` / ``torch.softmax`` directly (no hand-rolled exp/log).
-    Values lie in ``[0, log(vocab)]``.
+    ``[chunk_size, vocab]`` tile at a time, accumulating only running scalar sums.
+    Entropy is written as ``H = log_z − E_p[l]`` with ``log_z = logsumexp(l)`` and
+    ``E_p[l] = Σ softmax(l)·l``, using ``torch.logsumexp`` / ``torch.softmax`` directly
+    (no hand-rolled exp/log). ``log_z`` is reused for the logsumexp metric for free.
 
     Vocab-parallel TP is NOT supported yet (asserted off): a TP-sharded vocab would need
     the softmax normalizer reduced across ranks (a MAX + SUM all-reduce that can't fuse
@@ -183,6 +202,12 @@ def compute_logit_lens_entropy(
             states); ``None`` projects the raw residual.
         chunk_size: tokens per projection tile.
         tp_size: tensor-parallel world size; must be 1 (asserted — no TP support yet).
+        labels: ``[num_tokens]`` ground-truth next-token ids, already aligned to
+            ``hidden.reshape(-1, h)`` row order (seq-major). When given, the token-mean
+            cross-entropy is added to the result. Must match the token count or it is
+            ignored (defensive: no crash on a shape mismatch).
+        want_entropy: when ``False``, skip the entropy/logsumexp metrics (used when only
+            the cross-entropy is requested) — the projection is shared either way.
 
     Runs under ``@torch.no_grad()`` and detaches ``hidden`` / ``lm_head_weight``, so it
     never builds autograd graph or retains references into the training forward's graph.
@@ -197,37 +222,99 @@ def compute_logit_lens_entropy(
     if final_norm is not None:
         h = final_norm(h)
     num_tokens = h.shape[0]
+
+    # Cross-entropy needs labels aligned 1:1 with the flattened tokens. A mismatch means
+    # the caller couldn't align them (unexpected orientation / CP mismatch) — drop CE
+    # rather than gather garbage. .numel() is a Python-int attribute, no host sync.
+    want_ce = labels is not None and labels.numel() == num_tokens
+    labels_flat = labels.detach().reshape(-1).long().clamp_min(0) if want_ce else None
+
     if num_tokens == 0:
         z = hidden.new_zeros(())
-        return {
-            "logit_lens_entropy_mean": z,
-            "logit_lens_entropy_min": z,
-            "logit_lens_entropy_max": z,
-        }
+        out: dict[str, torch.Tensor] = {}
+        if want_entropy:
+            out["logit_lens_entropy_mean"] = z
+            out["logit_lens_logsumexp_mean"] = z
+        if want_ce:
+            out["logit_lens_cross_entropy_mean"] = z
+        return out
 
     weight = lm_head_weight.detach()  # [vocab, h]
 
-    per_token_entropy = []
+    # Only the token-mean is reported, so accumulate running sums (a scalar each)
+    # instead of retaining per-token vectors.
+    entropy_sum = h.new_zeros((), dtype=torch.float32)
+    logsumexp_sum = h.new_zeros((), dtype=torch.float32)
+    ce_sum = h.new_zeros((), dtype=torch.float32)
     for start in range(0, num_tokens, chunk_size):
         h_chunk = h[start : start + chunk_size]
         # Matmul in the weight dtype (cheap); reduce in fp32 (stable).
         logits = torch.matmul(h_chunk, weight.t()).float()  # [t, vocab]
-        # Fused, numerically-stable primitives (no hand-rolled exp on shifted logits,
-        # no separate log). H = log_z − E_p[l], E_p[l] = Σ softmax(l)·l.
+        # log_z is shared by entropy, logsumexp, and cross-entropy — one logsumexp.
         log_z = torch.logsumexp(logits, dim=-1)  # [t]
-        probs = torch.softmax(logits, dim=-1)  # [t, vocab]
-        # In-place weight into the `probs` buffer (safe: under @torch.no_grad) so the
-        # `probs·logits` product reuses it instead of allocating a third [t, vocab] tile.
-        probs.mul_(logits)  # probs now holds softmax(l)·l
-        entropy = log_z - probs.sum(dim=-1)  # [t]
-        per_token_entropy.append(entropy)
+        if want_entropy:
+            # Fused, numerically-stable primitives (no hand-rolled exp on shifted
+            # logits, no separate log). H = log_z − E_p[l], E_p[l] = Σ softmax(l)·l.
+            probs = torch.softmax(logits, dim=-1)  # [t, vocab]
+            # In-place weight into the `probs` buffer (safe: under @torch.no_grad) so the
+            # `probs·logits` product reuses it instead of allocating a third [t, vocab] tile.
+            probs.mul_(logits)  # probs now holds softmax(l)·l
+            entropy = log_z - probs.sum(dim=-1)  # [t]
+            entropy_sum += entropy.sum()
+            logsumexp_sum += log_z.sum()  # reuse log_z — the logsumexp metric is free
+        if want_ce:
+            label_chunk = labels_flat[start : start + chunk_size]
+            # CE_t = log_z_t − l_t[label_t] = -log softmax(l_t)[label_t]. Reuses log_z.
+            tgt = logits.gather(1, label_chunk.unsqueeze(1)).squeeze(1)  # [t]
+            ce_sum += (log_z - tgt).sum()
 
-    ent = torch.cat(per_token_entropy)  # [num_tokens] — tiny (one float per token)
-    return {
-        "logit_lens_entropy_mean": ent.mean(),
-        "logit_lens_entropy_min": ent.min(),
-        "logit_lens_entropy_max": ent.max(),
-    }
+    out = {}
+    if want_entropy:
+        out["logit_lens_entropy_mean"] = entropy_sum / num_tokens
+        out["logit_lens_logsumexp_mean"] = logsumexp_sum / num_tokens
+    if want_ce:
+        out["logit_lens_cross_entropy_mean"] = ce_sum / num_tokens
+    return out
+
+
+@torch.no_grad()
+def compute_hidden_spectral_entropy(hidden: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    """Matrix (von Neumann) entropy of the hidden-state spectrum — a representation
+    diversity / rank-collapse signal, computed WITHOUT the LM head.
+
+    For ``hidden`` reshaped to ``[n, d]`` (n tokens, d channels) with singular values
+    ``σ_i``, let ``p_i = σ_i² / Σ_k σ_k² = σ_i² / ‖h‖_F²`` (a valid distribution, since
+    ``‖h‖_F² = Σ σ_i²``). The entropy ``H = -Σ p_i log p_i ∈ [0, log(min(n, d))]`` measures
+    how many effective directions the token set spans: low H = collapsed onto a few
+    directions, high H = spread across many (``exp(H)`` is the effective rank).
+
+    Computed without a full SVD: the ``σ_i²`` are the eigenvalues of the smaller Gram
+    matrix (``hᵀh`` when ``n >= d`` else ``h hᵀ``), via ``torch.linalg.eigvalsh`` — a single
+    GPU call, no host sync. Tiny negative eigenvalues (numerical) are clamped to 0.
+
+    Intended to run on the POST-RMSNorm hidden states (the caller passes the layer's
+    ``input_layernorm`` output), so the per-token RMS scaling is already removed.
+
+    This is a SET-LEVEL, nonlinear quantity (not per-token): unlike the per-token mean
+    metrics, its cross-rank / cross-microbatch mean is only an APPROXIMATION of the global
+    spectral entropy (mean-of-per-shard-entropies != entropy-over-all-tokens). It is
+    reported as a per-shard value averaged at flush time, which is fine as a collapse trend
+    signal (accepted by design).
+
+    Returns a 0-dim GPU tensor (no host sync).
+    """
+    d = hidden.shape[-1]
+    h = hidden.reshape(-1, d).float()
+    n = h.shape[0]
+    if n == 0:
+        return hidden.new_zeros(())
+    # Eigenvalues of the smaller Gram matrix are exactly σ_i²; pick min(n, d) side so the
+    # eigvalsh cost is O(min(n, d)³) rather than a full [n, d] SVD.
+    gram = h.t() @ h if n >= d else h @ h.t()
+    evals = torch.linalg.eigvalsh(gram).clamp_min(0)  # ascending, real; no host sync
+    p = evals / evals.sum().clamp_min(eps)  # p_i = σ_i² / ‖h‖_F²
+    # 0·log0 -> 0: p already >= 0, clamp only inside the log (multiplied-out zeros vanish).
+    return -(p * p.clamp_min(eps).log()).sum()
 
 
 def _nearest_quantile_from_sorted(sorted_values: torch.Tensor, q: float) -> torch.Tensor:

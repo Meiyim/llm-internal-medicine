@@ -222,7 +222,7 @@ setup_internal_medicine()
 | 3 | `channel_p95` | `massive_act/.../channel_p95` | `p95(per_channel_max)` | 每层+全局 | 高分位通道幅度 |
 | 4 | `channel_p99` | `massive_act/.../channel_p99` | `p99(per_channel_max)` | 每层+全局 | 极高分位通道幅度 |
 | 5 | `channel_max_ratio` | `massive_act/.../channel_max_ratio` | `max / median` | 每层+全局 | 少数通道 outlier 严重度 |
-| 6 | `massive_act_channel_count` | `massive_act/.../massive_act_channel_count` | `count(ch > 100*median)` | 每层+全局 | median-relative 异常通道数量 |
+| 6 | `massive_act_channel_count` | `massive_act/.../massive_act_channel_count` | `mean_token(count(&#124;h&#124; > median*√H))` | 每层+全局 | 每 token median-relative 异常通道数（对 seqlen 取均值；megatron）|
 | 7 | `channel_count_gt_10` | `massive_act/.../channel_count_gt_10` | `count(per_channel_max > 10)` | 每层+全局 | 广泛高于基准量级的通道数量 |
 | 8 | `channel_count_gt_20` | `massive_act/.../channel_count_gt_20` | `count(per_channel_max > 20)` | 每层+全局 | 高幅度通道数量 |
 | 9 | `channel_count_gt_30` | `massive_act/.../channel_count_gt_30` | `count(per_channel_max > 30)` | 每层+全局 | 接近当前 1.5B FP4 峰值区间的通道数量 |
@@ -334,7 +334,7 @@ from internal_medicine import training_logs
 |----------|----------|--------|
 | 包含 `/max` 或以 `_max` 结尾 | `max` | 历史最大值 |
 | 以 `topk_channel_norm`、`channel_max_ratio`、`channel_median`、`channel_p95`、`channel_p99`、`activation_rms` 结尾 | `max` | 历史最大值 |
-| `massive_act_channel_count` 或 `channel_count_gt_*` | `max` | 历史最大值 |
+| `channel_count_gt_*` | `max` | 历史最大值 |
 | 包含 `/min` 或以 `_min` 结尾 | `min` | 历史最小值 |
 | 其他 | `mean` | 累积均值 |
 
@@ -346,7 +346,8 @@ from internal_medicine import training_logs
 |----------|----------|
 | 包含 `_max` 或以 `/max` 结尾 | `np.max(all_ranks)` |
 | `channel_max_ratio`、`channel_median`、`channel_p95`、`channel_p99`、`topk_channel_norm`、`activation_rms` | `np.max(all_ranks)` |
-| `massive_act_channel_count` 或 `channel_count_gt_*` | `np.max(all_ranks)` |
+| `channel_count_gt_*` | `np.max(all_ranks)` |
+| `massive_act_channel_count`（megatron 每 token 均值）| `np.mean(all_ranks)` |
 | 包含 `_min` 或以 `/min` 结尾 | `np.min(all_ranks)` |
 | 其他 | `np.mean(all_ranks)` |
 
@@ -404,7 +405,7 @@ NeMo Trainer 对应字段为 `internal_medicine_hook_timing`。开启后 trainer
 | **MassiveAct** | `channel_p95` | `p95(per_channel_max)` | max | 高分位通道幅度 |
 | **MassiveAct** | `channel_p99` | `p99(per_channel_max)` | max | 极高分位通道幅度 |
 | **MassiveAct** | `channel_max_ratio` | `max / median` | max | 异常值严重度 |
-| **MassiveAct** | `massive_act_channel_count` | `count(ch > 100*median)` | max | median-relative 异常通道数 |
+| **MassiveAct** | `massive_act_channel_count` | `mean_token(count(&#124;h&#124; > median*√H))` | mean | 每 token median-relative 异常通道数（megatron）|
 | **MassiveAct** | `channel_count_gt_10` | `count(ch > 10)` | max | 广泛高于基准量级 |
 | **MassiveAct** | `channel_count_gt_20` | `count(ch > 20)` | max | 高幅度通道数 |
 | **MassiveAct** | `channel_count_gt_30` | `count(ch > 30)` | max | 接近当前 FP4 峰值区间 |

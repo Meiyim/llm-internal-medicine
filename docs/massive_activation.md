@@ -85,14 +85,22 @@ channel_max_ratio = max(per_channel_max) / median(per_channel_max)
 
 ---
 
-### 4. Massive Activation Channel Count (异常通道数)
+### 4. Massive Activation Channel Count (每 token 异常通道数，seqlen 平均)
 
-**数学公式：**
+**数学公式（megatron 后端）：**
 ```
-massive_act_channel_count = |{c : max_pos(|H_i[:, c]|) > median × threshold_multiplier}|
+threshold = channel_median × sqrt(H) × extra_multiplier   # H=hidden_size, extra 默认 1.0
+massive_act_channel_count = mean_token( |{c : |H_i[token, c]| > threshold}| )
 ```
 
-超过阈值（默认 100× 中位数）的 channel 数量。
+**逐 token 计数后对 seqlen 取平均**（不再是"对 seqlen 取 max 后统计通道"）。阈值以
+中位通道幅度为基准，乘子改为 **√H**（隐藏维平方根，H=4k~16k 时约 64~128，替代旧的固定
+100×，随模型宽度自适应）；`extra_multiplier`（原 `spike_threshold_multiplier`，默认 1.0）
+是 √H 之上的可选系数。跨 DP/TP rank 在 flush 时按 **mean** 聚合（等 token 数假设，同其他
+mean 指标），跨层 global 也按 mean 聚合。
+
+> 注：PaddleFleet 后端仍是旧的"per-channel-max > median×100"通道计数语义（未改动）；只有
+> megatron 后端改为上述每-token 均值。
 
 **诊断意义：**
 - 论文发现 spike channel 通常只有 **2-5 个**（Property ii）
@@ -113,7 +121,7 @@ channel_count_gt_30 = |{c : per_channel_max[c] > 30}|
 按绝对激活幅度统计超过 10、20、30 的 channel 数量。
 
 **诊断意义：**
-- `massive_act_channel_count` 是 median-relative outlier 数量
+- `massive_act_channel_count` 是每 token 的 median-relative outlier 通道数（对 seqlen 取均值）
 - `channel_count_gt_10/20/30` 是 absolute scale growth 数量
 - 默认 `10/20/30` 更适合当前 1.5B 训练的激活量级；如果观察大幅度 BF16 runaway，可以通过 `absolute_thresholds` 显式切到更高阈值，例如 `(50.0, 100.0, 200.0)`
 - 这组指标适合对比不同训练设置下 residual stream 是否整体变大，例如 BF16 vs FP4
@@ -381,8 +389,8 @@ von Neumann）熵。`p_i` 是把奇异值平方归一化成的分布（合法，
 | `channel_max_ratio` | < 10 | NORMAL | 各 channel 量级接近 |
 | | 10 ~ 1000 | SPIKE | 存在少数异常 channel |
 | | > 1000 | SEVERE | 极端通道不平衡 |
-| `massive_act_channel_count` | 0 ~ 5 | NORMAL | 典型 spike pattern |
-| | > 10 | WARNING | 异常 channel 过多 |
+| `massive_act_channel_count` | 0 ~ 5 | NORMAL | 每 token 均值，典型 spike pattern（阈值 median×√H）|
+| | > 10 | WARNING | 每 token 异常 channel 过多 |
 | `channel_count_gt_10/20/30` | 趋势平稳 | NORMAL | 高幅度通道数量稳定 |
 | | 持续上升 | WARNING | 大范围激活膨胀 |
 | `activation_rms` | 趋势平稳 | NORMAL | 整体残差流量级稳定 |
@@ -508,7 +516,7 @@ for key, val in sorted(spike_metrics.items()):
 | `log_global` | `True` | 记录全局聚合指标 |
 | `monitor_interval` | `1` | 监控间隔 (每 N 步) |
 | `verbose` | `False` | 打印调试信息 |
-| `spike_threshold_multiplier` | `100.0` | spike channel 判定阈值 = median × 此值 |
+| `spike_threshold_multiplier` | `1.0` | `massive_act_channel_count` 阈值 = median × √H × 此值（√H 为基准乘子）|
 | `topk_channels` | `3` | Top-K 通道数（对应论文 Figure 1） |
 | `absolute_thresholds` | `(10.0, 20.0, 30.0)` | 绝对幅度通道计数阈值 |
 | `sparsity_epsilon` | `0.01` | post-norm sparsity 判定阈值 |

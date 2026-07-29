@@ -114,7 +114,6 @@ class TrainingLogs:
             "/max" in key
             or key.endswith("_max")
             or key.endswith(MAX_AGGREGATED_SUFFIXES)
-            or metric_name == "massive_act_channel_count"
             or metric_name.startswith("channel_count_gt_")
         )
 

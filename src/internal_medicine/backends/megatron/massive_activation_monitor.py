@@ -40,7 +40,6 @@ class MassiveActivationMonitor(TorchProbe):
         "channel_max_ratio",
         "topk_channel_norm",
         "activation_rms",
-        "massive_act_channel_count",
         "spectral_norm_max",
         "lipschitz_max",
     }
@@ -55,7 +54,7 @@ class MassiveActivationMonitor(TorchProbe):
         log_global: bool = True,
         monitor_interval: int = 1,
         verbose: bool = False,
-        spike_threshold_multiplier: float = 100.0,
+        spike_threshold_multiplier: float = 1.0,
         topk_channels: int = 3,
         sparsity_epsilon: float = 0.01,
         cosine_sample_pairs: int = 256,
@@ -558,9 +557,10 @@ class MassiveActivationMonitor(TorchProbe):
         per_channel_max = self._aggregate_per_channel_max(per_channel_max)
         tensor_metrics = summarize_per_channel_max(
             per_channel_max,
-            threshold_multiplier=self.spike_threshold_multiplier,
+            hidden_states,
             k=self.topk_channels,
             absolute_thresholds=self.absolute_thresholds,
+            extra_multiplier=self.spike_threshold_multiplier,
         )
 
         for name, val in tensor_metrics.items():
@@ -611,7 +611,7 @@ def setup_massive_activation_monitor(
     log_global: bool = True,
     monitor_interval: int = 1,
     verbose: bool = False,
-    spike_threshold_multiplier: float = 100.0,
+    spike_threshold_multiplier: float = 1.0,
     topk_channels: int = 3,
     sparsity_epsilon: float = 0.01,
     cosine_sample_pairs: int = 256,

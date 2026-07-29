@@ -425,6 +425,30 @@ class MegatronMassiveActivationMonitorTest(unittest.TestCase):
         self.assertEqual(latest["massive_act/layer_0/channel_count_gt_2"], 2.0)
         self.assertEqual(latest["massive_act/layer_0/channel_count_gt_3"], 1.0)
 
+    def test_massive_act_channel_count_is_per_token_mean_with_sqrt_h_threshold(self):
+        monitor = MassiveActivationMonitor(
+            log_per_layer=True,
+            log_global=False,
+            log_post_norm_metrics=False,
+            log_activation_rms=False,
+            log_lipschitz=False,
+        )
+        hidden_states = torch.tensor(
+            [
+                [[100.0, 1.0, 1.0, 1.0]],
+                [[100.0, 1.0, -1.0, 1.0]],
+            ]
+        )
+        for name in monitor._layer_metric_names():
+            monitor.declare_layer_metric(0, name)
+        monitor.allocate_buffers(hidden_states.device)
+
+        monitor._compute_residual_metrics(0, hidden_states)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="massive_act")
+        self.assertAlmostEqual(latest["massive_act/layer_0/massive_act_channel_count"], 1.0, places=5)
+
     def test_spectral_norm_bounds_record_per_token_rms_ratio(self):
         monitor = MassiveActivationMonitor(
             log_per_layer=True,

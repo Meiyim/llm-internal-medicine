@@ -92,7 +92,6 @@ class CoreMonitoringTest(unittest.TestCase):
             "massive_act/layer_0/channel_median",
             "massive_act/layer_0/channel_p95",
             "massive_act/layer_0/channel_p99",
-            "massive_act/layer_0/massive_act_channel_count",
             "massive_act/layer_0/channel_count_gt_100",
             "massive_act/layer_0/activation_rms",
             "massive_act/layer_0/spectral_norm_max",
@@ -101,6 +100,14 @@ class CoreMonitoringTest(unittest.TestCase):
             "massive_act/global_lipschitz_max",
         ):
             self.assertTrue(training_logs._is_max_metric(key), key)
+
+    def test_massive_act_channel_count_is_mean_aggregated(self):
+        for key in (
+            "massive_act/layer_0/massive_act_channel_count",
+            "massive_act/global_massive_act_channel_count",
+        ):
+            self.assertFalse(training_logs._is_max_metric(key), key)
+            self.assertFalse(training_logs._is_min_metric(key), key)
 
     def test_spectral_norm_min_keys_are_min_aggregated(self):
         for key in (

@@ -325,17 +325,31 @@ def _nearest_quantile_from_sorted(sorted_values: torch.Tensor, q: float) -> torc
 
 def summarize_per_channel_max(
     per_channel_max: torch.Tensor,
-    threshold_multiplier: float = 100.0,
+    hidden_states: torch.Tensor,
     k: int = 3,
     absolute_thresholds: tuple[float, ...] = DEFAULT_ABSOLUTE_THRESHOLDS,
+    extra_multiplier: float = 1.0,
 ) -> dict[str, torch.Tensor]:
-    """Derive scalar massive-activation metrics from per-channel maxima."""
+    """Derive scalar massive-activation metrics from per-channel maxima.
+
+    ``massive_act_channel_count`` is the mean per-token count of channels with
+    ``|activation| > channel_median * sqrt(H) * extra_multiplier`` (H = hidden size).
+    ``channel_median`` here uses the (TP-globalized) ``per_channel_max`` so the
+    threshold is consistent across shards; cross-rank mean is completed at flush.
+    """
     channel_max = per_channel_max.max()
     channel_median = per_channel_max.median()
     channel_max_ratio = channel_max / channel_median.clamp(min=1e-8)
-    threshold = channel_median * threshold_multiplier
     topk_vals = per_channel_max.topk(min(k, per_channel_max.shape[0])).values
     sorted_channel_max = per_channel_max.sort().values
+
+    hdim = hidden_states.shape[-1]
+    h = hidden_states.reshape(-1, hdim).float()
+    if h.shape[0] == 0:
+        massive_count = hidden_states.new_zeros(()).float()
+    else:
+        threshold = channel_median * (hdim**0.5) * extra_multiplier
+        massive_count = (h.abs() > threshold).sum(dim=1).float().mean()
 
     metrics = {
         "channel_max": channel_max,
@@ -343,7 +357,7 @@ def summarize_per_channel_max(
         "channel_p95": _nearest_quantile_from_sorted(sorted_channel_max, 0.95),
         "channel_p99": _nearest_quantile_from_sorted(sorted_channel_max, 0.99),
         "channel_max_ratio": channel_max_ratio,
-        "massive_act_channel_count": (per_channel_max > threshold).sum().float(),
+        "massive_act_channel_count": massive_count,
         "topk_channel_norm": topk_vals.norm(),
     }
     for absolute_threshold in absolute_thresholds:
@@ -370,32 +384,7 @@ def compute_channel_max(hidden_states: torch.Tensor) -> dict[str, torch.Tensor]:
             channel_p95/channel_p99: high quantiles of per-channel max absolute values
             channel_max_ratio: channel_max / channel_median (outlier severity)
     """
-    return summarize_per_channel_max(compute_per_channel_max(hidden_states))
-
-
-def compute_massive_activation_channel_count(
-    hidden_states: torch.Tensor,
-    threshold_multiplier: float = 100.0,
-) -> torch.Tensor:
-    """Count channels with activations exceeding a dynamic threshold.
-
-    The threshold is set relative to the median channel magnitude:
-        threshold = median_channel_max × threshold_multiplier
-
-    This captures Property (ii) from Sun et al. (2026): massive activations
-    are confined to a small subset of channels.
-
-    Args:
-        hidden_states: [S, B, H] or [B, S, H] post-residual hidden states.
-        threshold_multiplier: multiplier on median to define "spike" threshold.
-
-    Returns:
-        Scalar tensor: number of channels exceeding the threshold.
-    """
-    return summarize_per_channel_max(
-        compute_per_channel_max(hidden_states),
-        threshold_multiplier=threshold_multiplier,
-    )["massive_act_channel_count"]
+    return summarize_per_channel_max(compute_per_channel_max(hidden_states), hidden_states)
 
 
 def compute_topk_channel_norm(
@@ -415,7 +404,7 @@ def compute_topk_channel_norm(
     Returns:
         Scalar tensor: L2 norm of the top-K per-channel-max values.
     """
-    return summarize_per_channel_max(compute_per_channel_max(hidden_states), k=k)["topk_channel_norm"]
+    return summarize_per_channel_max(compute_per_channel_max(hidden_states), hidden_states, k=k)["topk_channel_norm"]
 
 
 def compute_post_norm_sparsity(

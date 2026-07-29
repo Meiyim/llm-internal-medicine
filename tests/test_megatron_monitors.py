@@ -21,6 +21,9 @@ except Exception as exc:  # pragma: no cover - depends on optional backend insta
 MassiveActivationMonitor = importlib.import_module(
     "internal_medicine.backends.megatron.massive_activation_monitor"
 ).MassiveActivationMonitor
+activation_dump_module = importlib.import_module("internal_medicine.backends.megatron.activation_dump_monitor")
+ActivationDumpMonitor = activation_dump_module.ActivationDumpMonitor
+setup_activation_dump_monitor = activation_dump_module.setup_activation_dump_monitor
 MoESpecialistMonitor = importlib.import_module("internal_medicine.backends.megatron.moe_monitor").MoESpecialistMonitor
 moe_monitor_module = importlib.import_module("internal_medicine.backends.megatron.moe_monitor")
 PLEHealthMonitor = importlib.import_module("internal_medicine.backends.megatron.ple_monitor").PLEHealthMonitor
@@ -886,6 +889,186 @@ class SinkHeadClassificationTest(unittest.TestCase):
         result = compute_sink_head_classification(torch.tensor([]), threshold=self.THRESHOLD)
         self.assertEqual(result["sink_nonsink_gap"].item(), 0.0)
         self.assertEqual(result["sink_head_ratio"].item(), 0.0)
+
+
+class MegatronActivationDumpMonitorTest(unittest.TestCase):
+    def setUp(self):
+        training_logs.reset()
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dump_dir = Path(self._tmp.name) / "act_dumps"
+
+    def tearDown(self):
+        training_logs.reset()
+        self._tmp.cleanup()
+
+    def _list_files(self, root):
+        return sorted(str(p) for p in Path(root).rglob("*.safetensors"))
+
+    def _load(self, path):
+        from safetensors import safe_open
+
+        with safe_open(path, framework="pt") as f:
+            meta = f.metadata()
+            tensors = {k: f.get_tensor(k) for k in list(f.keys())}
+        return tensors, meta
+
+    def test_dump_written_on_monitored_step(self):
+        S, B, H = 7, 2, 8
+        model = FakeGPTModel(num_layers=3, hidden_size=H, vocab_size=16)
+        monitor = ActivationDumpMonitor(dump_dir=str(self.dump_dir), n_sample_tokens=5, monitor_interval=1)
+        monitor.register_hooks(model)
+        model(torch.randn(S, B, H))
+        monitor.step()
+        files = self._list_files(self.dump_dir)
+        self.assertEqual(len(files), 3, f"expected one file per layer, got {files}")
+        tensors, meta = self._load(files[0])
+        self.assertEqual(tuple(tensors["hidden"].shape), (5, H))
+        self.assertEqual(tensors["token_index"].numel(), 5)
+        self.assertEqual(meta["hidden_size"], str(H))
+        self.assertEqual(meta["which"], "output")
+        self.assertIn("step_0000000", files[0])
+
+    def test_random_positions_not_first_k(self):
+        S, B, H = 20, 1, 8
+        model = FakeGPTModel(num_layers=1, hidden_size=H, vocab_size=16)
+        monitor = ActivationDumpMonitor(
+            dump_dir=str(self.dump_dir), n_sample_tokens=6, token_sample_seed=123, monitor_interval=1
+        )
+        monitor.register_hooks(model)
+        model(torch.randn(S, B, H))
+        monitor.step()
+        files = self._list_files(self.dump_dir)
+        tensors, _ = self._load(files[0])
+        idx = tensors["token_index"]
+        self.assertFalse(torch.equal(idx, torch.arange(6, dtype=idx.dtype)), "should not be first-K positions")
+
+    def test_same_positions_across_layers_same_step(self):
+        S, B, H = 20, 1, 8
+        model = FakeGPTModel(num_layers=3, hidden_size=H, vocab_size=16)
+        monitor = ActivationDumpMonitor(dump_dir=str(self.dump_dir), n_sample_tokens=6, monitor_interval=1)
+        monitor.register_hooks(model)
+        model(torch.randn(S, B, H))
+        monitor.step()
+        files = self._list_files(self.dump_dir)
+        self.assertEqual(len(files), 3)
+        idxs = [self._load(f)[0]["token_index"] for f in files]
+        for other in idxs[1:]:
+            self.assertTrue(torch.equal(idxs[0], other), "positions must match across layers within a step")
+
+    def test_positions_differ_across_steps(self):
+        S, B, H = 20, 1, 8
+        model = FakeGPTModel(num_layers=1, hidden_size=H, vocab_size=16)
+        monitor = ActivationDumpMonitor(dump_dir=str(self.dump_dir), n_sample_tokens=6, monitor_interval=1)
+        monitor.register_hooks(model)
+        model(torch.randn(S, B, H))
+        monitor.step()
+        model(torch.randn(S, B, H))
+        monitor.step()
+        d0 = self._load(self._list_files(Path(self.dump_dir) / "step_0000000")[0])[0]["token_index"]
+        d1 = self._load(self._list_files(Path(self.dump_dir) / "step_0000001")[0])[0]["token_index"]
+        self.assertFalse(torch.equal(d0, d1), "positions should differ across steps (seed depends on step)")
+
+    def test_interval_gate_skips_unmonitored_step(self):
+        S, B, H = 8, 1, 8
+        model = FakeGPTModel(num_layers=1, hidden_size=H, vocab_size=16)
+        monitor = ActivationDumpMonitor(dump_dir=str(self.dump_dir), n_sample_tokens=4, monitor_interval=2)
+        monitor.register_hooks(model)
+        model(torch.randn(S, B, H))  # step_count 0 -> monitored
+        monitor.step()  # -> step_count 1
+        n_after_first = len(self._list_files(self.dump_dir))
+        model(torch.randn(S, B, H))  # step_count 1 -> 1 % 2 != 0 -> skipped
+        monitor.step()  # -> step_count 2
+        self.assertEqual(len(self._list_files(self.dump_dir)), n_after_first, "no new files on unmonitored step")
+        self.assertFalse((Path(self.dump_dir) / "step_0000001").exists())
+
+    def test_sample_layers_respected(self):
+        S, B, H = 8, 1, 8
+        model = FakeGPTModel(num_layers=4, hidden_size=H, vocab_size=16)
+        monitor = ActivationDumpMonitor(
+            dump_dir=str(self.dump_dir), n_sample_tokens=4, sample_layers=[1, 3], monitor_interval=1
+        )
+        monitor.register_hooks(model)
+        model(torch.randn(S, B, H))
+        monitor.step()
+        files = self._list_files(self.dump_dir)
+        self.assertEqual(len(files), 2)
+        layers = sorted(self._load(f)[1]["layer_idx"] for f in files)
+        self.assertEqual(layers, ["1", "3"])
+
+    def test_first_microbatch_only(self):
+        S, B, H = 8, 1, 8
+        model = FakeGPTModel(num_layers=2, hidden_size=H, vocab_size=16)
+        monitor = ActivationDumpMonitor(
+            dump_dir=str(self.dump_dir), n_sample_tokens=4, first_microbatch_only=True, monitor_interval=1
+        )
+        monitor.register_hooks(model)
+        model(torch.randn(S, B, H))  # microbatch 1
+        model(torch.randn(S, B, H))  # microbatch 2 (same step) -> skipped by first_microbatch_only
+        monitor.step()
+        self.assertEqual(len(self._list_files(self.dump_dir)), 2, "one file per layer despite two forwards")
+
+    def test_rank_filter_disables_dump(self):
+        S, B, H = 8, 1, 8
+        model = FakeGPTModel(num_layers=2, hidden_size=H, vocab_size=16)
+        monitor = ActivationDumpMonitor(
+            dump_dir=str(self.dump_dir), n_sample_tokens=4, dump_dp_ranks=[1], monitor_interval=1
+        )
+        monitor.register_hooks(model)  # test runs on dp_rank 0, filter wants rank 1
+        model(torch.randn(S, B, H))
+        monitor.step()
+        self.assertEqual(self._list_files(self.dump_dir), [], "no files when this rank is not in dump_dp_ranks")
+
+    def test_dtype_cast_on_write(self):
+        S, B, H = 8, 1, 8
+        model = FakeGPTModel(num_layers=1, hidden_size=H, vocab_size=16)
+        monitor = ActivationDumpMonitor(
+            dump_dir=str(self.dump_dir), n_sample_tokens=4, dump_dtype="float16", monitor_interval=1
+        )
+        monitor.register_hooks(model)
+        model(torch.randn(S, B, H))
+        monitor.step()
+        tensors, meta = self._load(self._list_files(self.dump_dir)[0])
+        self.assertEqual(tensors["hidden"].dtype, torch.float16)
+        self.assertEqual(meta["src_dtype"], "float32")
+
+    def test_setup_helper_registers_and_dumps(self):
+        S, B, H = 8, 1, 8
+        model = FakeGPTModel(num_layers=2, hidden_size=H, vocab_size=16)
+        monitor_dict = {}
+        setup_activation_dump_monitor(
+            model, dump_dir=str(self.dump_dir), n_sample_tokens=4, monitor_interval=1, monitor_dict=monitor_dict
+        )
+        self.assertIn("act_dump", monitor_dict)
+        model(torch.randn(S, B, H))
+        monitor_dict["act_dump"].step()
+        self.assertEqual(len(self._list_files(self.dump_dir)), 2)
+
+    def test_rotation_keeps_only_recent_steps(self):
+        S, B, H = 8, 1, 8
+        model = FakeGPTModel(num_layers=1, hidden_size=H, vocab_size=16)
+        monitor = ActivationDumpMonitor(
+            dump_dir=str(self.dump_dir), n_sample_tokens=4, max_dump_steps=2, monitor_interval=1
+        )
+        monitor.register_hooks(model)
+        for _ in range(5):
+            model(torch.randn(S, B, H))
+            monitor.step()
+        step_dirs = sorted(p.name for p in Path(self.dump_dir).glob("step_*"))
+        self.assertEqual(step_dirs, ["step_0000003", "step_0000004"], "only the 2 most-recent steps retained")
+
+    def test_rotation_disabled_when_none(self):
+        S, B, H = 8, 1, 8
+        model = FakeGPTModel(num_layers=1, hidden_size=H, vocab_size=16)
+        monitor = ActivationDumpMonitor(
+            dump_dir=str(self.dump_dir), n_sample_tokens=4, max_dump_steps=None, monitor_interval=1
+        )
+        monitor.register_hooks(model)
+        for _ in range(4):
+            model(torch.randn(S, B, H))
+            monitor.step()
+        self.assertEqual(len(list(Path(self.dump_dir).glob("step_*"))), 4, "no pruning when max_dump_steps=None")
 
 
 if __name__ == "__main__":

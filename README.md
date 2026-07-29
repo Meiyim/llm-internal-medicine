@@ -9,6 +9,9 @@
 - **[PLE Health](./docs/ple_health.md)** — Per-Layer Embedding 健康监控 (7 指标)
 - **[mHC Health](./docs/mhc_health.md)** — Manifold-Constrained Hyper-Connections 映射监控 (每 hc 模块 8 指标；仅在开启 mHC 层时生效)
 
+外加一个非指标类工具：
+- **[Activation Dump](./docs/activation_dump.md)** — 按 monitor 间隔把残差流 hidden states 采样落盘 (safetensors)，供离线结构分析 (`spec_entropy_explorer.py`)，不上报任何 training_logs 指标
+
 ---
 
 ## 快速开始

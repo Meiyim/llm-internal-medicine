@@ -2,6 +2,7 @@
 
 import logging
 
+from .activation_dump_monitor import ActivationDumpMonitor, setup_activation_dump_monitor
 from .base import TorchProbe
 from .gather import install_gather_fn
 from .massive_activation_monitor import MassiveActivationMonitor, setup_massive_activation_monitor
@@ -18,6 +19,7 @@ _MONITOR_MAP = {
     "ple_health": setup_ple_monitor,
     "massive_act": setup_massive_activation_monitor,
     "mhc_health": setup_mhc_monitor,
+    "act_dump": setup_activation_dump_monitor,
 }
 
 
@@ -66,4 +68,6 @@ __all__ = [
     "setup_massive_activation_monitor",
     "MHCHealthMonitor",
     "setup_mhc_monitor",
+    "ActivationDumpMonitor",
+    "setup_activation_dump_monitor",
 ]

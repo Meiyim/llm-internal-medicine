@@ -34,8 +34,16 @@ BOS / attention-sink 的 massive activation 影响，量级与统计特性异常
 `max_dump_steps` 个 `step_*` 目录，删除更旧的，使磁盘占用有上界，跑多久都不会撑爆。
 设为 `null` 关闭轮转（无上限）。
 
+`min_channel_max_ratio`（默认 `None`）在 flush 时按 massive-activation 门限过滤：
+只有 `channel_max / channel_median >= min_channel_max_ratio` 的样本会落盘，其他丢弃。
+ratio 无论如何都写进 metadata（`channel_max_ratio` 字段），便于事后核对。触发所在的
+`step / layer_idx / global_rank / pp / tp / dp` 也已经记进 metadata。适合"只关心
+ill-conditioned 状态"的场景，配合 `max_dump_steps` 后每步一层最多写一份、只在异常
+step 才写，磁盘占用天然稀疏。
+
 粗略磁盘占用（每 step）≈ `n_sample_tokens × hidden_size × dtype_size × 采样层数`；
-配合 `max_dump_steps` 后总占用 ≈ 上式 × `max_dump_steps`。
+配合 `max_dump_steps` 后总占用 ≈ 上式 × `max_dump_steps`。开启 `min_channel_max_ratio`
+后按实际"异常步数"下压。
 
 ## 配置（必须用 dict 形式传 per-monitor kwargs）
 
@@ -61,9 +69,9 @@ internal_medicine_monitors:
 | `first_microbatch_only` | `True` | 每 step 每层只落盘第一个 microbatch |
 | `dump_dp_ranks` | `[0]` | 哪些 DP rank 落盘 |
 | `dump_tp_ranks` | `[0]` | 哪些 TP rank 落盘 |
-| `dump_dtype` | `None` | 写盘前 cast（`float32`/`float16`/`bfloat16`）；`None`=保留源 dtype |
 | `max_dumps_per_step` | `None` | 每 step 文件数安全上限 |
 | `max_dump_steps` | `20` | 轮转：只保留最近 N 个 `step_*` 目录；`None`=不轮转 |
+| `min_channel_max_ratio` | `None` | flush 门限：`channel_max / channel_median` 低于此值则不落盘（None=不过滤） |
 
 ## 文件布局与元数据
 
@@ -78,7 +86,8 @@ internal_medicine_monitors:
 safetensors metadata（全部为字符串）：`step`、`layer_idx`、`which`、`global_rank`、
 `pp_rank`、`tp_rank`、`dp_rank`、`seq`、`batch`、`hidden_size`、`n_tokens`、
 `n_sample_tokens`、`token_sample_seed`、`src_dtype`、`sequence_parallel`、
-`token_layout`（`seq_major_flattened_s_times_b`）。
+`token_layout`（`seq_major_flattened_s_times_b`）、`channel_max_ratio`（本次采样
+per-channel `max/median`，用于事后按 massive-activation 严重度筛选）。
 
 ## 并行语义
 

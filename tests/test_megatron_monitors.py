@@ -1044,19 +1044,6 @@ class MegatronActivationDumpMonitorTest(unittest.TestCase):
         monitor.step()
         self.assertEqual(self._list_files(self.dump_dir), [], "no files when this rank is not in dump_dp_ranks")
 
-    def test_dtype_cast_on_write(self):
-        S, B, H = 8, 1, 8
-        model = FakeGPTModel(num_layers=1, hidden_size=H, vocab_size=16)
-        monitor = ActivationDumpMonitor(
-            dump_dir=str(self.dump_dir), n_sample_tokens=4, dump_dtype="float16", monitor_interval=1
-        )
-        monitor.register_hooks(model)
-        model(torch.randn(S, B, H))
-        monitor.step()
-        tensors, meta = self._load(self._list_files(self.dump_dir)[0])
-        self.assertEqual(tensors["hidden"].dtype, torch.float16)
-        self.assertEqual(meta["src_dtype"], "float32")
-
     def test_setup_helper_registers_and_dumps(self):
         S, B, H = 8, 1, 8
         model = FakeGPTModel(num_layers=2, hidden_size=H, vocab_size=16)
@@ -1093,6 +1080,54 @@ class MegatronActivationDumpMonitorTest(unittest.TestCase):
             model(torch.randn(S, B, H))
             monitor.step()
         self.assertEqual(len(list(Path(self.dump_dir).glob("step_*"))), 4, "no pruning when max_dump_steps=None")
+
+    def test_channel_max_ratio_recorded_in_metadata(self):
+        S, B, H = 6, 1, 8
+        model = FakeGPTModel(num_layers=1, hidden_size=H, vocab_size=16)
+        monitor = ActivationDumpMonitor(dump_dir=str(self.dump_dir), n_sample_tokens=4, monitor_interval=1)
+        monitor.register_hooks(model)
+        model(torch.randn(S, B, H))
+        monitor.step()
+        _, meta = self._load(self._list_files(self.dump_dir)[0])
+        self.assertIn("channel_max_ratio", meta)
+        self.assertGreater(float(meta["channel_max_ratio"]), 0.0)
+
+    def test_min_channel_max_ratio_filters_healthy_states(self):
+        S, B, H = 6, 1, 8
+        model = FakeGPTModel(num_layers=1, hidden_size=H, vocab_size=16)
+        monitor = ActivationDumpMonitor(
+            dump_dir=str(self.dump_dir),
+            n_sample_tokens=4,
+            monitor_interval=1,
+            min_channel_max_ratio=1e9,
+        )
+        monitor.register_hooks(model)
+        model(torch.randn(S, B, H))
+        monitor.step()
+        self.assertEqual(self._list_files(self.dump_dir), [], "healthy activations should not hit disk")
+
+    def test_min_channel_max_ratio_admits_spike_states(self):
+        S, B, H = 6, 1, 8
+        model = FakeGPTModel(num_layers=1, hidden_size=H, vocab_size=16)
+        monitor = ActivationDumpMonitor(
+            dump_dir=str(self.dump_dir),
+            n_sample_tokens=4,
+            monitor_interval=1,
+            min_channel_max_ratio=10.0,
+            which="input",  # measure ratio on layer input so our crafted spike is visible
+        )
+        monitor.register_hooks(model)
+        h = torch.randn(S, B, H) * 0.01
+        h[..., 0] = 500.0  # blow one channel far above the median
+        model(h)
+        monitor.step()
+        files = self._list_files(self.dump_dir)
+        self.assertEqual(len(files), 1)
+        _, meta = self._load(files[0])
+        self.assertGreater(float(meta["channel_max_ratio"]), 10.0)
+        self.assertEqual(meta["layer_idx"], "0")
+        self.assertEqual(meta["step"], "0")
+        self.assertIn("global_rank", meta)
 
 
 if __name__ == "__main__":

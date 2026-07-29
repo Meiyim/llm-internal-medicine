@@ -18,6 +18,11 @@ leading tokens are biased by BOS / attention-sink massive activations, so a firs
 slice is unrepresentative of the residual stream). A rotation cap (``max_dump_steps``)
 prunes the oldest ``step_*`` directories after each write so disk stays bounded no
 matter how long the run is.
+
+A ``min_channel_max_ratio`` gate targets massive-activation "ill-conditioned" states:
+each captured tensor's per-channel ``max/median`` ratio is computed on the hot path
+(0-dim GPU tensor, no sync) and, at flush, dumps below the threshold are discarded
+before hitting disk. The ratio is recorded in the safetensors metadata regardless.
 """
 
 import logging
@@ -30,12 +35,6 @@ import torch.nn as nn
 from .base import TorchProbe
 
 logger = logging.getLogger(__name__)
-
-_DTYPE_MAP = {
-    "float32": torch.float32,
-    "float16": torch.float16,
-    "bfloat16": torch.bfloat16,
-}
 
 
 class ActivationDumpMonitor(TorchProbe):
@@ -58,9 +57,9 @@ class ActivationDumpMonitor(TorchProbe):
         first_microbatch_only: bool = True,
         dump_dp_ranks: list[int] | None = None,
         dump_tp_ranks: list[int] | None = None,
-        dump_dtype: str | None = None,
         max_dumps_per_step: int | None = None,
         max_dump_steps: int | None = 20,
+        min_channel_max_ratio: float | None = None,
         monitor_interval: int = 1,
         verbose: bool = False,
         hook_timing_enabled: bool = False,
@@ -72,10 +71,10 @@ class ActivationDumpMonitor(TorchProbe):
         )
         if which not in ("output", "input"):
             raise ValueError(f"which must be 'output' or 'input', got {which!r}")
-        if dump_dtype is not None and dump_dtype not in _DTYPE_MAP:
-            raise ValueError(f"dump_dtype must be one of {sorted(_DTYPE_MAP)} or None, got {dump_dtype!r}")
         if max_dump_steps is not None and max_dump_steps < 1:
             raise ValueError(f"max_dump_steps must be >= 1 or None, got {max_dump_steps!r}")
+        if min_channel_max_ratio is not None and min_channel_max_ratio < 0:
+            raise ValueError(f"min_channel_max_ratio must be >= 0 or None, got {min_channel_max_ratio!r}")
         self.dump_dir = dump_dir
         self.which = which
         self.sample_layers = set(sample_layers) if sample_layers else None
@@ -84,9 +83,9 @@ class ActivationDumpMonitor(TorchProbe):
         self.first_microbatch_only = first_microbatch_only
         self.dump_dp_ranks = set(dump_dp_ranks) if dump_dp_ranks is not None else {0}
         self.dump_tp_ranks = set(dump_tp_ranks) if dump_tp_ranks is not None else {0}
-        self.dump_dtype = dump_dtype
         self.max_dumps_per_step = max_dumps_per_step
         self.max_dump_steps = max_dump_steps
+        self.min_channel_max_ratio = min_channel_max_ratio
 
         # Parallel state (resolved in _init_parallel_state).
         self.tp_rank = 0
@@ -293,9 +292,11 @@ class ActivationDumpMonitor(TorchProbe):
                     hdim = h.shape[-1]
                     flat = h.reshape(-1, hdim)
                     n_tokens = flat.shape[0]
+                    ratio_gpu = self._channel_max_ratio(flat)
                     idx_cpu, idx_dev = self._token_indices(n_tokens, flat.device)
                     sample = flat.index_select(0, idx_dev)
                     cpu_tensor, event = self._async_copy_to_cpu(sample)
+                    ratio_cpu, ratio_event = self._async_copy_to_cpu(ratio_gpu)
                 meta = {
                     "step": str(self.step_count),
                     "layer_idx": str(layer_idx),
@@ -321,6 +322,8 @@ class ActivationDumpMonitor(TorchProbe):
                         "cpu": cpu_tensor,
                         "idx": idx_cpu,
                         "event": event,
+                        "ratio_cpu": ratio_cpu,
+                        "ratio_event": ratio_event,
                         "meta": meta,
                     }
                 )
@@ -330,6 +333,11 @@ class ActivationDumpMonitor(TorchProbe):
                     logger.error(f"[ActivationDumpMonitor] dump error at layer {layer_idx}: {e}")
 
         return hook_fn
+
+    def _channel_max_ratio(self, flat: torch.Tensor) -> torch.Tensor:
+        """0-dim GPU tensor: max / median of per-channel |activation| max. No host sync."""
+        per_channel_max = flat.abs().amax(dim=0).float()
+        return per_channel_max.max() / per_channel_max.median().clamp(min=1e-8)
 
     # ------------------------------------------------------------------
     # Cold path: sync the side stream and write to disk (runs at step end)
@@ -347,15 +355,21 @@ class ActivationDumpMonitor(TorchProbe):
             self._pending.clear()
             self._captured_this_step.clear()
             return
-        cast_dtype = _DTYPE_MAP.get(self.dump_dtype) if self.dump_dtype else None
         written = 0
+        skipped = 0
         for entry in self._pending:
             event = entry["event"]
             if event is not None:
                 event.synchronize()  # cold path: safe to block here, off the hot path
+            ratio_event = entry.get("ratio_event")
+            if ratio_event is not None:
+                ratio_event.synchronize()
+            ratio_val = float(entry["ratio_cpu"].item())
+            entry["meta"]["channel_max_ratio"] = f"{ratio_val:.6f}"
+            if self.min_channel_max_ratio is not None and ratio_val < self.min_channel_max_ratio:
+                skipped += 1
+                continue
             hidden = entry["cpu"]
-            if cast_dtype is not None:
-                hidden = hidden.to(cast_dtype)
             step_dir = os.path.join(self.dump_dir, f"step_{entry['step']:07d}")
             os.makedirs(step_dir, exist_ok=True)
             fname = (
@@ -372,8 +386,11 @@ class ActivationDumpMonitor(TorchProbe):
                 written += 1
             except Exception as e:
                 logger.error(f"[ActivationDumpMonitor] failed writing {path}: {e}")
-        if self.verbose and written:
-            logger.info(f"[ActivationDumpMonitor] wrote {written} dumps for step {self._pending[0]['step']}.")
+        if self.verbose and (written or skipped):
+            logger.info(
+                f"[ActivationDumpMonitor] step {self._pending[0]['step']}: "
+                f"wrote {written}, skipped {skipped} (channel_max_ratio filter)."
+            )
         self._pending.clear()
         self._captured_this_step.clear()
         if written:
@@ -424,9 +441,9 @@ def setup_activation_dump_monitor(
     first_microbatch_only: bool = True,
     dump_dp_ranks: list[int] | None = None,
     dump_tp_ranks: list[int] | None = None,
-    dump_dtype: str | None = None,
     max_dumps_per_step: int | None = None,
     max_dump_steps: int | None = 20,
+    min_channel_max_ratio: float | None = None,
     monitor_interval: int = 1,
     verbose: bool = False,
     hook_timing_enabled: bool = False,
@@ -447,9 +464,9 @@ def setup_activation_dump_monitor(
         first_microbatch_only=first_microbatch_only,
         dump_dp_ranks=dump_dp_ranks,
         dump_tp_ranks=dump_tp_ranks,
-        dump_dtype=dump_dtype,
         max_dumps_per_step=max_dumps_per_step,
         max_dump_steps=max_dump_steps,
+        min_channel_max_ratio=min_channel_max_ratio,
         monitor_interval=monitor_interval,
         verbose=verbose,
         hook_timing_enabled=hook_timing_enabled,

@@ -10,7 +10,6 @@ For a `y = W x` linear on hidden inputs:
 
 ```
 LAR = log_n( ||W X||_rms / (||W||_rms * ||X||_rms) ),   n = W.shape[1]  (input dim)
-k   = n ** (2 * (1 - LAR))                              (effective dimension)
 ```
 
 Hooked at two families of sites:
@@ -64,17 +63,24 @@ With TP=1/DP=1 no reduction fires. Cost is negligible either way.
 
 ## Metrics emitted per monitored step
 
-Per site (`lm_head`, `router_0`, `router_1`, ...):
-`lar/{site}/{lar, k}`.
+Per site (`lm_head`, `router_0`, `router_1`, ...): `lar/{site}/lar` — one metric,
+nothing else.
 
 The three RMS norms (`rms_w`, `rms_x`, `rms_z`) are computed at flush time but
 **not logged** — only their combination `lar` carries the diagnostic signal, and
 raw activation/weight scale is already covered by `massive_act`
 (`activation_rms`, `spectral_norm_max/min`).
 
+`k = H ** (2*(1-lar))` (effective dimension) is **not logged** either: it is a
+strictly monotone reparametrisation of `lar`, so it carries no information `lar`
+does not already have, and its literal "effective rank" reading only holds for a
+uniform weight spectrum — which does not hold at 200k-vocab scale (see the outer
+spec's §10 measurements: full rank, one dominant direction, heavy tail). Derive
+it offline from `lar` if you want the alternate scale.
+
 Globals:
-- `lar/global_lm_head_lar`, `lar/global_lm_head_k` (equals the single lm_head site)
-- `lar/global_router_lar`, `lar/global_router_k` (mean over routers, if any)
+- `lar/global_lm_head_lar` (equals the single lm_head site)
+- `lar/global_router_lar` (mean over routers, if any)
 
 ## Config
 
@@ -106,8 +112,6 @@ internal_medicine_monitors:
 - **Declining `lar`, decline accelerating ⇒ overfitting onset** (paper's core
   signal — the *slope* is the strongest indicator). Consider logging a smoothed
   `d(lar)/dstep` downstream.
-- `k = H ** (2*(1-lar))` — effective dimension used by the map. Relative trend
-  is meaningful; treat absolute value cautiously at 200k-vocab scale.
 
 ## Perf notes
 

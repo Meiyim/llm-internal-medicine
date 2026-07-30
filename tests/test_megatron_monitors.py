@@ -1277,16 +1277,16 @@ class MegatronLARMonitorTest(unittest.TestCase):
         want_lar, *_ = _lar_analytical(hidden, model.output_layer.weight, logits=model.output_layer(hidden))
         self.assertAlmostEqual(got["lar/lm_head/lar"], want_lar, places=4)
         self.assertAlmostEqual(got["lar/global_lm_head_lar"], want_lar, places=4)
-        want_k = H ** (2 * (1 - want_lar))
-        self.assertAlmostEqual(got["lar/lm_head/k"], want_k, places=2)
 
-    def test_lar_logs_only_lar_and_k(self):
-        """The emitted schema is exactly {lar, k} per site.
+    def test_lar_logs_only_lar(self):
+        """The emitted schema is exactly {lar} per site, plus the lar globals.
 
         rms_w / rms_x / rms_z are flush-time intermediates — only their combination
         (lar) is meaningful, and raw activation scale belongs to massive_act.
-        valid_frac was removed: it reported nX/H clamped to 1.0, i.e. always exactly
-        1.0, and a truthful keep-rate needs a pre-mask token count the hooks discard."""
+        k = H**(2*(1-lar)) was removed as a monotone reparametrisation of lar carrying
+        no extra information. valid_frac was removed: it reported nX/H clamped to 1.0,
+        i.e. always exactly 1.0, and a truthful keep-rate needs a pre-mask token count
+        the hooks discard."""
         S, B, H, V = 6, 1, 8, 12
         model = FakeGPTModel(num_layers=1, hidden_size=H, vocab_size=V)
         monitor = LARMonitor(hook_moe_router=False, monitor_interval=1, apply_loss_mask=False)
@@ -1294,10 +1294,7 @@ class MegatronLARMonitorTest(unittest.TestCase):
         model.output_layer(torch.randn(S, B, H))
         monitor.step()
         got = training_logs.get_latest(prefix="lar")
-        self.assertEqual(
-            set(got),
-            {"lar/lm_head/lar", "lar/lm_head/k", "lar/global_lm_head_lar", "lar/global_lm_head_k"},
-        )
+        self.assertEqual(set(got), {"lar/lm_head/lar", "lar/global_lm_head_lar"})
 
     def test_lar_svd_cross_check(self):
         S, B, H, V = 8, 1, 6, 10
@@ -1403,8 +1400,6 @@ class MegatronLARMonitorTest(unittest.TestCase):
         head_input = model.decoder(hidden)
         want_lar, *_ = _lar_analytical(head_input, model.shared_weight, logits=logits)
         self.assertAlmostEqual(got["lar/lm_head/lar"], want_lar, places=4)
-        want_k = H ** (2 * (1 - want_lar))
-        self.assertAlmostEqual(got["lar/lm_head/k"], want_k, places=2)
 
     def test_lar_lm_head_masking_matches_manual_index(self):
         S, B, H, V = 5, 1, 4, 6

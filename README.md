@@ -8,7 +8,7 @@
 - **[Massive Activation Health](./docs/massive_activation.md)** — Residual Stream Massive Activation 健康监控 (21 指标)
 - **[PLE Health](./docs/ple_health.md)** — Per-Layer Embedding 健康监控 (7 指标)
 - **[mHC Health](./docs/mhc_health.md)** — Manifold-Constrained Hyper-Connections 映射监控 (每 hc 模块 8 指标；仅在开启 mHC 层时生效)
-- **[LAR (Log-Alignment Ratio)](./docs/lar.md)** — output_layer + 每个 MoE router 的 LAR 与有效维 k，泛化/过拟合诊断信号（无 SVD、每步 O(1) 通信）
+- **[LAR (Log-Alignment Ratio)](./docs/lar.md)** — output_layer + 每个 MoE router 的 LAR，泛化/过拟合诊断信号（无 SVD、每步 O(1) 通信）
 
 外加一个非指标类工具：
 - **[Activation Dump](./docs/activation_dump.md)** — 按 monitor 间隔把残差流 hidden states 采样落盘 (safetensors)，供离线结构分析 (`spec_entropy_explorer.py`)，不上报任何 training_logs 指标

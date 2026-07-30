@@ -39,13 +39,12 @@ _IGNORE_INDEX_DEFAULT = -100  # Megatron convention for ``labels`` padding
 class LARMonitor(TorchProbe):
     """Log-Alignment Ratio for lm_head + MoE routers.
 
-    Emits, per site (``lm_head`` and ``router_{L}``) and per monitored step:
-    ``lar`` and ``k`` (effective dim = ``H ** (2*(1-lar))``). The underlying
-    ``rms_w`` / ``rms_x`` / ``rms_z`` are flush-time intermediates and
-    deliberately not logged — only their combination (``lar``) is meaningful, and
-    raw activation scale is already covered by ``massive_act``. Two globals:
-    ``global_lm_head_lar`` (trivial — equals the single lm_head site) and
-    ``global_router_lar`` (mean over routers), plus matching ``k`` globals.
+    Emits exactly one metric per site (``lm_head`` and ``router_{L}``) per
+    monitored step: ``lar``. The underlying ``rms_w`` / ``rms_x`` / ``rms_z`` are
+    flush-time intermediates and deliberately not logged — only their combination
+    is meaningful, and raw activation scale is already covered by ``massive_act``.
+    Two globals: ``global_lm_head_lar`` (trivial — equals the single lm_head site)
+    and ``global_router_lar`` (mean over routers).
     """
 
     METRIC_PREFIX = "lar"
@@ -382,16 +381,17 @@ class LARMonitor(TorchProbe):
         rms_z = (ssZ / nZ.clamp_min(1)).clamp_min(eps).sqrt()
         ratio = rms_z / (rms_w * rms_x).clamp_min(eps)
         lar = ratio.log() / torch.log(torch.tensor(H, device=ratio.device, dtype=ratio.dtype))
-        k = torch.tensor(H, device=ratio.device, dtype=ratio.dtype).pow(2.0 * (1.0 - lar))
+        # No ``k = H ** (2*(1-lar))``: it is a pure monotone reparametrisation of ``lar``
+        # (bijective, carries zero extra information) and its literal "effective rank"
+        # reading only holds for a uniform weight spectrum — which does not hold at
+        # 200k-vocab scale. Derive it offline from ``lar`` if you want it.
+        #
         # No ``valid_frac``: reporting the mask's keep-rate needs a pre-mask token count,
         # but the hooks index ``x_flat[mask]`` before ``_accumulate``, so only post-mask
         # counts survive to flush. Deriving it from ``nX`` is not possible (``nX`` is an
         # element count, ``T*H``). The masking of the sums is unaffected — see
         # ``_valid_mask`` / ``_make_lm_head_hook``.
-        return {
-            f"{key}/lar": lar,
-            f"{key}/k": k,
-        }
+        return {f"{key}/lar": lar}
 
     def _flush_buffers(self) -> None:
         super()._flush_buffers()  # harmless: no scalar keys declared via declare_*
@@ -406,11 +406,9 @@ class LARMonitor(TorchProbe):
             if metrics is not None:
                 log_dict.update({f"{self.METRIC_PREFIX}/{k}": v for k, v in metrics.items()})
                 log_dict[f"{self.METRIC_PREFIX}/global_lm_head_lar"] = metrics["lm_head/lar"]
-                log_dict[f"{self.METRIC_PREFIX}/global_lm_head_k"] = metrics["lm_head/k"]
 
         # routers
         router_lars: list[torch.Tensor] = []
-        router_ks: list[torch.Tensor] = []
         for site in self._router_site_keys:
             if not self._sites[site]["ss"]:
                 continue
@@ -419,10 +417,8 @@ class LARMonitor(TorchProbe):
                 continue
             log_dict.update({f"{self.METRIC_PREFIX}/{k}": v for k, v in metrics.items()})
             router_lars.append(metrics[f"{site}/lar"])
-            router_ks.append(metrics[f"{site}/k"])
         if router_lars:
             log_dict[f"{self.METRIC_PREFIX}/global_router_lar"] = torch.stack(router_lars).mean()
-            log_dict[f"{self.METRIC_PREFIX}/global_router_k"] = torch.stack(router_ks).mean()
 
         if log_dict:
             training_logs.update(**log_dict)

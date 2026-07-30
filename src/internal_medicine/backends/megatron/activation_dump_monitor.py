@@ -13,11 +13,20 @@ time (``_flush_buffers``, the cold path). This honors ``monitor-hook-perf-rules`
 no ``.item()/.cpu()`` sync and no collectives on the hot path.
 
 Aggressive-sampling defaults keep long runs from filling disk: first microbatch only,
-a subset of layers, one DP/TP rank, and RANDOM token positions (not the first K — the
-leading tokens are biased by BOS / attention-sink massive activations, so a first-K
-slice is unrepresentative of the residual stream). A rotation cap (``max_dump_steps``)
-prunes the oldest ``step_*`` directories after each write so disk stays bounded no
-matter how long the run is.
+a subset of layers, and one DP/TP rank. Hidden states are dumped in FULL by default
+(``n_sample_tokens=None``) — the whole ``[s*b, h]`` residual tensor — because a token
+subsample breaks any analysis that needs to line activations up against the input
+sequence. Set ``n_sample_tokens=K`` to fall back to sampling K RANDOM token positions
+(not the first K — the leading tokens are biased by BOS / attention-sink massive
+activations, so a first-K slice is unrepresentative of the residual stream). A rotation
+cap (``max_dump_steps``) prunes the oldest ``step_*`` directories after each write so
+disk stays bounded no matter how long the run is.
+
+The input batch that produced the activations (``input_ids``, ``labels``,
+``position_ids`` and any ``packed_seq_params`` tensors) is captured by a model-level
+forward pre-hook and written once per step as ``batch_*.safetensors``, so an offline
+reader can map any residual row back to its token, its sequence within the pack, and
+its loss-mask state. Disable with ``dump_input_batch=False``.
 
 A ``min_channel_max_ratio`` gate targets massive-activation "ill-conditioned" states:
 each captured tensor's per-channel ``max/median`` ratio is computed on the hot path
@@ -36,13 +45,34 @@ from .base import TorchProbe
 
 logger = logging.getLogger(__name__)
 
+# PackedSeqParams fields worth persisting. ``cp_group`` (a ProcessGroup) is
+# deliberately excluded — it is not serialisable and carries no analysis value.
+_PACKED_SEQ_TENSOR_FIELDS = (
+    "cu_seqlens_q",
+    "cu_seqlens_kv",
+    "cu_seqlens_q_padded",
+    "cu_seqlens_kv_padded",
+    "seq_idx",
+)
+_PACKED_SEQ_SCALAR_FIELDS = (
+    "qkv_format",
+    "max_seqlen_q",
+    "max_seqlen_kv",
+    "total_tokens",
+    "local_cp_size",
+)
+# Batch tensors pulled from the model-forward kwargs. ``attention_mask`` is excluded:
+# it is often None (fused/causal paths) or a huge [b,1,s,s] bool tensor.
+_BATCH_TENSOR_KWARGS = ("input_ids", "labels", "position_ids", "loss_mask")
+
 
 class ActivationDumpMonitor(TorchProbe):
     """Dump per-layer residual hidden states to disk on monitored steps.
 
-    Records no scalar metrics: forward hooks stash GPU->pinned-CPU copies of a
-    random-position token sample, and ``_flush_buffers`` writes them as safetensors
-    files (with a metadata sidecar) once per step.
+    Records no scalar metrics: forward hooks stash GPU->pinned-CPU copies of the
+    hidden states (full by default), and ``_flush_buffers`` writes them as safetensors
+    files (with a metadata sidecar) once per step, alongside the input batch that
+    produced them.
     """
 
     METRIC_PREFIX = "act_dump"
@@ -52,9 +82,10 @@ class ActivationDumpMonitor(TorchProbe):
         dump_dir: str = "./outputs/act_dumps",
         which: str = "output",
         sample_layers: list[int] | None = None,
-        n_sample_tokens: int | None = 512,
+        n_sample_tokens: int | None = None,
         token_sample_seed: int = 0,
         first_microbatch_only: bool = True,
+        dump_input_batch: bool = True,
         dump_dp_ranks: list[int] | None = None,
         dump_tp_ranks: list[int] | None = None,
         max_dumps_per_step: int | None = None,
@@ -81,6 +112,7 @@ class ActivationDumpMonitor(TorchProbe):
         self.n_sample_tokens = n_sample_tokens
         self.token_sample_seed = token_sample_seed
         self.first_microbatch_only = first_microbatch_only
+        self.dump_input_batch = dump_input_batch
         self.dump_dp_ranks = set(dump_dp_ranks) if dump_dp_ranks is not None else {0}
         self.dump_tp_ranks = set(dump_tp_ranks) if dump_tp_ranks is not None else {0}
         self.max_dumps_per_step = max_dumps_per_step
@@ -99,6 +131,8 @@ class ActivationDumpMonitor(TorchProbe):
 
         # Hot-path scratch, reset at flush.
         self._pending: list[dict] = []
+        self._pending_batch: dict | None = None
+        self._batch_capture_models: list = []
         self._captured_this_step: set[int] = set()
         self._cached_idx_step: int | None = None
         self._cached_idx_cpu: torch.Tensor | None = None
@@ -170,6 +204,14 @@ class ActivationDumpMonitor(TorchProbe):
             )
             self.hooks.append(hook)
             registered += 1
+        # Batch capture: one model-level pre-hook per unique root module. Fires before
+        # the layer hooks, so the batch is already stashed when the activations land.
+        if self.dump_input_batch and model is not None and not any(m is model for m in self._batch_capture_models):
+            self._batch_capture_models.append(model)
+            hook = model.register_forward_pre_hook(
+                self.timed_hook("act_dump_batch", self._make_batch_capture_hook()), with_kwargs=True
+            )
+            self.hooks.append(hook)
         logger.info(
             f"[ActivationDumpMonitor] Registered {registered} dump hooks (this_rank_dumps={self._this_rank_dumps})."
         )
@@ -222,12 +264,18 @@ class ActivationDumpMonitor(TorchProbe):
     # ------------------------------------------------------------------
 
     def _token_indices(self, n_tokens: int, device: torch.device):
-        """Random token positions for this step, shared across sampled layers.
+        """Token positions to dump for this step, shared across sampled layers.
 
-        Generated on CPU so the same indices double as file metadata without a D2H
-        sync, then moved to ``device``. Cached per ``step_count`` so every sampled
-        layer in a step gathers the SAME positions (cross-layer comparability). Sorted
-        for readability; the exact positions are recorded in the dump's ``token_index``.
+        With ``n_sample_tokens=None`` (the default) this is every position — the full
+        residual tensor is dumped, which is what keeps rows alignable against the
+        ``input_ids`` / ``labels`` in the batch file.
+
+        When a subsample IS requested, positions are RANDOM (not first-K, whose leading
+        tokens are BOS/attention-sink biased). Generated on CPU so the same indices
+        double as file metadata without a D2H sync, then moved to ``device``. Cached per
+        ``step_count`` so every sampled layer in a step gathers the SAME positions
+        (cross-layer comparability). Sorted for readability; the exact positions are
+        recorded in the dump's ``token_index``.
         """
         k = self.n_sample_tokens
         if k is None or k >= n_tokens:
@@ -269,7 +317,7 @@ class ActivationDumpMonitor(TorchProbe):
         return cpu_tensor, event
 
     # ------------------------------------------------------------------
-    # Hot path: capture a random-position sample (no D2H sync, no collectives)
+    # Hot path: capture the hidden states (no D2H sync, no collectives)
     # ------------------------------------------------------------------
 
     def _make_dump_hook(self, layer_idx: int):
@@ -294,7 +342,9 @@ class ActivationDumpMonitor(TorchProbe):
                     n_tokens = flat.shape[0]
                     ratio_gpu = self._channel_max_ratio(flat)
                     idx_cpu, idx_dev = self._token_indices(n_tokens, flat.device)
-                    sample = flat.index_select(0, idx_dev)
+                    # Full dump (the default): skip index_select entirely — the gather
+                    # would copy every row for nothing.
+                    sample = flat if idx_cpu.numel() == n_tokens else flat.index_select(0, idx_dev)
                     cpu_tensor, event = self._async_copy_to_cpu(sample)
                     ratio_cpu, ratio_event = self._async_copy_to_cpu(ratio_gpu)
                 meta = {
@@ -310,6 +360,7 @@ class ActivationDumpMonitor(TorchProbe):
                     "hidden_size": str(hdim),
                     "n_tokens": str(n_tokens),
                     "n_sample_tokens": str(idx_cpu.numel()),
+                    "full_dump": str(idx_cpu.numel() == n_tokens),
                     "token_sample_seed": str(self.token_sample_seed),
                     "src_dtype": str(h.dtype).replace("torch.", ""),
                     "sequence_parallel": str(self.sequence_parallel),
@@ -340,6 +391,116 @@ class ActivationDumpMonitor(TorchProbe):
         return per_channel_max.max() / per_channel_max.median().clamp(min=1e-8)
 
     # ------------------------------------------------------------------
+    # Hot path: capture the input batch (model-level forward pre-hook)
+    # ------------------------------------------------------------------
+
+    def _make_batch_capture_hook(self):
+        """Stash the batch feeding this forward: ids, labels, position_ids, pack params.
+
+        Registered on the root model so it runs before any layer hook. Only the first
+        microbatch of a monitored step is kept (matching ``first_microbatch_only``'s
+        intent for activations), so the batch on disk is the one that produced the
+        dumped hidden states. Every tensor goes through the same async D2H path as the
+        activations — no ``.item()``/``.cpu()`` sync on the hot path.
+        """
+
+        def hook_fn(module, args, kwargs):
+            if not self._this_rank_dumps or not self._should_monitor():
+                return None
+            if self._pending_batch is not None:
+                return None  # first microbatch of this step already captured
+            try:
+                self._pending_batch = self._capture_batch(args, kwargs)
+            except Exception as e:
+                if self.verbose:
+                    logger.error(f"[ActivationDumpMonitor] batch capture error: {e}")
+            return None
+
+        return hook_fn
+
+    def _capture_batch(self, args, kwargs) -> dict:
+        """Build the pending-batch entry: async D2H copies + serialisable metadata.
+
+        Reads the batch from **kwargs only**. Megatron-Bridge invokes the model as
+        ``model(**forward_args)`` (``gpt_step.py``/``llava_step.py``), so the real call
+        path is all-keyword. A positional fallback (``args[0] -> input_ids``) was tried
+        and rejected: on any model whose ``forward`` takes something else first it
+        silently mislabels that tensor as ``input_ids``, writing a bogus batch file that
+        looks authoritative. Capturing nothing is better than capturing a lie.
+        """
+        tensors: dict[str, torch.Tensor] = {}
+        events: list = []
+        meta: dict[str, str] = {}
+        if not kwargs:
+            return {"tensors": tensors, "events": events, "meta": meta}
+        with torch.no_grad():
+            for name in _BATCH_TENSOR_KWARGS:
+                value = kwargs.get(name)
+                if isinstance(value, torch.Tensor):
+                    cpu_tensor, event = self._async_copy_to_cpu(value.detach())
+                    tensors[name] = cpu_tensor
+                    events.append(event)
+                    meta[f"{name}_shape"] = str(tuple(value.shape))
+                    meta[f"{name}_dtype"] = str(value.dtype).replace("torch.", "")
+            psp = kwargs.get("packed_seq_params")
+            if psp is not None:
+                for field in _PACKED_SEQ_TENSOR_FIELDS:
+                    value = getattr(psp, field, None)
+                    if isinstance(value, torch.Tensor):
+                        cpu_tensor, event = self._async_copy_to_cpu(value.detach())
+                        tensors[f"packed_seq_params.{field}"] = cpu_tensor
+                        events.append(event)
+                for field in _PACKED_SEQ_SCALAR_FIELDS:
+                    value = getattr(psp, field, None)
+                    if value is None:
+                        continue
+                    # ``max_seqlen_q/kv`` are ints in the mcore dataclass, but this repo's
+                    # own get_packed_seq_params (src/trainers/gpt_step_fix_cp.py) builds
+                    # them from ``batch["max_seqlen"].squeeze()`` — i.e. 0-dim GPU
+                    # tensors. ``str()``/``int()`` on those would D2H-sync inside a
+                    # forward pre-hook (perf-rules Rule 1), so route tensors through the
+                    # async copy and only stringify genuine python scalars.
+                    if isinstance(value, torch.Tensor):
+                        cpu_tensor, event = self._async_copy_to_cpu(value.detach())
+                        tensors[f"packed_seq_params.{field}"] = cpu_tensor
+                        events.append(event)
+                    else:
+                        meta[f"packed_seq_params.{field}"] = str(value)
+                meta["packed_seq_params_present"] = "True"
+            elif tensors:
+                meta["packed_seq_params_present"] = "False"
+        return {"tensors": tensors, "events": events, "meta": meta}
+
+    def _write_batch(self, save_file, step_dir: str, step_id: int) -> bool:
+        """Write the captured batch as ``batch_*.safetensors``. Returns True on write."""
+        entry = self._pending_batch
+        if not entry or not entry["tensors"]:
+            return False
+        for event in entry["events"]:
+            if event is not None:
+                event.synchronize()  # cold path
+        meta = dict(entry["meta"])
+        meta.update(
+            {
+                "step": str(step_id),
+                "global_rank": str(self.global_rank),
+                "pp_rank": str(self.pp_rank),
+                "tp_rank": str(self.tp_rank),
+                "dp_rank": str(self.dp_rank),
+                "kind": "input_batch",
+            }
+        )
+        fname = f"rank{self.global_rank}_pp{self.pp_rank}_tp{self.tp_rank}_dp{self.dp_rank}_batch.safetensors"
+        path = os.path.join(step_dir, fname)
+        tensors = {k: v.contiguous() for k, v in entry["tensors"].items()}
+        try:
+            save_file(tensors, path, metadata=meta)
+            return True
+        except Exception as e:
+            logger.error(f"[ActivationDumpMonitor] failed writing {path}: {e}")
+            return False
+
+    # ------------------------------------------------------------------
     # Cold path: sync the side stream and write to disk (runs at step end)
     # ------------------------------------------------------------------
 
@@ -347,6 +508,7 @@ class ActivationDumpMonitor(TorchProbe):
         super()._flush_buffers()  # harmless: no scalar keys declared
         if not self._pending:
             self._captured_this_step.clear()
+            self._pending_batch = None
             return
         try:
             from safetensors.torch import save_file
@@ -354,9 +516,11 @@ class ActivationDumpMonitor(TorchProbe):
             logger.error(f"[ActivationDumpMonitor] safetensors unavailable, dropping {len(self._pending)} dumps: {e}")
             self._pending.clear()
             self._captured_this_step.clear()
+            self._pending_batch = None
             return
         written = 0
         skipped = 0
+        batch_written = False
         for entry in self._pending:
             event = entry["event"]
             if event is not None:
@@ -393,13 +557,19 @@ class ActivationDumpMonitor(TorchProbe):
                 written += 1
             except Exception as e:
                 logger.error(f"[ActivationDumpMonitor] failed writing {path}: {e}")
+            # Write the batch once, into the same step dir, only if a hidden dump
+            # actually survived the ratio gate — otherwise the batch would be orphaned.
+            if written and not batch_written:
+                batch_written = self._write_batch(save_file, step_dir, step_id)
         if self.verbose and (written or skipped):
             logger.info(
                 f"[ActivationDumpMonitor] step {self.step_count}: "
-                f"wrote {written}, skipped {skipped} (channel_max_ratio filter)."
+                f"wrote {written}, skipped {skipped} (channel_max_ratio filter), "
+                f"batch={'yes' if batch_written else 'no'}."
             )
         self._pending.clear()
         self._captured_this_step.clear()
+        self._pending_batch = None
         if written:
             self._rotate_dumps()
 
@@ -443,9 +613,10 @@ def setup_activation_dump_monitor(
     dump_dir: str = "./outputs/act_dumps",
     which: str = "output",
     sample_layers: list[int] | None = None,
-    n_sample_tokens: int | None = 512,
+    n_sample_tokens: int | None = None,
     token_sample_seed: int = 0,
     first_microbatch_only: bool = True,
+    dump_input_batch: bool = True,
     dump_dp_ranks: list[int] | None = None,
     dump_tp_ranks: list[int] | None = None,
     max_dumps_per_step: int | None = None,
@@ -469,6 +640,7 @@ def setup_activation_dump_monitor(
         n_sample_tokens=n_sample_tokens,
         token_sample_seed=token_sample_seed,
         first_microbatch_only=first_microbatch_only,
+        dump_input_batch=dump_input_batch,
         dump_dp_ranks=dump_dp_ranks,
         dump_tp_ranks=dump_tp_ranks,
         max_dumps_per_step=max_dumps_per_step,

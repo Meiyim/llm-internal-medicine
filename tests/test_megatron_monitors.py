@@ -131,6 +131,46 @@ class FakeTiedGPTModel(nn.Module):
         return self.output_layer(hidden, weight=self.shared_weight)
 
 
+class FakeBatchGPTModel(nn.Module):
+    """GPTModel whose forward is all-keyword, as Megatron-Bridge calls it.
+
+    ``gpt_step.py`` does ``model(**forward_args)`` with input_ids / position_ids /
+    attention_mask / labels (+ packed_seq_params when packing), so this fixture is the
+    shape ActivationDumpMonitor's batch-capture pre-hook actually sees in production.
+    The hidden states are supplied separately so a test can assert on known values.
+    """
+
+    def __init__(self, num_layers, hidden_size, hidden):
+        super().__init__()
+        self.decoder = FakeDecoder(num_layers, hidden_size)
+        self._hidden = hidden
+
+    def forward(self, input_ids=None, position_ids=None, attention_mask=None, labels=None, packed_seq_params=None):
+        return self.decoder(self._hidden)
+
+
+class FakePackedSeqParams:
+    """Stand-in for megatron.core.packed_seq_params.PackedSeqParams.
+
+    ``cp_group`` is a non-serialisable ProcessGroup in the real class; it is set to a
+    junk value here so a test can prove the monitor never tries to persist it.
+    """
+
+    qkv_format = "thd"
+    max_seqlen_q = 4
+    max_seqlen_kv = 4
+    total_tokens = 12
+    local_cp_size = 1
+    cu_seqlens_q_padded = None
+    cu_seqlens_kv_padded = None
+    cp_group = "NOT-A-SERIALISABLE-TENSOR"
+
+    def __init__(self):
+        self.cu_seqlens_q = torch.tensor([0, 4, 8, 12], dtype=torch.int32)
+        self.cu_seqlens_kv = torch.tensor([0, 4, 8, 12], dtype=torch.int32)
+        self.seq_idx = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2], dtype=torch.int32)
+
+
 class FakeHeadlessGPTModel(nn.Module):
     """Non-head PP stage: decoder present but no output_layer / tied weight accessor."""
 
@@ -1182,6 +1222,184 @@ class MegatronActivationDumpMonitorTest(unittest.TestCase):
         self.assertEqual(meta["layer_idx"], "0")
         self.assertEqual(meta["step"], "0")
         self.assertIn("global_rank", meta)
+
+    # ---------------- full-hidden dump (default) ----------------
+
+    def test_full_hidden_dumped_by_default(self):
+        """Default n_sample_tokens=None must dump every token row, not a 512 subsample:
+        a subsample cannot be lined up against the batch's input_ids / labels."""
+        S, B, H = 7, 3, 8
+        self.assertIsNone(ActivationDumpMonitor(dump_dir=str(self.dump_dir)).n_sample_tokens)
+        hidden = torch.randn(S, B, H)
+        model = FakeBatchGPTModel(num_layers=1, hidden_size=H, hidden=hidden)
+        monitor = ActivationDumpMonitor(dump_dir=str(self.dump_dir), monitor_interval=1)
+        monitor.register_hooks(model)
+        model(input_ids=torch.randint(0, 16, (B, S)))
+        monitor.step()
+        act = [f for f in self._list_files(self.dump_dir) if "batch" not in Path(f).name]
+        tensors, meta = self._load(act[0])
+        self.assertEqual(tuple(tensors["hidden"].shape), (S * B, H))
+        self.assertEqual(meta["full_dump"], "True")
+        self.assertEqual(meta["n_tokens"], str(S * B))
+        self.assertEqual(meta["n_sample_tokens"], str(S * B))
+        # token_index is the identity permutation on a full dump.
+        self.assertTrue(torch.equal(tensors["token_index"], torch.arange(S * B)))
+
+    def test_hidden_values_match_layer_output_on_full_dump(self):
+        """The dumped rows must be the actual layer output, seq-major flattened."""
+        S, B, H = 5, 2, 8
+        hidden = torch.randn(S, B, H)
+        model = FakeBatchGPTModel(num_layers=1, hidden_size=H, hidden=hidden)
+        monitor = ActivationDumpMonitor(dump_dir=str(self.dump_dir), monitor_interval=1)
+        monitor.register_hooks(model)
+        with torch.no_grad():
+            want, _ = model.decoder.layers[0](hidden_states=hidden)
+        model(input_ids=torch.randint(0, 16, (B, S)))
+        monitor.step()
+        act = [f for f in self._list_files(self.dump_dir) if "batch" not in Path(f).name]
+        got = self._load(act[0])[0]["hidden"]
+        self.assertTrue(torch.allclose(got, want.reshape(-1, H), atol=1e-6))
+
+    def test_explicit_n_sample_tokens_still_subsamples(self):
+        S, B, H = 20, 1, 8
+        model = FakeGPTModel(num_layers=1, hidden_size=H, vocab_size=16)
+        monitor = ActivationDumpMonitor(dump_dir=str(self.dump_dir), n_sample_tokens=6, monitor_interval=1)
+        monitor.register_hooks(model)
+        model(torch.randn(S, B, H))
+        monitor.step()
+        tensors, meta = self._load(self._list_files(self.dump_dir)[0])
+        self.assertEqual(tuple(tensors["hidden"].shape), (6, H))
+        self.assertEqual(meta["full_dump"], "False")
+
+    # ---------------- input-batch dump ----------------
+
+    def test_input_batch_dumped_alongside_hidden(self):
+        """input_ids / labels / position_ids land in a batch_*.safetensors next to the
+        activations, byte-identical to what was fed to the forward."""
+        S, B, H = 6, 2, 8
+        hidden = torch.randn(S, B, H)
+        model = FakeBatchGPTModel(num_layers=2, hidden_size=H, hidden=hidden)
+        monitor = ActivationDumpMonitor(dump_dir=str(self.dump_dir), monitor_interval=1)
+        monitor.register_hooks(model)
+        ids = torch.randint(0, 16, (B, S))
+        labels = torch.randint(0, 16, (B, S))
+        pos = torch.arange(S).expand(B, S).contiguous()
+        model(input_ids=ids, position_ids=pos, attention_mask=None, labels=labels)
+        monitor.step()
+
+        files = self._list_files(self.dump_dir)
+        batch = [f for f in files if "batch" in Path(f).name]
+        self.assertEqual(len(batch), 1, f"expected exactly one batch file, got {files}")
+        self.assertEqual(len([f for f in files if "batch" not in Path(f).name]), 2, "one hidden file per layer")
+        tensors, meta = self._load(batch[0])
+        self.assertTrue(torch.equal(tensors["input_ids"], ids))
+        self.assertTrue(torch.equal(tensors["labels"], labels))
+        self.assertTrue(torch.equal(tensors["position_ids"], pos))
+        self.assertEqual(meta["kind"], "input_batch")
+        self.assertEqual(meta["step"], "0")
+        self.assertEqual(meta["input_ids_shape"], str((B, S)))
+        # attention_mask was None; must not appear as a key.
+        self.assertNotIn("attention_mask", tensors)
+
+    def test_packed_seq_params_dumped_without_cp_group(self):
+        """PackedSeqParams tensors are persisted; the non-serialisable cp_group is not."""
+        S, B, H = 6, 2, 8
+        psp = FakePackedSeqParams()
+        model = FakeBatchGPTModel(num_layers=1, hidden_size=H, hidden=torch.randn(S, B, H))
+        monitor = ActivationDumpMonitor(dump_dir=str(self.dump_dir), monitor_interval=1)
+        monitor.register_hooks(model)
+        model(input_ids=torch.randint(0, 16, (B, S)), packed_seq_params=psp)
+        monitor.step()
+
+        batch = [f for f in self._list_files(self.dump_dir) if "batch" in Path(f).name]
+        tensors, meta = self._load(batch[0])
+        self.assertTrue(torch.equal(tensors["packed_seq_params.cu_seqlens_q"], psp.cu_seqlens_q))
+        self.assertTrue(torch.equal(tensors["packed_seq_params.seq_idx"], psp.seq_idx))
+        self.assertEqual(meta["packed_seq_params_present"], "True")
+        self.assertEqual(meta["packed_seq_params.qkv_format"], "thd")
+        self.assertEqual(meta["packed_seq_params.total_tokens"], "12")
+        for key in list(tensors) + list(meta):
+            self.assertNotIn("cp_group", key, "cp_group is a ProcessGroup; must never be persisted")
+        # cu_seqlens_q_padded is None on this batch -> absent, not a null entry.
+        self.assertNotIn("packed_seq_params.cu_seqlens_q_padded", tensors)
+
+    def test_packed_seq_params_tensor_max_seqlen_avoids_host_sync(self):
+        """This repo's own get_packed_seq_params (src/trainers/gpt_step_fix_cp.py) sets
+        max_seqlen_q/kv from ``batch["max_seqlen"].squeeze()`` — 0-dim TENSORS, not ints.
+        str()/int() on those would D2H-sync inside the pre-hook, so they must be routed
+        through the async copy and land as tensors, not metadata."""
+        S, B, H = 6, 1, 8
+        psp = FakePackedSeqParams()
+        psp.max_seqlen_q = torch.tensor(4, dtype=torch.int32)  # 0-dim tensor, as in this repo
+        psp.max_seqlen_kv = torch.tensor(4, dtype=torch.int32)
+        model = FakeBatchGPTModel(num_layers=1, hidden_size=H, hidden=torch.randn(S, B, H))
+        monitor = ActivationDumpMonitor(dump_dir=str(self.dump_dir), monitor_interval=1)
+        monitor.register_hooks(model)
+        model(input_ids=torch.randint(0, 16, (B, S)), packed_seq_params=psp)
+        monitor.step()
+
+        batch = [f for f in self._list_files(self.dump_dir) if "batch" in Path(f).name]
+        tensors, meta = self._load(batch[0])
+        self.assertIn("packed_seq_params.max_seqlen_q", tensors)
+        self.assertEqual(int(tensors["packed_seq_params.max_seqlen_q"]), 4)
+        self.assertNotIn("packed_seq_params.max_seqlen_q", meta, "tensor must not be stringified")
+        # qkv_format is a genuine python str -> still metadata.
+        self.assertEqual(meta["packed_seq_params.qkv_format"], "thd")
+
+    def test_batch_dump_disabled(self):
+        S, B, H = 6, 1, 8
+        model = FakeBatchGPTModel(num_layers=1, hidden_size=H, hidden=torch.randn(S, B, H))
+        monitor = ActivationDumpMonitor(dump_dir=str(self.dump_dir), monitor_interval=1, dump_input_batch=False)
+        monitor.register_hooks(model)
+        model(input_ids=torch.randint(0, 16, (B, S)))
+        monitor.step()
+        files = self._list_files(self.dump_dir)
+        self.assertEqual(len(files), 1)
+        self.assertNotIn("batch", Path(files[0]).name)
+
+    def test_batch_not_written_when_ratio_gate_drops_every_dump(self):
+        """No hidden file survives the gate -> no orphan batch file either."""
+        S, B, H = 6, 1, 8
+        model = FakeBatchGPTModel(num_layers=1, hidden_size=H, hidden=torch.randn(S, B, H))
+        monitor = ActivationDumpMonitor(dump_dir=str(self.dump_dir), monitor_interval=1, min_channel_max_ratio=1e9)
+        monitor.register_hooks(model)
+        model(input_ids=torch.randint(0, 16, (B, S)))
+        monitor.step()
+        self.assertEqual(self._list_files(self.dump_dir), [])
+
+    def test_batch_captured_from_first_microbatch_only(self):
+        """Two forwards in one step -> the batch on disk is the FIRST one, matching the
+        first-microbatch hidden states it sits next to."""
+        S, B, H = 6, 1, 8
+        model = FakeBatchGPTModel(num_layers=1, hidden_size=H, hidden=torch.randn(S, B, H))
+        monitor = ActivationDumpMonitor(dump_dir=str(self.dump_dir), monitor_interval=1)
+        monitor.register_hooks(model)
+        first = torch.randint(0, 16, (B, S))
+        second = torch.randint(100, 116, (B, S))
+        model(input_ids=first)
+        model(input_ids=second)
+        monitor.step()
+        batch = [f for f in self._list_files(self.dump_dir) if "batch" in Path(f).name]
+        self.assertEqual(len(batch), 1)
+        got = self._load(batch[0])[0]["input_ids"]
+        self.assertTrue(torch.equal(got, first), "batch must come from the first microbatch")
+
+    def test_batch_state_reset_between_steps(self):
+        S, B, H = 6, 1, 8
+        model = FakeBatchGPTModel(num_layers=1, hidden_size=H, hidden=torch.randn(S, B, H))
+        monitor = ActivationDumpMonitor(dump_dir=str(self.dump_dir), monitor_interval=1)
+        monitor.register_hooks(model)
+        step0 = torch.randint(0, 16, (B, S))
+        step1 = torch.randint(100, 116, (B, S))
+        model(input_ids=step0)
+        monitor.step()
+        model(input_ids=step1)
+        monitor.step()
+        got0 = self._load(self._list_files(Path(self.dump_dir) / "step_0000000")[0])[0]
+        b1 = [f for f in self._list_files(Path(self.dump_dir) / "step_0000001") if "batch" in Path(f).name]
+        got1 = self._load(b1[0])[0]
+        self.assertTrue(torch.equal(got0["input_ids"], step0))
+        self.assertTrue(torch.equal(got1["input_ids"], step1), "step 1 must capture its own batch")
 
 
 def _lar_analytical(hidden, weight, logits=None):

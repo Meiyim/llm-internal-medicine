@@ -11,7 +11,7 @@
 - **[LAR (Log-Alignment Ratio)](./docs/lar.md)** — output_layer + 每个 MoE router 的 LAR，泛化/过拟合诊断信号（无 SVD、每步 O(1) 通信）
 
 外加一个非指标类工具：
-- **[Activation Dump](./docs/activation_dump.md)** — 按 monitor 间隔把残差流 hidden states 采样落盘 (safetensors)，供离线结构分析 (`spec_entropy_explorer.py`)，不上报任何 training_logs 指标
+- **[Activation Dump](./docs/activation_dump.md)** — 按 monitor 间隔把残差流 hidden states（默认全量）连同产生它们的输入 batch（`input_ids` / `labels` / `PackedSeqParams`）落盘 (safetensors)，供离线结构分析 (`spec_entropy_explorer.py`)，不上报任何 training_logs 指标
 
 ---
 

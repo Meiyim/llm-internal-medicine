@@ -40,8 +40,8 @@ class LARMonitor(TorchProbe):
     """Log-Alignment Ratio for lm_head + MoE routers.
 
     Emits, per site (``lm_head`` and ``router_{L}``) and per monitored step:
-    ``lar``, ``k`` (effective dim = ``H ** (2*(1-lar))``), ``valid_frac``. The
-    underlying ``rms_w`` / ``rms_x`` / ``rms_z`` are flush-time intermediates and
+    ``lar`` and ``k`` (effective dim = ``H ** (2*(1-lar))``). The underlying
+    ``rms_w`` / ``rms_x`` / ``rms_z`` are flush-time intermediates and
     deliberately not logged — only their combination (``lar``) is meaningful, and
     raw activation scale is already covered by ``massive_act``. Two globals:
     ``global_lm_head_lar`` (trivial — equals the single lm_head site) and
@@ -383,15 +383,14 @@ class LARMonitor(TorchProbe):
         ratio = rms_z / (rms_w * rms_x).clamp_min(eps)
         lar = ratio.log() / torch.log(torch.tensor(H, device=ratio.device, dtype=ratio.dtype))
         k = torch.tensor(H, device=ratio.device, dtype=ratio.dtype).pow(2.0 * (1.0 - lar))
-        # valid_frac uses lm_head's X tokens if available (denominator = pre-mask numel).
-        # Cheap heuristic: recompute from the local (unreduced) X count vs expected [T,H]
-        # which we don't retain; report 1.0 when no mask applied else ratio via nX/H.
-        # For simplicity + honesty, we approximate valid_frac from nX and H when H > 0.
-        valid_frac = (nX / (H if H > 0 else 1.0)).clamp(max=1.0)
+        # No ``valid_frac``: reporting the mask's keep-rate needs a pre-mask token count,
+        # but the hooks index ``x_flat[mask]`` before ``_accumulate``, so only post-mask
+        # counts survive to flush. Deriving it from ``nX`` is not possible (``nX`` is an
+        # element count, ``T*H``). The masking of the sums is unaffected — see
+        # ``_valid_mask`` / ``_make_lm_head_hook``.
         return {
             f"{key}/lar": lar,
             f"{key}/k": k,
-            f"{key}/valid_frac": valid_frac,
         }
 
     def _flush_buffers(self) -> None:

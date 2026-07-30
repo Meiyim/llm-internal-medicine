@@ -1280,10 +1280,13 @@ class MegatronLARMonitorTest(unittest.TestCase):
         want_k = H ** (2 * (1 - want_lar))
         self.assertAlmostEqual(got["lar/lm_head/k"], want_k, places=2)
 
-    def test_lar_does_not_log_rms_components(self):
-        """rms_w / rms_x / rms_z are flush-time intermediates, not metrics. Only their
-        combination (lar) is meaningful, and raw activation scale belongs to
-        massive_act — keep them out of the logged schema."""
+    def test_lar_logs_only_lar_and_k(self):
+        """The emitted schema is exactly {lar, k} per site.
+
+        rms_w / rms_x / rms_z are flush-time intermediates — only their combination
+        (lar) is meaningful, and raw activation scale belongs to massive_act.
+        valid_frac was removed: it reported nX/H clamped to 1.0, i.e. always exactly
+        1.0, and a truthful keep-rate needs a pre-mask token count the hooks discard."""
         S, B, H, V = 6, 1, 8, 12
         model = FakeGPTModel(num_layers=1, hidden_size=H, vocab_size=V)
         monitor = LARMonitor(hook_moe_router=False, monitor_interval=1, apply_loss_mask=False)
@@ -1291,9 +1294,10 @@ class MegatronLARMonitorTest(unittest.TestCase):
         model.output_layer(torch.randn(S, B, H))
         monitor.step()
         got = training_logs.get_latest(prefix="lar")
-        self.assertIn("lar/lm_head/lar", got)  # guard: the site did report
-        for suffix in ("rms_w", "rms_x", "rms_z"):
-            self.assertNotIn(f"lar/lm_head/{suffix}", got)
+        self.assertEqual(
+            set(got),
+            {"lar/lm_head/lar", "lar/lm_head/k", "lar/global_lm_head_lar", "lar/global_lm_head_k"},
+        )
 
     def test_lar_svd_cross_check(self):
         S, B, H, V = 8, 1, 6, 10

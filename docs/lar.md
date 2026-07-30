@@ -37,7 +37,12 @@ kwarg). Tokens where `labels != label_ignore_index` (default `-100`) are used
 for the `X` / logits sum-of-squares. The weight sum-of-squares is
 token-independent and unaffected. When `labels` is not present on a forward
 (eval / inference), the monitor falls back to using all tokens; `lar` still
-emits and `valid_frac` will read 1.0.
+emits.
+
+There is **no `valid_frac` metric** reporting the mask's keep-rate. Computing it
+would need a pre-mask token count, but the hooks index `x_flat[mask]` before
+accumulating, so only post-mask counts reach flush time. Whether masking is live
+is therefore not observable from the emitted metrics.
 
 **Under `sequence_parallel=True`**, hidden entering routers is seq-sharded
 across TP while `labels` are full-length. Router LAR falls back to unmasked
@@ -60,7 +65,7 @@ With TP=1/DP=1 no reduction fires. Cost is negligible either way.
 ## Metrics emitted per monitored step
 
 Per site (`lm_head`, `router_0`, `router_1`, ...):
-`lar/{site}/{lar, k, valid_frac}`.
+`lar/{site}/{lar, k}`.
 
 The three RMS norms (`rms_w`, `rms_x`, `rms_z`) are computed at flush time but
 **not logged** — only their combination `lar` carries the diagnostic signal, and

@@ -24,6 +24,9 @@ MassiveActivationMonitor = importlib.import_module(
 activation_dump_module = importlib.import_module("internal_medicine.backends.megatron.activation_dump_monitor")
 ActivationDumpMonitor = activation_dump_module.ActivationDumpMonitor
 setup_activation_dump_monitor = activation_dump_module.setup_activation_dump_monitor
+lar_module = importlib.import_module("internal_medicine.backends.megatron.lar_monitor")
+LARMonitor = lar_module.LARMonitor
+setup_lar_monitor = lar_module.setup_lar_monitor
 MoESpecialistMonitor = importlib.import_module("internal_medicine.backends.megatron.moe_monitor").MoESpecialistMonitor
 moe_monitor_module = importlib.import_module("internal_medicine.backends.megatron.moe_monitor")
 PLEHealthMonitor = importlib.import_module("internal_medicine.backends.megatron.ple_monitor").PLEHealthMonitor
@@ -1128,6 +1131,232 @@ class MegatronActivationDumpMonitorTest(unittest.TestCase):
         self.assertEqual(meta["layer_idx"], "0")
         self.assertEqual(meta["step"], "0")
         self.assertIn("global_rank", meta)
+
+
+def _lar_analytical(hidden, weight, logits=None):
+    """RMS-based LAR reference: hidden [T,H], weight [V,H], logits [T,V] (or None => hidden @ weight.T)."""
+    H = weight.shape[1]
+    x = hidden.reshape(-1, H).detach().float()
+    w = weight.detach().float()
+    z = (x @ w.t()) if logits is None else logits.reshape(-1, weight.shape[0]).detach().float()
+    rms_w = w.pow(2).mean().sqrt()
+    rms_x = x.pow(2).mean().sqrt()
+    rms_z = z.pow(2).mean().sqrt()
+    lar = float(torch.log(rms_z / (rms_w * rms_x)) / math.log(H))
+    return lar, rms_w.item(), rms_x.item(), rms_z.item()
+
+
+def _lar_svd(hidden, weight):
+    """Spectral cross-check: LAR = 1 + 0.5 * log_n(Σ p_i q_i)  (spec §5)."""
+    W = weight.detach().float()
+    _, S, Vh = torch.linalg.svd(W, full_matrices=False)
+    p = S**2
+    p = p / p.sum()
+    H = W.shape[1]
+    x = hidden.reshape(-1, H).float()
+    proj = x @ Vh.t()
+    q = proj.pow(2).sum(0)
+    q = q / q.sum()
+    return 1.0 + 0.5 * float(torch.log((p * q).sum()) / math.log(H))
+
+
+class _FakeRouter(nn.Module):
+    """Minimal MoE router: gating linear returning (probs, routing_map) — the real
+    Megatron TopKRouter contract, from which LARMonitor must NOT read logits."""
+
+    def __init__(self, hidden_size, num_experts):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(num_experts, hidden_size))
+
+    def forward(self, hidden):
+        logits = F.linear(hidden, self.weight)
+        probs = F.softmax(logits, dim=-1)
+        routing_map = probs.argmax(dim=-1, keepdim=True)
+        return probs, routing_map
+
+
+class _FakeMoELayer(nn.Module):
+    def __init__(self, hidden_size, num_experts):
+        super().__init__()
+        self.router = _FakeRouter(hidden_size, num_experts)
+
+    def forward(self, hidden):
+        self.router(hidden)
+        return hidden
+
+
+class _FakeMoEBlock(nn.Module):
+    """Wraps FakeGPTModel with an MoE-style .mlp on each decoder layer."""
+
+    def __init__(self, num_layers, hidden_size, num_experts, vocab_size):
+        super().__init__()
+        decoder_layers = [SimpleNamespace(mlp=_FakeMoELayer(hidden_size, num_experts)) for _ in range(num_layers)]
+        # register the router as a real submodule so parameters are visible.
+        self._routers = nn.ModuleList([layer.mlp.router for layer in decoder_layers])
+        self.decoder = SimpleNamespace(
+            layers=decoder_layers,
+            final_layernorm=nn.LayerNorm(hidden_size),
+        )
+        self.output_layer = nn.Linear(hidden_size, vocab_size, bias=False)
+
+    def forward(self, hidden, labels=None):
+        # run every router so their forward hooks fire
+        for layer in self.decoder.layers:
+            layer.mlp(hidden)
+        return self.output_layer(hidden)
+
+
+class MegatronLARMonitorTest(unittest.TestCase):
+    def setUp(self):
+        training_logs.reset()
+
+    def tearDown(self):
+        training_logs.reset()
+
+    def test_lar_lm_head_matches_analytical(self):
+        S, B, H, V = 6, 1, 8, 12
+        model = FakeGPTModel(num_layers=1, hidden_size=H, vocab_size=V)
+        monitor = LARMonitor(hook_moe_router=False, monitor_interval=1, apply_loss_mask=False)
+        monitor.register_hooks(model)
+        hidden = torch.randn(S, B, H)
+        # Drive output_layer directly with a known hidden so analytical matches exactly.
+        model.output_layer(hidden)
+        monitor.step()
+        got = training_logs.get_latest(prefix="lar")
+        want_lar, want_rms_w, want_rms_x, want_rms_z = _lar_analytical(
+            hidden, model.output_layer.weight, logits=model.output_layer(hidden)
+        )
+        self.assertAlmostEqual(got["lar/lm_head/lar"], want_lar, places=4)
+        self.assertAlmostEqual(got["lar/lm_head/rms_w"], want_rms_w, places=4)
+        self.assertAlmostEqual(got["lar/lm_head/rms_x"], want_rms_x, places=4)
+        self.assertAlmostEqual(got["lar/lm_head/rms_z"], want_rms_z, places=4)
+        self.assertAlmostEqual(got["lar/global_lm_head_lar"], want_lar, places=4)
+        want_k = H ** (2 * (1 - want_lar))
+        self.assertAlmostEqual(got["lar/lm_head/k"], want_k, places=2)
+
+    def test_lar_svd_cross_check(self):
+        S, B, H, V = 8, 1, 6, 10
+        model = FakeGPTModel(num_layers=1, hidden_size=H, vocab_size=V)
+        monitor = LARMonitor(hook_moe_router=False, monitor_interval=1, apply_loss_mask=False)
+        monitor.register_hooks(model)
+        hidden = torch.randn(S, B, H)
+        model.output_layer(hidden)
+        monitor.step()
+        got_lar = training_logs.get_latest(prefix="lar")["lar/lm_head/lar"]
+        svd_lar = _lar_svd(hidden.reshape(-1, H), model.output_layer.weight)
+        self.assertAlmostEqual(got_lar, svd_lar, places=3)
+
+    def test_lar_router_matches_analytical(self):
+        S, B, H, E, V = 4, 1, 6, 5, 8
+        model = _FakeMoEBlock(num_layers=1, hidden_size=H, num_experts=E, vocab_size=V)
+        monitor = LARMonitor(hook_lm_head=False, monitor_interval=1, apply_loss_mask=False)
+        monitor.register_hooks(model)
+        hidden = torch.randn(S, B, H)
+        model(hidden)
+        monitor.step()
+        got = training_logs.get_latest(prefix="lar")
+        router_weight = model.decoder.layers[0].mlp.router.weight
+        want_lar, *_ = _lar_analytical(hidden, router_weight, logits=hidden.reshape(-1, H) @ router_weight.t())
+        self.assertAlmostEqual(got["lar/router_0/lar"], want_lar, places=4)
+        self.assertAlmostEqual(got["lar/global_router_lar"], want_lar, places=4)
+
+    def test_lar_multi_microbatch_accumulation(self):
+        S, B, H, V = 4, 1, 6, 8
+        model = FakeGPTModel(num_layers=1, hidden_size=H, vocab_size=V)
+        monitor = LARMonitor(hook_moe_router=False, monitor_interval=1, apply_loss_mask=False)
+        monitor.register_hooks(model)
+        h1 = torch.randn(S, B, H)
+        h2 = torch.randn(S, B, H)
+        h3 = torch.randn(S, B, H)
+        model.output_layer(h1)
+        model.output_layer(h2)
+        model.output_layer(h3)
+        monitor.step()
+        got = training_logs.get_latest(prefix="lar")["lar/lm_head/lar"]
+        big = torch.cat([h1.reshape(-1, H), h2.reshape(-1, H), h3.reshape(-1, H)], dim=0)
+        want, *_ = _lar_analytical(big, model.output_layer.weight, logits=big @ model.output_layer.weight.t())
+        self.assertAlmostEqual(got, want, places=4)
+
+    def test_lar_interval_gate(self):
+        S, B, H, V = 4, 1, 6, 8
+        model = FakeGPTModel(num_layers=1, hidden_size=H, vocab_size=V)
+        monitor = LARMonitor(hook_moe_router=False, monitor_interval=5, apply_loss_mask=False)
+        monitor.register_hooks(model)
+        # step_count=0 before the very first step(), so _should_monitor() would fire, but
+        # we exercise a step that is NOT a multiple of 5.
+        monitor.step_count = 1  # ensure next _should_monitor() check is 1 % 5 != 0
+        model.output_layer(torch.randn(S, B, H))
+        monitor.step()  # step_count 1 -> 2
+        self.assertEqual(training_logs.get_latest(prefix="lar"), {})
+
+    def test_lar_lm_head_absent_on_middle_stage(self):
+        H = 6
+        model = FakeHeadlessGPTModel(num_layers=1, hidden_size=H)
+        monitor = LARMonitor(hook_moe_router=False, monitor_interval=1, apply_loss_mask=False)
+        monitor.register_hooks(model)  # must not crash and must produce no site
+        model(torch.randn(4, 1, H))
+        monitor.step()
+        self.assertEqual(training_logs.get_latest(prefix="lar"), {})
+
+    def test_lar_tied_weights_uses_shared_tensor(self):
+        S, B, H, V = 4, 1, 6, 8
+        model = FakeGPTModel(num_layers=1, hidden_size=H, vocab_size=V)
+        # Simulate tied embeddings: swap output_layer.weight with a shared tensor.
+        shared = nn.Parameter(torch.randn(V, H) * 0.5)
+        model.output_layer.weight = shared
+        monitor = LARMonitor(hook_moe_router=False, monitor_interval=1, apply_loss_mask=False)
+        monitor.register_hooks(model)
+        model.output_layer(torch.randn(S, B, H))
+        monitor.step()
+        got_rms_w = training_logs.get_latest(prefix="lar")["lar/lm_head/rms_w"]
+        want_rms_w = float(shared.detach().float().pow(2).mean().sqrt())
+        self.assertAlmostEqual(got_rms_w, want_rms_w, places=5)
+
+    def test_lar_lm_head_masking_matches_manual_index(self):
+        S, B, H, V = 5, 1, 4, 6
+        model = FakeGPTModel(num_layers=1, hidden_size=H, vocab_size=V)
+        monitor = LARMonitor(hook_moe_router=False, monitor_interval=1, apply_loss_mask=True)
+        monitor.register_hooks(model)
+        hidden = torch.randn(S, B, H)
+        labels = torch.tensor([[1, 2, -100, 4, -100]])  # [B, S] -> valid at positions 0,1,3
+        # Drive the head with the model so the label-capture pre-hook fires.
+        model(hidden, labels=labels)  # note: FakeGPTModel(x) ignores labels but pre-hook still sees them
+        # The pre-hook is on the model, but model(hidden, labels=...) doesn't call output_layer;
+        # so drive output_layer separately using the same captured labels.
+        model.output_layer(hidden)
+        monitor.step()
+        got = training_logs.get_latest(prefix="lar")
+        mask = labels.transpose(0, 1).reshape(-1) != -100  # seq-major
+        hidden_masked = hidden.reshape(-1, H)[mask]
+        logits_masked = model.output_layer(hidden).reshape(-1, V)[mask]
+        want_lar, *_ = _lar_analytical(hidden_masked, model.output_layer.weight, logits=logits_masked)
+        self.assertAlmostEqual(got["lar/lm_head/lar"], want_lar, places=4)
+
+    def test_lar_falls_back_when_labels_absent(self):
+        S, B, H, V = 4, 1, 6, 8
+        model = FakeGPTModel(num_layers=1, hidden_size=H, vocab_size=V)
+        monitor = LARMonitor(hook_moe_router=False, monitor_interval=1, apply_loss_mask=True)
+        monitor.register_hooks(model)
+        model.output_layer(torch.randn(S, B, H))  # no labels captured -> fall back
+        monitor.step()
+        got = training_logs.get_latest(prefix="lar")
+        self.assertIn("lar/lm_head/lar", got)  # still emitted; no crash
+
+    def test_lar_router_masking_uses_captured_labels(self):
+        S, B, H, E, V = 4, 1, 6, 5, 8
+        model = _FakeMoEBlock(num_layers=1, hidden_size=H, num_experts=E, vocab_size=V)
+        monitor = LARMonitor(hook_lm_head=False, monitor_interval=1, apply_loss_mask=True)
+        monitor.register_hooks(model)
+        hidden = torch.randn(S, B, H)
+        labels = torch.tensor([[7, -100, 3, -100]])  # valid at 0, 2
+        model(hidden, labels=labels)
+        monitor.step()
+        got = training_logs.get_latest(prefix="lar")["lar/router_0/lar"]
+        router_weight = model.decoder.layers[0].mlp.router.weight
+        mask = labels.transpose(0, 1).reshape(-1) != -100
+        hidden_masked = hidden.reshape(-1, H)[mask]
+        want, *_ = _lar_analytical(hidden_masked, router_weight, logits=hidden_masked @ router_weight.t())
+        self.assertAlmostEqual(got, want, places=4)
 
 
 if __name__ == "__main__":

@@ -370,7 +370,14 @@ class ActivationDumpMonitor(TorchProbe):
                 skipped += 1
                 continue
             hidden = entry["cpu"]
-            step_dir = os.path.join(self.dump_dir, f"step_{entry['step']:07d}")
+            # ``self.step_count`` reflects the trainer's global iteration during
+            # this flush (synced by ``monitor.step(global_step=...)`` before the
+            # flush runs; falls back to the hook-time counter when no global_step
+            # is provided). Prefer it over ``entry["step"]`` so file layout stays
+            # anchored to the trainer's iteration across checkpoint resume.
+            step_id = int(self.step_count)
+            entry["meta"]["step"] = str(step_id)
+            step_dir = os.path.join(self.dump_dir, f"step_{step_id:07d}")
             os.makedirs(step_dir, exist_ok=True)
             fname = (
                 f"rank{self.global_rank}_pp{self.pp_rank}_tp{self.tp_rank}_dp{self.dp_rank}"
@@ -388,7 +395,7 @@ class ActivationDumpMonitor(TorchProbe):
                 logger.error(f"[ActivationDumpMonitor] failed writing {path}: {e}")
         if self.verbose and (written or skipped):
             logger.info(
-                f"[ActivationDumpMonitor] step {self._pending[0]['step']}: "
+                f"[ActivationDumpMonitor] step {self.step_count}: "
                 f"wrote {written}, skipped {skipped} (channel_max_ratio filter)."
             )
         self._pending.clear()

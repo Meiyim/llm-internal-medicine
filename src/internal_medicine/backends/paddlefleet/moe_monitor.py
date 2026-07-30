@@ -402,8 +402,8 @@ class PaddleMoEMonitor(PaddleProbe):
         self._patched_gates = []
         self._expert_norm_layers = []
 
-    def step(self):
-        super().step()
+    def step(self, global_step: int | None = None):
+        super().step(global_step=global_step)
 
 
 def setup_moe_monitor(

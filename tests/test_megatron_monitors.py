@@ -1047,6 +1047,19 @@ class MegatronActivationDumpMonitorTest(unittest.TestCase):
         monitor.step()
         self.assertEqual(self._list_files(self.dump_dir), [], "no files when this rank is not in dump_dp_ranks")
 
+    def test_dump_uses_global_step_when_provided(self):
+        S, B, H = 4, 1, 8
+        model = FakeGPTModel(num_layers=1, hidden_size=H, vocab_size=16)
+        monitor = ActivationDumpMonitor(dump_dir=str(self.dump_dir), n_sample_tokens=4, monitor_interval=1)
+        monitor.register_hooks(model)
+        model(torch.randn(S, B, H))
+        monitor.step(global_step=137)
+        files = self._list_files(self.dump_dir)
+        self.assertEqual(len(files), 1)
+        self.assertIn("step_0000137", files[0])
+        _, meta = self._load(files[0])
+        self.assertEqual(meta["step"], "137")
+
     def test_setup_helper_registers_and_dumps(self):
         S, B, H = 8, 1, 8
         model = FakeGPTModel(num_layers=2, hidden_size=H, vocab_size=16)

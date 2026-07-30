@@ -394,14 +394,14 @@ class MoESpecialistMonitor(TorchProbe):
                 if self.verbose:
                     logger.error(f"[MoEMonitor] Step expert-metric error layer {layer_idx}: {e}")
 
-    def step(self):
+    def step(self, global_step: int | None = None):
         # in_forward=False: step() runs outside any forward, so we want the
         # monitor-interval gate without _should_monitor's recompute grad guard
         # (a caller-side no_grad wrapper must not silently disable expert-weight
         # metrics). Same reason the expert-bias update uses in_forward=False.
         if self._should_monitor(in_forward=False):
             self._compute_expert_metrics_for_all_layers()
-        super().step()
+        super().step(global_step=global_step)
 
     def _compute_router_metrics(self, layer_idx, router, outputs, _moe_layer):
         topk = getattr(router, "topk", None)

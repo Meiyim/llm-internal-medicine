@@ -49,11 +49,25 @@ class Probe(ABC):
             hook.remove()
         self.hooks = []
 
-    def step(self):
-        self.step_count += 1
+    def step(self, global_step: int | None = None):
+        """Advance the monitor's step counter and flush accumulators.
+
+        If ``global_step`` is provided, ``self.step_count`` is synced to it
+        *before* the flush (so file names / metadata anchor to the trainer's
+        iteration and survive checkpoint resume), then advanced to
+        ``global_step + 1`` after the flush so the next iteration's forward
+        hook sees the correct value for its ``_should_monitor`` gate.
+        Otherwise the counter increments by 1 after the flush (legacy).
+        """
+        if global_step is not None:
+            self.step_count = int(global_step)
         self._flush_buffers()
         if self.log_global and self._global_accum:
             self._flush_global_metrics()
+        if global_step is not None:
+            self.step_count = int(global_step) + 1
+        else:
+            self.step_count += 1
 
     def _flush_buffers(self) -> None:
         """Hook for backend-specific batched flush. Default: no-op.

@@ -222,8 +222,8 @@ class PLEHealthMonitor(TorchProbe):
 
         return hook_fn
 
-    def step(self):
-        super().step()
+    def step(self, global_step: int | None = None):
+        super().step(global_step=global_step)
         self._token_ple_buf = None
         self._proj_ple_buf = None
         self._gate_out_buf.clear()

@@ -200,8 +200,8 @@ class MHCHealthMonitor(TorchProbe):
         self._composite.clear()
         super().remove_hooks()
 
-    def step(self):
-        super().step()
+    def step(self, global_step: int | None = None):
+        super().step(global_step=global_step)
         # Release the running composite between train steps so a [s*b, n, n]
         # buffer never sits idle in VRAM; the root reseeds it next forward, so
         # clearing is correctness-neutral.

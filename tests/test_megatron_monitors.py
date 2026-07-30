@@ -1001,7 +1001,13 @@ class MegatronActivationDumpMonitorTest(unittest.TestCase):
         training_logs.reset()
         import tempfile
 
-        self._tmp = tempfile.TemporaryDirectory()
+        # Scratch under the repo, NOT /tmp: act_dump's dump_dir validation rejects
+        # /tmp (small, shared — filling it takes down the node), and the project rule
+        # is that no test output lands there either. Keeping the fixture on a real
+        # volume also means these tests exercise the same path checks production does.
+        scratch = Path(__file__).resolve().parent / ".scratch"
+        scratch.mkdir(parents=True, exist_ok=True)
+        self._tmp = tempfile.TemporaryDirectory(dir=str(scratch))
         self.dump_dir = Path(self._tmp.name) / "act_dumps"
 
     def tearDown(self):
@@ -1222,6 +1228,55 @@ class MegatronActivationDumpMonitorTest(unittest.TestCase):
         self.assertEqual(meta["layer_idx"], "0")
         self.assertEqual(meta["step"], "0")
         self.assertIn("global_rank", meta)
+
+    # ---------------- dump_dir validation ----------------
+
+    def test_relative_dump_dir_is_resolved_against_cwd(self):
+        """A relative dump_dir is supported (the default) — it lands under the run
+        directory. It is stored resolved so a later os.chdir cannot move the dump."""
+        import os
+
+        rel = os.path.relpath(str(self.dump_dir), os.getcwd())
+        monitor = ActivationDumpMonitor(dump_dir=rel, monitor_interval=1)
+        self.assertTrue(os.path.isabs(monitor.dump_dir))
+        self.assertEqual(monitor.dump_dir, os.path.abspath(str(self.dump_dir)))
+
+    def test_dump_dir_rejects_new_top_level_dir_in_root(self):
+        """Writing to '/' directly is not allowed: a dump_dir whose top-level ancestor
+        does not exist (e.g. '/outputs/...', what './outputs/...' becomes when the job is
+        launched from '/') must fail at construction, not after filling the disk."""
+        with self.assertRaises(ValueError) as ctx:
+            ActivationDumpMonitor(dump_dir="/outputs/act_dumps")
+        self.assertIn("top-level", str(ctx.exception))
+
+    def test_dump_dir_rejects_filesystem_root(self):
+        with self.assertRaises(ValueError) as ctx:
+            ActivationDumpMonitor(dump_dir="/")
+        self.assertIn("filesystem root", str(ctx.exception))
+
+    def test_dump_dir_rejects_small_shared_volumes(self):
+        for bad in ("/tmp/act_dumps", "/dev/shm/act_dumps", "/var/tmp/x"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError) as ctx:
+                ActivationDumpMonitor(dump_dir=bad)
+            self.assertIn("small/shared", str(ctx.exception))
+
+    def test_dump_root_env_pins_allowed_prefix(self):
+        import os
+        from unittest import mock
+
+        root = str(Path(self._tmp.name) / "allowed")
+        os.makedirs(root, exist_ok=True)
+        with mock.patch.dict(os.environ, {"INTERNAL_MEDICINE_DUMP_ROOT": root}):
+            inside = ActivationDumpMonitor(dump_dir=os.path.join(root, "dumps"))
+            self.assertTrue(inside.dump_dir.startswith(root))
+            with self.assertRaises(ValueError) as ctx:
+                ActivationDumpMonitor(dump_dir=str(Path(self._tmp.name) / "elsewhere"))
+            self.assertIn("INTERNAL_MEDICINE_DUMP_ROOT", str(ctx.exception))
+
+    def test_setup_helper_also_validates_dump_dir(self):
+        model = FakeGPTModel(num_layers=1, hidden_size=8, vocab_size=16)
+        with self.assertRaises(ValueError):
+            setup_activation_dump_monitor(model, dump_dir="/outputs/act_dumps")
 
     # ---------------- full-hidden dump (default) ----------------
 

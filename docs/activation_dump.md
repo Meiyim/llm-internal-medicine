@@ -79,13 +79,39 @@ step 才写，磁盘占用天然稀疏。
 `max_dump_steps` 后总占用 ≈ 上式 × `max_dump_steps`。开启 `min_channel_max_ratio`
 后按实际"异常步数"下压。
 
+## dump_dir 路径校验（构造时就报错）
+
+`dump_dir` 在 `__init__` 里经 `resolve_dump_dir()` 解析成**绝对路径**后校验并保存
+（保存绝对路径也顺带免疫运行中途的 `os.chdir()`）。
+
+**相对路径是推荐用法**（默认就是 `./outputs/act_dumps`）：它落在作业启动时所在的运行
+目录下，通常就是仓库 checkout。被拒绝的只是"逃逸到根文件系统"的情况：
+
+| 情况 | 结果 |
+|---|---|
+| `./outputs/act_dumps`（从仓库目录启动） | OK → `<repo>/outputs/act_dumps` |
+| `/root/paddlejob/workspace/.../act_dumps` | OK |
+| `/` | 拒绝：文件系统根 |
+| `/tmp/...`、`/dev/shm/...`、`/var/tmp/...` 等 | 拒绝：小容量共享卷，写满会把整个节点带崩 |
+| `/outputs/act_dumps`（= 从 `/` 启动时的 `./outputs/...`） | 拒绝：会在 `/` 下新建顶级目录，**不允许直接写根目录** |
+
+最后一条的判据是**顶级祖先目录必须已存在**：`/outputs/act_dumps` 需要新建 `/outputs`
+所以拒绝；`/root/paddlejob/...` 因为 `/root` 已存在所以通过。这条正好拦住"从 `/` 启动
+作业 + 相对 dump_dir"这个真实事故路径。
+
+另外可选设 `$INTERNAL_MEDICINE_DUMP_ROOT`，强制 dump 必须落在该前缀之下，适合把大容量
+scratch 卷钉死。
+
+选择在构造时抛异常而不是 warning：dump 路径错了通常要等磁盘写满、跑了几小时之后才会
+被发现。
+
 ## 配置（必须用 dict 形式传 per-monitor kwargs）
 
 ```yaml
 internal_medicine_monitor_interval: 50
 internal_medicine_monitors:
     act_dump:
-        dump_dir: "./outputs/act_dumps"
+        dump_dir: "./outputs/act_dumps"   # 相对=运行目录下；禁止解析到 / 或 /tmp
         which: "output"          # "output"=层输出残差 | "input"=层输入残差
         sample_layers: [0, 6, 11] # global 层索引；null=全部层
         n_sample_tokens: null     # null=全量落盘（默认）；设 K 则随机采 K 个位置
@@ -96,7 +122,7 @@ internal_medicine_monitors:
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `dump_dir` | `"./outputs/act_dumps"` | 落盘根目录 |
+| `dump_dir` | `"./outputs/act_dumps"` | 落盘根目录；构造时解析为绝对路径并校验（禁止 `/`、`/tmp` 等，禁止在 `/` 下新建顶级目录） |
 | `which` | `"output"` | `"output"` 取层输出残差，`"input"` 取层输入残差 |
 | `sample_layers` | `None` | global 层索引列表；`None`=全部层 |
 | `n_sample_tokens` | `None` | `None`=全量落盘；设 K 则随机采 K 个 token 位置 |

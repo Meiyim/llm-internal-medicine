@@ -32,6 +32,14 @@ A ``min_channel_max_ratio`` gate targets massive-activation "ill-conditioned" st
 each captured tensor's per-channel ``max/median`` ratio is computed on the hot path
 (0-dim GPU tensor, no sync) and, at flush, dumps below the threshold are discarded
 before hitting disk. The ratio is recorded in the safetensors metadata regardless.
+
+``dump_dir`` is resolved to an absolute path and validated at construction
+(``resolve_dump_dir``). A relative path (the default) is fine — it lands under the run
+directory the job was launched from. What is rejected is a path that escapes into the
+root filesystem: the root itself, small/shared system roots (``/tmp``, ``/dev/shm``,
+...), and anything that would create a NEW top-level directory in ``/`` (e.g. a job
+launched from ``/`` turning ``./outputs/act_dumps`` into ``/outputs/act_dumps``).
+``$INTERNAL_MEDICINE_DUMP_ROOT`` can additionally pin an allowed prefix.
 """
 
 import logging
@@ -64,6 +72,73 @@ _PACKED_SEQ_SCALAR_FIELDS = (
 # Batch tensors pulled from the model-forward kwargs. ``attention_mask`` is excluded:
 # it is often None (fused/causal paths) or a huge [b,1,s,s] bool tensor.
 _BATCH_TENSOR_KWARGS = ("input_ids", "labels", "position_ids", "loss_mask")
+
+# Filesystem roots a dump must never land in. These are small, shared, often tmpfs;
+# filling one takes down the node and clobbers other jobs on it. A full-hidden dump is
+# easily tens of GB, so this is a live hazard, not a theoretical one.
+_FORBIDDEN_DUMP_ROOTS = ("/tmp", "/var/tmp", "/dev/shm", "/run", "/usr", "/etc", "/boot")
+
+# Deployments can pin an allowed prefix (e.g. a large scratch volume) so a mistyped or
+# CWD-relative dump_dir fails at setup instead of silently filling the wrong disk.
+_DUMP_ROOT_ENV = "INTERNAL_MEDICINE_DUMP_ROOT"
+
+
+def resolve_dump_dir(dump_dir: str) -> str:
+    """Return ``dump_dir`` as an absolute, validated path, or raise ``ValueError``.
+
+    A RELATIVE ``dump_dir`` (the default, ``./outputs/act_dumps``) is intended and
+    supported: it lands under whatever run directory the job was launched from, which is
+    normally the repo checkout. What must never happen is that resolution escapes into
+    the root filesystem — launched from ``/``, ``./outputs/act_dumps`` becomes
+    ``/outputs/act_dumps``, and writing tens of GB there means creating a new top-level
+    directory in ``/``, which this deployment does not permit and which fills a small
+    shared volume.
+
+    Validation runs on the RESOLVED path and rejects
+
+    - the filesystem root itself,
+    - anything under a small/shared system root (``/tmp``, ``/dev/shm``, ...), and
+    - any path whose top-level ancestor does not already exist, i.e. writing it would
+      create a new entry directly in ``/`` (this is what catches ``/outputs/...``).
+
+    If ``$INTERNAL_MEDICINE_DUMP_ROOT`` is set, the resolved path must also live under
+    it. Raising at construction is deliberate: a bad dump path is otherwise only
+    discovered once the disk fills, hours into a run.
+    """
+    expanded = os.path.expanduser(os.path.expandvars(str(dump_dir)))
+    resolved = os.path.abspath(expanded)
+    hint = f"(given: {dump_dir!r}, cwd: {os.getcwd()!r})"
+    if resolved == os.sep:
+        raise ValueError(
+            f"act_dump dump_dir resolves to the filesystem root ({resolved!r}); "
+            f"point it at a large writable volume {hint}."
+        )
+    for bad in _FORBIDDEN_DUMP_ROOTS:
+        if resolved == bad or resolved.startswith(bad + os.sep):
+            raise ValueError(
+                f"act_dump dump_dir resolves under {bad!r} ({resolved!r}), which is small/shared; "
+                f"filling it takes down the node. Point it at a large writable volume {hint}."
+            )
+    # Top-level ancestor must already exist. ``/outputs/act_dumps`` would create
+    # ``/outputs`` — writing to root directly, which is not allowed here. A relative
+    # path under a real run directory (``/root/paddlejob/...``) passes because ``/root``
+    # exists. This is the check that catches a job launched from ``/``.
+    top_level = os.sep + resolved.lstrip(os.sep).split(os.sep)[0]
+    if not os.path.isdir(top_level):
+        raise ValueError(
+            f"act_dump dump_dir {resolved!r} would create a new top-level directory {top_level!r} in '/'; "
+            f"writing to the root filesystem is not allowed. If dump_dir is relative, launch the job from "
+            f"the run directory (or pass an absolute path under it) {hint}."
+        )
+    required_root = os.environ.get(_DUMP_ROOT_ENV)
+    if required_root:
+        root = os.path.abspath(os.path.expanduser(os.path.expandvars(required_root)))
+        if resolved != root and not resolved.startswith(root.rstrip(os.sep) + os.sep):
+            raise ValueError(
+                f"act_dump dump_dir {resolved!r} is outside ${_DUMP_ROOT_ENV} ({root!r}). "
+                f"Either move the dump under that root or unset the variable {hint}."
+            )
+    return resolved
 
 
 class ActivationDumpMonitor(TorchProbe):
@@ -106,7 +181,9 @@ class ActivationDumpMonitor(TorchProbe):
             raise ValueError(f"max_dump_steps must be >= 1 or None, got {max_dump_steps!r}")
         if min_channel_max_ratio is not None and min_channel_max_ratio < 0:
             raise ValueError(f"min_channel_max_ratio must be >= 0 or None, got {min_channel_max_ratio!r}")
-        self.dump_dir = dump_dir
+        # Store the RESOLVED absolute path: validates the target up-front and makes the
+        # dump location immune to a later os.chdir() mid-run.
+        self.dump_dir = resolve_dump_dir(dump_dir)
         self.which = which
         self.sample_layers = set(sample_layers) if sample_layers else None
         self.n_sample_tokens = n_sample_tokens

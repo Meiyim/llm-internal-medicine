@@ -17,7 +17,12 @@ Hooked at two families of sites:
 
 - **`lm_head`** — the output projection on the last PP stage. Hidden and logits
   are already in the forward pass; nothing recomputed. Works with tied
-  input/output embeddings (`module.weight` is the shared tensor).
+  input/output embeddings: under `share_embeddings_and_output_weights` Megatron
+  builds `output_layer` with `skip_weight_param_allocation=True`, so
+  `module.weight is None` and the tensor is only reachable via
+  `shared_embedding_or_output_weight()`. The monitor resolves the weight through
+  that accessor at attach time and closes over it, since reading `module.weight`
+  inside the hook would yield `None` and silently drop the site.
 - **`router_{L}`** — every MoE router. The router forward returns
   `(probs, routing_map)` (not raw gating logits), so the monitor recomputes
   `logits = F.linear(hidden.float(), weight.float())` locally in the hook.

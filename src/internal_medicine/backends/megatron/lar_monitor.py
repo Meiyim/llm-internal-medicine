@@ -122,17 +122,26 @@ class LARMonitor(TorchProbe):
             hook = model.register_forward_pre_hook(self._make_label_capture_hook(), with_kwargs=True)
             self.hooks.append(hook)
 
-        # LM head: last PP stage only (owns ``output_layer``).
+        # LM head: last PP stage only (owns ``output_layer``). Under
+        # ``share_embeddings_and_output_weights`` + PP=1, Megatron builds
+        # ``output_layer`` with ``skip_weight_param_allocation=True`` so
+        # ``module.weight is None`` and the actual tensor lives on the shared
+        # embedding — resolve it via ``shared_embedding_or_output_weight()``
+        # (same accessor MassiveActivationMonitor uses for logit-lens) and close
+        # over it at attach time, since ``module.weight`` inside the hook would
+        # still be ``None``.
         if self.hook_lm_head:
             output_layer = getattr(base, "output_layer", None)
-            weight = getattr(output_layer, "weight", None) if output_layer is not None else None
+            weight = self._resolve_lm_head_weight(base, output_layer)
             if output_layer is not None and weight is not None:
                 self._register_site("lm_head", H=int(weight.shape[1]))
                 hook = output_layer.register_forward_hook(
-                    self.timed_hook("lar_lm_head", self._make_lm_head_hook()),
+                    self.timed_hook("lar_lm_head", self._make_lm_head_hook(weight)),
                     with_kwargs=False,
                 )
                 self.hooks.append(hook)
+            elif self.verbose and output_layer is not None:
+                logger.warning("[LARMonitor] output_layer has no resolvable weight; skipping lm_head site.")
 
         # Routers: every MoE layer.
         if self.hook_moe_router:
@@ -153,6 +162,24 @@ class LARMonitor(TorchProbe):
         if key in self._sites:
             return
         self._sites[key] = {"H": H, "ss": {}, "n": {}, "w_done": False}
+
+    def _resolve_lm_head_weight(self, base: nn.Module, output_layer):
+        """Return the tied ``[V, H]`` LM-head weight, or ``None``.
+
+        Tries ``shared_embedding_or_output_weight()`` first — this is the safe
+        accessor when ``share_embeddings_and_output_weights=True`` (Megatron
+        sets ``output_layer.weight = None`` and passes the shared tensor at
+        forward time). Falls back to ``output_layer.weight`` for untied heads.
+        """
+        getter = getattr(base, "shared_embedding_or_output_weight", None)
+        if callable(getter):
+            try:
+                w = getter()
+                if w is not None:
+                    return w
+            except Exception:
+                pass
+        return getattr(output_layer, "weight", None) if output_layer is not None else None
 
     def _find_routers(self, model: nn.Module, layer_offset: int = 0) -> list[tuple[int, nn.Module]]:
         """Discover MoE routers via the same layer walk MoEMonitor uses."""
@@ -249,7 +276,10 @@ class LARMonitor(TorchProbe):
             s["n"]["W"] = torch.as_tensor(float(Wf.numel()), device=Wf.device)
             s["w_done"] = True
 
-    def _make_lm_head_hook(self):
+    def _make_lm_head_hook(self, weight: torch.Tensor):
+        # Close over the shared tensor resolved at attach time: under tied
+        # embeddings ``module.weight is None`` and the actual weight lives on
+        # the input embedding. Same nn.Parameter identity survives across steps.
         def hook_fn(module, inputs, output):
             if not self._should_monitor():
                 return
@@ -261,9 +291,6 @@ class LARMonitor(TorchProbe):
                 z = output[0] if isinstance(output, (tuple, list)) else output
                 if not isinstance(z, torch.Tensor):
                     return
-                w = getattr(module, "weight", None)
-                if w is None:
-                    return
                 with torch.no_grad():
                     x_flat = x.reshape(-1, x.shape[-1])
                     z_flat = z.reshape(-1, z.shape[-1])
@@ -271,7 +298,7 @@ class LARMonitor(TorchProbe):
                     if mask is not None and mask.shape[0] == x_flat.shape[0]:
                         x_flat = x_flat[mask]
                         z_flat = z_flat[mask]
-                    self._accumulate("lm_head", x_flat, w, z_flat)
+                    self._accumulate("lm_head", x_flat, weight, z_flat)
             except Exception as e:
                 if self.verbose:
                     logger.error(f"[LARMonitor] lm_head hook error: {e}")

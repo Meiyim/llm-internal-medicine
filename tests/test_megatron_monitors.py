@@ -93,6 +93,44 @@ class FakeGPTModel(nn.Module):
         return self.decoder(x)
 
 
+class FakeTiedOutputLayer(nn.Module):
+    """ColumnParallelLinear built with ``skip_weight_param_allocation=True``.
+
+    Megatron does this when ``share_embeddings_and_output_weights=True``: the module
+    owns no weight (``self.weight is None``) and the caller passes the shared tensor
+    in at forward time. The forward hook therefore sees ``module.weight is None``.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.weight = None
+
+    def forward(self, x, weight=None):
+        return F.linear(x, weight)
+
+
+class FakeTiedGPTModel(nn.Module):
+    """GPTModel with tied input/output embeddings at PP=1.
+
+    ``output_layer`` holds no weight; the tied tensor is reachable only through
+    ``shared_embedding_or_output_weight()`` (which real Megatron resolves to
+    ``embedding.word_embeddings.weight`` when ``pre_process`` is True).
+    """
+
+    def __init__(self, num_layers, hidden_size, vocab_size):
+        super().__init__()
+        self.decoder = FakeDecoder(num_layers, hidden_size)
+        self.shared_weight = nn.Parameter(torch.randn(vocab_size, hidden_size) * 0.3)
+        self.output_layer = FakeTiedOutputLayer()
+
+    def shared_embedding_or_output_weight(self):
+        return self.shared_weight
+
+    def forward(self, x, labels=None):
+        hidden = self.decoder(x)
+        return self.output_layer(hidden, weight=self.shared_weight)
+
+
 class FakeHeadlessGPTModel(nn.Module):
     """Non-head PP stage: decoder present but no output_layer / tied weight accessor."""
 
@@ -1324,6 +1362,34 @@ class MegatronLARMonitorTest(unittest.TestCase):
         got_rms_w = training_logs.get_latest(prefix="lar")["lar/lm_head/rms_w"]
         want_rms_w = float(shared.detach().float().pow(2).mean().sqrt())
         self.assertAlmostEqual(got_rms_w, want_rms_w, places=5)
+
+    def test_lar_lm_head_resolves_via_shared_accessor_when_weight_none(self):
+        """Tied embeddings + PP=1: ``output_layer.weight`` is None, so the monitor must
+        resolve the weight through ``shared_embedding_or_output_weight()`` at attach
+        time and close over it — reading ``module.weight`` in the hook yields None and
+        would silently drop the site."""
+        S, B, H, V = 4, 1, 6, 8
+        model = FakeTiedGPTModel(num_layers=1, hidden_size=H, vocab_size=V)
+        self.assertIsNone(model.output_layer.weight)  # guard: fixture models the real case
+
+        monitor = LARMonitor(hook_moe_router=False, monitor_interval=1, apply_loss_mask=False)
+        monitor.register_hooks(model)
+        self.assertIn("lm_head", monitor._sites)
+        self.assertEqual(monitor._sites["lm_head"]["H"], H)
+
+        # Drive the real forward so the hook fires with module.weight still None.
+        hidden = torch.randn(S, B, H)
+        logits = model(hidden)
+        monitor.step()
+
+        got = training_logs.get_latest(prefix="lar")
+        # ``hidden`` is the decoder input; the head sees the decoder output.
+        head_input = model.decoder(hidden)
+        want_lar, want_rms_w, want_rms_x, want_rms_z = _lar_analytical(head_input, model.shared_weight, logits=logits)
+        self.assertAlmostEqual(got["lar/lm_head/rms_w"], want_rms_w, places=5)
+        self.assertAlmostEqual(got["lar/lm_head/rms_x"], want_rms_x, places=4)
+        self.assertAlmostEqual(got["lar/lm_head/rms_z"], want_rms_z, places=4)
+        self.assertAlmostEqual(got["lar/lm_head/lar"], want_lar, places=4)
 
     def test_lar_lm_head_masking_matches_manual_index(self):
         S, B, H, V = 5, 1, 4, 6

@@ -40,10 +40,12 @@ class LARMonitor(TorchProbe):
     """Log-Alignment Ratio for lm_head + MoE routers.
 
     Emits, per site (``lm_head`` and ``router_{L}``) and per monitored step:
-    ``lar``, ``k`` (effective dim = ``H ** (2*(1-lar))``), ``rms_w``, ``rms_x``,
-    ``rms_z``, ``valid_frac``. Two globals: ``global_lm_head_lar`` (trivial —
-    equals the single lm_head site) and ``global_router_lar`` (mean over
-    routers), plus matching ``k`` globals.
+    ``lar``, ``k`` (effective dim = ``H ** (2*(1-lar))``), ``valid_frac``. The
+    underlying ``rms_w`` / ``rms_x`` / ``rms_z`` are flush-time intermediates and
+    deliberately not logged — only their combination (``lar``) is meaningful, and
+    raw activation scale is already covered by ``massive_act``. Two globals:
+    ``global_lm_head_lar`` (trivial — equals the single lm_head site) and
+    ``global_router_lar`` (mean over routers), plus matching ``k`` globals.
     """
 
     METRIC_PREFIX = "lar"
@@ -371,6 +373,10 @@ class LARMonitor(TorchProbe):
             ssX, nX = self._reduce_pair(s["ss"]["X"], s["n"]["X"], self._dp_group)
             ssZ, nZ = self._reduce_pair(s["ss"]["Z"], s["n"]["Z"], self._dp_group)
         eps = 1e-12
+        # rms_* are flush-time locals only: they are the inputs to ``lar`` and are not
+        # logged. Their absolute scale is uninformative on its own (it tracks whatever
+        # the residual/logit scale happens to be) and it is already covered by
+        # ``massive_act``'s activation_rms / spectral-norm metrics.
         rms_w = (ssW / nW.clamp_min(1)).clamp_min(eps).sqrt()
         rms_x = (ssX / nX.clamp_min(1)).clamp_min(eps).sqrt()
         rms_z = (ssZ / nZ.clamp_min(1)).clamp_min(eps).sqrt()
@@ -385,9 +391,6 @@ class LARMonitor(TorchProbe):
         return {
             f"{key}/lar": lar,
             f"{key}/k": k,
-            f"{key}/rms_w": rms_w,
-            f"{key}/rms_x": rms_x,
-            f"{key}/rms_z": rms_z,
             f"{key}/valid_frac": valid_frac,
         }
 

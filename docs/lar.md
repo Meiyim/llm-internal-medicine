@@ -60,7 +60,12 @@ With TP=1/DP=1 no reduction fires. Cost is negligible either way.
 ## Metrics emitted per monitored step
 
 Per site (`lm_head`, `router_0`, `router_1`, ...):
-`lar/{site}/{lar, k, rms_w, rms_x, rms_z, valid_frac}`.
+`lar/{site}/{lar, k, valid_frac}`.
+
+The three RMS norms (`rms_w`, `rms_x`, `rms_z`) are computed at flush time but
+**not logged** — only their combination `lar` carries the diagnostic signal, and
+raw activation/weight scale is already covered by `massive_act`
+(`activation_rms`, `spectral_norm_max/min`).
 
 Globals:
 - `lar/global_lm_head_lar`, `lar/global_lm_head_k` (equals the single lm_head site)

@@ -1274,16 +1274,26 @@ class MegatronLARMonitorTest(unittest.TestCase):
         model.output_layer(hidden)
         monitor.step()
         got = training_logs.get_latest(prefix="lar")
-        want_lar, want_rms_w, want_rms_x, want_rms_z = _lar_analytical(
-            hidden, model.output_layer.weight, logits=model.output_layer(hidden)
-        )
+        want_lar, *_ = _lar_analytical(hidden, model.output_layer.weight, logits=model.output_layer(hidden))
         self.assertAlmostEqual(got["lar/lm_head/lar"], want_lar, places=4)
-        self.assertAlmostEqual(got["lar/lm_head/rms_w"], want_rms_w, places=4)
-        self.assertAlmostEqual(got["lar/lm_head/rms_x"], want_rms_x, places=4)
-        self.assertAlmostEqual(got["lar/lm_head/rms_z"], want_rms_z, places=4)
         self.assertAlmostEqual(got["lar/global_lm_head_lar"], want_lar, places=4)
         want_k = H ** (2 * (1 - want_lar))
         self.assertAlmostEqual(got["lar/lm_head/k"], want_k, places=2)
+
+    def test_lar_does_not_log_rms_components(self):
+        """rms_w / rms_x / rms_z are flush-time intermediates, not metrics. Only their
+        combination (lar) is meaningful, and raw activation scale belongs to
+        massive_act — keep them out of the logged schema."""
+        S, B, H, V = 6, 1, 8, 12
+        model = FakeGPTModel(num_layers=1, hidden_size=H, vocab_size=V)
+        monitor = LARMonitor(hook_moe_router=False, monitor_interval=1, apply_loss_mask=False)
+        monitor.register_hooks(model)
+        model.output_layer(torch.randn(S, B, H))
+        monitor.step()
+        got = training_logs.get_latest(prefix="lar")
+        self.assertIn("lar/lm_head/lar", got)  # guard: the site did report
+        for suffix in ("rms_w", "rms_x", "rms_z"):
+            self.assertNotIn(f"lar/lm_head/{suffix}", got)
 
     def test_lar_svd_cross_check(self):
         S, B, H, V = 8, 1, 6, 10
@@ -1357,11 +1367,13 @@ class MegatronLARMonitorTest(unittest.TestCase):
         model.output_layer.weight = shared
         monitor = LARMonitor(hook_moe_router=False, monitor_interval=1, apply_loss_mask=False)
         monitor.register_hooks(model)
-        model.output_layer(torch.randn(S, B, H))
+        hidden = torch.randn(S, B, H)
+        logits = model.output_layer(hidden)
         monitor.step()
-        got_rms_w = training_logs.get_latest(prefix="lar")["lar/lm_head/rms_w"]
-        want_rms_w = float(shared.detach().float().pow(2).mean().sqrt())
-        self.assertAlmostEqual(got_rms_w, want_rms_w, places=5)
+        # ``lar`` depends on ||W||_rms, so matching the analytical value computed from
+        # ``shared`` pins that the shared tensor (not a stale one) fed the weight stats.
+        want_lar, *_ = _lar_analytical(hidden, shared, logits=logits)
+        self.assertAlmostEqual(training_logs.get_latest(prefix="lar")["lar/lm_head/lar"], want_lar, places=4)
 
     def test_lar_lm_head_resolves_via_shared_accessor_when_weight_none(self):
         """Tied embeddings + PP=1: ``output_layer.weight`` is None, so the monitor must
@@ -1385,11 +1397,10 @@ class MegatronLARMonitorTest(unittest.TestCase):
         got = training_logs.get_latest(prefix="lar")
         # ``hidden`` is the decoder input; the head sees the decoder output.
         head_input = model.decoder(hidden)
-        want_lar, want_rms_w, want_rms_x, want_rms_z = _lar_analytical(head_input, model.shared_weight, logits=logits)
-        self.assertAlmostEqual(got["lar/lm_head/rms_w"], want_rms_w, places=5)
-        self.assertAlmostEqual(got["lar/lm_head/rms_x"], want_rms_x, places=4)
-        self.assertAlmostEqual(got["lar/lm_head/rms_z"], want_rms_z, places=4)
+        want_lar, *_ = _lar_analytical(head_input, model.shared_weight, logits=logits)
         self.assertAlmostEqual(got["lar/lm_head/lar"], want_lar, places=4)
+        want_k = H ** (2 * (1 - want_lar))
+        self.assertAlmostEqual(got["lar/lm_head/k"], want_k, places=2)
 
     def test_lar_lm_head_masking_matches_manual_index(self):
         S, B, H, V = 5, 1, 4, 6

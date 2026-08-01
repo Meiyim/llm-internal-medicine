@@ -184,6 +184,51 @@ class FakeHeadlessGPTModel(nn.Module):
         return self.decoder(x)
 
 
+class FakeLatentProj(nn.Module):
+    """Stand-in for mcore's ``fc2_latent_proj`` (TELinear, latent -> hidden).
+
+    ``TELinear.forward(self, x)`` takes a single positional tensor and returns
+    ``(out, bias)``, which is how ``MoELayer.postprocess`` calls it.
+    """
+
+    def __init__(self, latent_size, hidden_size):
+        super().__init__()
+        self.linear = nn.Linear(latent_size, hidden_size, bias=False)
+
+    def forward(self, x):
+        return self.linear(x), None
+
+
+class FakeLatentMoELayer(nn.Module):
+    """Latent MoE layer reproducing mcore's combine -> fc2_latent_proj ordering.
+
+    ``forward`` mimics ``MoELayer``: experts produce per-expert outputs in LATENT dim,
+    those are combined k-way with router weights, and the combined latent tensor is fed
+    to ``fc2_latent_proj``. The monitor's pre-hook on ``fc2_latent_proj`` must observe
+    exactly that combined tensor — ``self.combined`` is stashed so a test can assert it.
+    """
+
+    def __init__(self, hidden_size, latent_size, num_experts, topk=2):
+        super().__init__()
+        self.router = _FakeRouter(latent_size, num_experts)
+        self.fc1_latent_proj = nn.Linear(hidden_size, latent_size, bias=False)
+        self.fc2_latent_proj = FakeLatentProj(latent_size, hidden_size)
+        self.topk = topk
+        self.num_experts = num_experts
+        self.combined = None
+
+    def forward(self, hidden_states, expert_outputs=None, probs=None):
+        latent = self.fc1_latent_proj(hidden_states)
+        if expert_outputs is None:
+            # topk expert outputs in latent dim; combine with uniform weights.
+            expert_outputs = [latent for _ in range(self.topk)]
+            probs = [1.0 / self.topk] * self.topk
+        combined = sum(p * e for p, e in zip(expert_outputs, probs, strict=True))
+        self.combined = combined
+        out, _ = self.fc2_latent_proj(combined)
+        return out
+
+
 class MegatronMoEMonitorTest(unittest.TestCase):
     def setUp(self):
         training_logs.reset()
@@ -419,6 +464,140 @@ class MegatronMoEMonitorTest(unittest.TestCase):
         finally:
             monitor.remove_hooks()
             fmg.get_updated_expert_bias = original
+
+    # ---------------- latent-combine magnitude ----------------
+
+    def test_latent_combine_metrics_measure_post_combine_pre_up_proj_tensor(self):
+        """The pre-hook on fc2_latent_proj must see the k-way-combined LATENT tensor —
+        after expert combine, before the up-projection back to hidden_size."""
+        S, B, H, L, E = 4, 2, 8, 5, 4
+        layer = FakeLatentMoELayer(hidden_size=H, latent_size=L, num_experts=E)
+        monitor = MoESpecialistMonitor(log_per_layer=True, log_global=True)
+        monitor._find_moe_layers = lambda _model: [(0, layer)]
+        monitor._prepare_layers(object())
+        monitor.allocate_buffers(torch.device("cpu"))
+        monitor._attach_hooks([(0, layer)])
+        try:
+            layer(torch.randn(S, B, H))
+            monitor.step()
+
+            latest = training_logs.get_latest(prefix="moe_health")
+            combined = layer.combined.detach().reshape(-1, L).float()
+            want_rms = float(combined.square().mean().sqrt())
+            per_channel_max = combined.abs().amax(dim=0)
+            want_ratio = float(per_channel_max.max() / per_channel_max.mean())
+            self.assertAlmostEqual(latest["moe_health/layer_0/latent_combine_rms"], want_rms, places=5)
+            self.assertAlmostEqual(
+                latest["moe_health/layer_0/latent_combine_channel_max_mean_ratio"], want_ratio, places=5
+            )
+            self.assertIn("moe_health/global_latent_combine_rms", latest)
+            self.assertIn("moe_health/global_latent_combine_channel_max_mean_ratio", latest)
+        finally:
+            monitor.remove_hooks()
+
+    def test_latent_combine_measures_latent_dim_not_hidden_dim(self):
+        """Guard against hooking the wrong side: the measured tensor must have
+        latent_size channels, so a per-channel stat over hidden_size would differ."""
+        S, B, H, L, E = 3, 1, 8, 4, 4
+        layer = FakeLatentMoELayer(hidden_size=H, latent_size=L, num_experts=E)
+        monitor = MoESpecialistMonitor(log_per_layer=True, log_global=True)
+        monitor._find_moe_layers = lambda _model: [(0, layer)]
+        monitor._prepare_layers(object())
+        monitor.allocate_buffers(torch.device("cpu"))
+        monitor._attach_hooks([(0, layer)])
+        try:
+            hidden = torch.randn(S, B, H)
+            out = layer(hidden)
+            monitor.step()
+            self.assertEqual(layer.combined.shape[-1], L)
+            self.assertEqual(out.shape[-1], H)
+            latest = training_logs.get_latest(prefix="moe_health")
+            got = latest["moe_health/layer_0/latent_combine_rms"]
+            hidden_side_rms = float(out.detach().reshape(-1, H).float().square().mean().sqrt())
+            self.assertNotAlmostEqual(got, hidden_side_rms, places=4)
+        finally:
+            monitor.remove_hooks()
+
+    def test_latent_combine_ratio_detects_dominant_channel(self):
+        """channel_max/mean ratio ~1 for a flat combine, and large when one latent
+        channel dominates — the massive-activation signature we want to catch."""
+        S, B, H, L, E = 4, 1, 8, 4, 4
+        layer = FakeLatentMoELayer(hidden_size=H, latent_size=L, num_experts=E)
+        monitor = MoESpecialistMonitor(log_per_layer=True, log_global=True)
+        monitor._find_moe_layers = lambda _model: [(0, layer)]
+        monitor._prepare_layers(object())
+        monitor.allocate_buffers(torch.device("cpu"))
+        monitor._attach_hooks([(0, layer)])
+        try:
+            flat = torch.ones(S, B, L)
+            layer(torch.randn(S, B, H), expert_outputs=[flat], probs=[1.0])
+            monitor.step()
+            ratio_flat = training_logs.get_latest(prefix="moe_health")[
+                "moe_health/layer_0/latent_combine_channel_max_mean_ratio"
+            ]
+            self.assertAlmostEqual(ratio_flat, 1.0, places=5)
+
+            training_logs.reset()
+            spiked = torch.ones(S, B, L)
+            spiked[..., 0] = 100.0
+            layer(torch.randn(S, B, H), expert_outputs=[spiked], probs=[1.0])
+            monitor.step()
+            ratio_spiked = training_logs.get_latest(prefix="moe_health")[
+                "moe_health/layer_0/latent_combine_channel_max_mean_ratio"
+            ]
+            # per-channel maxima = [100, 1, 1, 1] -> mean 25.75 -> ratio ~3.88
+            self.assertAlmostEqual(ratio_spiked, 100.0 / (103.0 / 4), places=4)
+            self.assertGreater(ratio_spiked, ratio_flat)
+        finally:
+            monitor.remove_hooks()
+
+    def test_latent_combine_metrics_absent_on_non_latent_moe(self):
+        """Plain (non-latent) MoE has no fc2_latent_proj: the metrics must simply not
+        be declared, not crash and not emit zeros."""
+        monitor = MoESpecialistMonitor(log_per_layer=True, log_global=True)
+        plain = _FakeMoELayer(hidden_size=8, num_experts=4)
+        self.assertIsNone(monitor._latent_proj_of(plain))
+        monitor._find_moe_layers = lambda _model: [(0, plain)]
+        monitor._prepare_layers(object())
+        monitor.allocate_buffers(torch.device("cpu"))
+        monitor._attach_hooks([(0, plain)])
+        try:
+            plain(torch.randn(4, 1, 8))
+            monitor.step()
+            latest = training_logs.get_latest(prefix="moe_health")
+            for name in moe_monitor_module._LATENT_COMBINE_METRICS:
+                self.assertNotIn(f"moe_health/layer_0/{name}", latest)
+                self.assertNotIn(f"moe_health/global_{name}", latest)
+        finally:
+            monitor.remove_hooks()
+
+    def test_latent_combine_ratio_is_max_aggregated_across_ranks(self):
+        """The ratio is a max-over-tokens of a per-channel peak, so cross-rank
+        composition must use max, not mean (it lacks a _max suffix, so it has to be
+        listed in MAX_AGGREGATED / MAX_AGGREGATED_SUFFIXES explicitly)."""
+        name = "latent_combine_channel_max_mean_ratio"
+        self.assertIn(name, MoESpecialistMonitor.MAX_AGGREGATED)
+        self.assertTrue(training_logs._is_max_metric(f"moe_health/layer_0/{name}"))
+        self.assertTrue(training_logs._is_max_metric(f"moe_health/global_{name}"))
+        # The RMS is a scale, not an extremum -> mean-composed.
+        self.assertFalse(training_logs._is_max_metric("moe_health/layer_0/latent_combine_rms"))
+
+    def test_latent_combine_hook_respects_monitor_interval(self):
+        S, B, H, L, E = 4, 1, 8, 4, 4
+        layer = FakeLatentMoELayer(hidden_size=H, latent_size=L, num_experts=E)
+        monitor = MoESpecialistMonitor(log_per_layer=True, log_global=True, monitor_interval=2)
+        monitor._find_moe_layers = lambda _model: [(0, layer)]
+        monitor._prepare_layers(object())
+        monitor.allocate_buffers(torch.device("cpu"))
+        monitor._attach_hooks([(0, layer)])
+        try:
+            monitor.step_count = 1  # 1 % 2 != 0 -> unmonitored step
+            layer(torch.randn(S, B, H))
+            monitor.step()
+            latest = training_logs.get_latest(prefix="moe_health")
+            self.assertNotIn("moe_health/layer_0/latent_combine_rms", latest)
+        finally:
+            monitor.remove_hooks()
 
 
 class MegatronPLEMonitorTest(unittest.TestCase):

@@ -190,6 +190,41 @@ def compute_shared_expert_norm(shared_expert_weights: list[torch.Tensor]) -> tor
     return all_params.float().norm()
 
 
+def compute_latent_combine_stats(hidden_states: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Magnitude stats for the post-combine, pre-``fc2_latent_proj`` tensor.
+
+    This is the k-way-combined expert output still in LATENT dim, i.e. the tensor
+    ``MoELayer.postprocess`` feeds into ``fc2_latent_proj``. It is the point where
+    ``topk`` expert contributions have just been summed with their router weights, so
+    it is where combine-side magnitude blow-up shows up first — before the latent
+    up-projection smears it back across ``hidden_size``.
+
+    Args:
+        hidden_states: post-combine latent tensor, ``[..., latent_size]``.
+
+    Returns:
+        - ``latent_combine_rms``: RMS over all elements, the overall scale of the
+          combined output.
+        - ``latent_combine_channel_max_mean_ratio``: ``max_c / mean_c`` over the
+          per-channel maximum absolute activation. 1.0 means every latent channel
+          peaks equally; a large value means a few channels dominate (the
+          massive-activation signature). Uses the MEAN as denominator (not the median
+          that ``massive_act/channel_max_ratio`` uses) so it reacts to a broad shift
+          in the channel-peak distribution, not just to the middle of it.
+
+    Both are 0-dim GPU tensors — no host sync (perf-rules Rule 1).
+    """
+    h = hidden_states.reshape(-1, hidden_states.shape[-1]).float()
+    if h.shape[0] == 0:
+        zero = torch.zeros((), device=hidden_states.device)
+        return {"latent_combine_rms": zero, "latent_combine_channel_max_mean_ratio": zero}
+    per_channel_max = h.abs().amax(dim=0)
+    return {
+        "latent_combine_rms": h.square().mean().sqrt(),
+        "latent_combine_channel_max_mean_ratio": per_channel_max.max() / per_channel_max.mean().clamp(min=1e-8),
+    }
+
+
 def compute_shared_routed_ratio(
     shared_norm: torch.Tensor,
     routed_norm_mean: torch.Tensor,

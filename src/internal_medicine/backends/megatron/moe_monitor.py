@@ -16,6 +16,7 @@ from .base import TorchProbe
 from .moe_metrics import (
     compute_bias_affinity_jaccard,
     compute_expert_norms,
+    compute_latent_combine_stats,
     compute_load_balance_ratios,
     compute_router_entropy,
     compute_shared_expert_norm,
@@ -67,10 +68,19 @@ _EXPERT_METRICS = (
     "shared_routed_ratio",
 )
 
+# Magnitude of the k-way-combined expert output while still in LATENT dim — the tensor
+# ``MoELayer.postprocess`` hands to ``fc2_latent_proj``. Only declared on latent-MoE
+# models (``config.moe_latent_size`` set); a no-op elsewhere. Captured by wrapping
+# ``fc2_latent_proj``'s forward pre-hook, which sees exactly that tensor.
+_LATENT_COMBINE_METRICS = (
+    "latent_combine_rms",
+    "latent_combine_channel_max_mean_ratio",
+)
+
 
 class MoESpecialistMonitor(TorchProbe):
     METRIC_PREFIX = "moe_health"
-    MAX_AGGREGATED = {"score_sum_max", "expert_norm_max"}
+    MAX_AGGREGATED = {"score_sum_max", "expert_norm_max", "latent_combine_channel_max_mean_ratio"}
     MIN_AGGREGATED = {"score_sum_min", "expert_norm_min"}
 
     def __init__(
@@ -128,6 +138,12 @@ class MoESpecialistMonitor(TorchProbe):
         for layer_idx, moe_layer in moe_layers:
             for name in (*_ROUTER_METRICS, *_EXPERT_METRICS):
                 self.declare_layer_metric(layer_idx, name)
+            # Latent-combine magnitude: only exists on latent-MoE models, where
+            # MoELayer builds fc2_latent_proj. Declare here so the schema is locked
+            # before allocate_buffers (perf-rules Rule 3: no lazy declare).
+            if self._latent_proj_of(moe_layer) is not None:
+                for name in _LATENT_COMBINE_METRICS:
+                    self.declare_layer_metric(layer_idx, name)
             # Load-balance ratios need globally-reduced per-expert counts. Prefer
             # router.global_tokens_per_expert (global_aux_loss path); fall back to
             # the expert-bias path when only that is available. Declare the metrics
@@ -156,8 +172,30 @@ class MoESpecialistMonitor(TorchProbe):
                     self.timed_hook("router", self._make_router_hook(layer_idx, moe_layer))
                 )
                 self.hooks.append(hook)
+            # fc2_latent_proj's INPUT is the k-way-combined expert output in latent
+            # dim, so a forward PRE-hook there reads exactly the tensor we want with
+            # no extra copy and no dependence on MoELayer.postprocess internals.
+            latent_proj = self._latent_proj_of(moe_layer)
+            if latent_proj is not None:
+                hook = latent_proj.register_forward_pre_hook(
+                    self.timed_hook("latent_combine", self._make_latent_combine_hook(layer_idx)),
+                    with_kwargs=True,
+                )
+                self.hooks.append(hook)
 
         logger.info(f"[MoEMonitor] Registered {len(self.hooks)} hooks on {len(targets)} layers.")
+
+    @staticmethod
+    def _latent_proj_of(moe_layer: nn.Module):
+        """Return the layer's ``fc2_latent_proj`` (latent -> hidden), else ``None``.
+
+        Present only when ``config.moe_latent_size`` is set: mcore's ``MoELayer``
+        builds ``fc1_latent_proj`` / ``fc2_latent_proj`` as a pair, and
+        ``postprocess`` runs ``fc2_latent_proj`` immediately after
+        ``combine_postprocess``. Non-latent MoE models return ``None`` and the
+        latent-combine metrics are simply never declared.
+        """
+        return getattr(moe_layer, "fc2_latent_proj", None)
 
     def _patch_expert_bias_update(self):
         """Piggyback on mcore's per-global-batch expert-bias update to emit
@@ -373,6 +411,45 @@ class MoESpecialistMonitor(TorchProbe):
                 for attr in ("_cached_scores_for_aux_loss", "_cached_routing_map_for_aux_loss"):
                     if hasattr(module, attr):
                         setattr(module, attr, None)
+
+        return hook_fn
+
+    def _make_latent_combine_hook(self, layer_idx: int):
+        """Forward pre-hook on ``fc2_latent_proj``: measure its input.
+
+        That input is the k-way-combined expert output, still in latent dim — the
+        tensor produced by ``combine_postprocess`` and consumed by the latent
+        up-projection. Records RMS + per-channel max/mean ratio as 0-dim GPU tensors.
+
+        No cross-rank collective here (perf-rules Rule 2). ``fc2_latent_proj`` is built
+        ``parallel_mode="duplicated"``, so the latent dim is NOT TP-sharded and the
+        per-channel reduction is already complete locally; the token dim is
+        DP/CP-partitioned, and flush-time ``gather_and_aggregate`` composes those
+        (mean for the RMS, max for the ratio).
+        """
+
+        def hook_fn(module, args, kwargs):
+            if not self._should_monitor():
+                return None
+            try:
+                # mcore calls ``self.fc2_latent_proj(output)`` positionally and
+                # ``TELinear.forward(self, x)`` takes a single tensor; the kwargs
+                # fallback covers a non-TE / renamed linear.
+                hidden = args[0] if args else None
+                if hidden is None and kwargs:
+                    for key in ("x", "inp", "input", "hidden_states"):
+                        if isinstance(kwargs.get(key), torch.Tensor):
+                            hidden = kwargs[key]
+                            break
+                if not isinstance(hidden, torch.Tensor) or hidden.dim() < 2:
+                    return None
+                with torch.no_grad():
+                    for name, val in compute_latent_combine_stats(hidden.detach()).items():
+                        self.record_layer_metric(layer_idx, name, val)
+            except Exception as e:
+                if self.verbose:
+                    logger.error(f"[MoEMonitor] latent-combine hook error layer {layer_idx}: {e}")
+            return None
 
         return hook_fn
 

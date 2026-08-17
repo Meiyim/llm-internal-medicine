@@ -314,7 +314,7 @@ Massive activations 是 pre-norm Transformer 的**架构副产品**，独立于�
 
 监控 mHC (Manifold-Constrained Hyper-Connections) 层的三个 per-token 映射 `h_pre` / `h_post` / `h_res`。
 只在模型开启 mHC 层时生效——mHC 类无法 import 或模型不含 `HyperConnectionTransformerLayer` 时该 monitor 为
-彻底 no-op（不 wrap、不产生指标）。每层含两个 hyper-connection 模块（`attn` / `mlp`），各产出以下 8 个指标，
+彻底 no-op（不 wrap、不产生指标）。每层含两个 hyper-connection 模块（`attn` / `mlp`），各产出以下 13 个指标，
 指标名以 `attn_` / `mlp_` 前缀区分；全部按 token/batch 求均值。
 
 | # | 指标 | 日志键 | 公式 | 级别 | 诊断意义 |
@@ -327,6 +327,11 @@ Massive activations 是 pre-norm Transformer 的**架构副产品**，独立于�
 | 6 | `{c}_amax_gain_bwd` | `mhc_health/layer_{i}/{c}_amax_gain_bwd` | `mean_t(max_j \|Σ_i h_res_ij\|)` | 每层+全局 | 单层反向最坏放大 (≈1) |
 | 7 | `{c}_composite_amax_gain_fwd` | `mhc_health/layer_{i}/{c}_composite_amax_gain_fwd` | 复合映射 `∏ h_res` 的行和 | 每层+全局 | 跨层累积前向放大 |
 | 8 | `{c}_composite_amax_gain_bwd` | `mhc_health/layer_{i}/{c}_composite_amax_gain_bwd` | 复合映射 `∏ h_res` 的列和 | 每层+全局 | 跨层累积反向放大 |
+| 9 | `{c}_h_res_orth_dev` | `mhc_health/layer_{i}/{c}_h_res_orth_dev` | `mean_t(\|\|h_resᵀ h_res − I\|\|_F)` | 每层+全局 | 偏离正交（等距）的程度，0 = 保范 |
+| 10 | `{c}_composite_h_res_orth_dev` | `mhc_health/layer_{i}/{c}_composite_h_res_orth_dev` | 同上，作用于复合映射 | 每层+全局 | 跨层累积的非等距程度 |
+| 11 | `{c}_h_res_beta_mean` | `mhc_health/layer_{i}/{c}_h_res_beta_mean` | `mean_t(n − tr(h_res))` | 每层+全局 | rank-1 擦除强度 β（非擦除构型 = 迹亏损） |
+| 12 | `{c}_h_res_beta_std` | `mhc_health/layer_{i}/{c}_h_res_beta_std` | `std_t(n − tr(h_res))` | 每层+全局 | β 的 token 级离散度，0 = 退化成常数 |
+| 13 | `{c}_h_res_outer_dev` | `mhc_health/layer_{i}/{c}_h_res_outer_dev` | `mean_t(\|\|h_res − h_post ⊗ h_pre\|\|_F)` | 每层+全局 | 残差混合中「读写外积」解释不掉的部分 |
 
 `{c}` ∈ `{attn, mlp}`。复合映射为本 pipeline stage / VPP chunk 内 `h_res` 的累乘（每次 forward 在本 stage 首个
 hc 模块处重置）——PP=1 时精确，PP>1 时为 stage 局部近似。

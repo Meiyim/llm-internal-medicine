@@ -62,7 +62,7 @@ internal_medicine_monitors:
 
 ## 监控指标
 
-每个 hc 模块产出 8 个指标，指标名以 `attn_` / `mlp_` 前缀区分，全部按 token/batch 求均值
+每个 hc 模块产出 13 个指标，指标名以 `attn_` / `mlp_` 前缀区分，全部按 token/batch 求均值
 （并在 flush 时对 microbatch/rank 求均值）。日志键形如 `mhc_health/layer_{i}/{c}_{name}`，`{c}` ∈ `{attn, mlp}`；
 对应的 `mhc_health/global_{c}_{name}` 由逐层累加器在 flush 时自动派生。
 
@@ -94,6 +94,25 @@ amax_gain_bwd = mean_t( max_j | Σ_i  M_ij | )      # 列和（backward）
 
 单层 `h_res` 经 Sinkhorn 投影为双随机矩阵（行/列和 ≈ 1），故单层 amax-gain ≈ 1.0；复合映射的增益随深度偏离 1.0，
 正是残差流放大/收缩的信号。
+
+### 流形与结构（h_res 的形状诊断）
+
+| 指标 | 公式 | 诊断意义 |
+|------|------|----------|
+| `{c}_h_res_orth_dev` | `mean_t( \|\| h_resᵀ h_res − I \|\|_F )` | 偏离正交（等距）的程度：0 = 精确保范 |
+| `{c}_composite_h_res_orth_dev` | 同上，作用于复合映射 | 跨层累积的非等距程度 |
+| `{c}_h_res_beta_mean` | `mean_t( n − tr(h_res) )` | rank-1 擦除强度 β |
+| `{c}_h_res_beta_std` | `std_t( n − tr(h_res) )` | β 的 token 级离散度：→0 说明退化成逐层常数 |
+| `{c}_h_res_outer_dev` | `mean_t( \|\| h_res − h_post ⊗ h_pre \|\|_F )` | 残差混合中「读写外积」解释不掉的部分 |
+
+**β = `n − tr(h_res)`。** 对 `H_res = I − β·ûûᵀ`（`‖û‖ = 1`）这个迹亏损**精确等于** β，所以 rank-1 擦除消融的核心判据
+（β 收敛到 0 / (0,2) / 2）可以直接读这条曲线，不必再从 `orth_dev = 2β − β²` 反推 —— 后者在 β=0 与 β=2 处都是 0，
+单看它分不出「擦除无效」和「Householder 反射」。其他构型下它就是普通的迹亏损：恒等 = 0，双随机 = `n` 减对角质量。
+
+**外积偏差的下标方向。** `apply_h_res` 算的是 `out_i = Σ_j h_res[i,j]·x_j`，而子层通路写回的是
+`h_post_i · Σ_j h_pre_j·x_j`，所以与 `h_res` 下标同序的 rank-1 矩阵是 `h_post ⊗ h_pre`（元素 `[i,j] = h_post_i·h_pre_j`），
+本指标即残差混合与这个读写外积的 Frobenius 距离。注意它未减掉恒等分量，所以近似恒等的 `h_res` 会有一个 `√n` 量级的底；
+对称的 `h_res`（如 rank-1 擦除）两个下标方向给出同一个值，方向只在 dense/正交构型下才有区别。
 
 ### 复合映射（composite mapping）
 

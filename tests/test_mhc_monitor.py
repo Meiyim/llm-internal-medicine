@@ -71,6 +71,49 @@ class MHCMetricsTest(unittest.TestCase):
         self.assertAlmostEqual(mean.item(), 1.5, places=5)
         self.assertAlmostEqual(std.item(), h.std().item(), places=6)
 
+    def test_erase_beta_recovers_rank1_strength(self):
+        # H_res = I - beta * u u^T with ||u|| = 1 -> tr = n - beta, per token.
+        n = 4
+        u = torch.tensor([0.9707, 0.1387, 0.1387, 0.1387])
+        u = u / u.norm()
+        betas = torch.tensor([0.25, 1.75])
+        eye = torch.eye(n)
+        mats = torch.stack([eye - b * torch.outer(u, u) for b in betas]).reshape(2, 1, n, n)
+        mean, std = mhc_metrics.erase_beta_stats(mats)
+        self.assertAlmostEqual(mean.item(), 1.0, places=5)
+        self.assertAlmostEqual(std.item(), betas.std().item(), places=5)
+
+    def test_erase_beta_zero_on_identity(self):
+        n = 4
+        ident = torch.eye(n).reshape(1, 1, n, n).expand(3, 2, n, n)
+        mean, std = mhc_metrics.erase_beta_stats(ident)
+        self.assertAlmostEqual(mean.item(), 0.0, places=6)
+        self.assertAlmostEqual(std.item(), 0.0, places=6)
+
+    def test_outer_deviation_zero_on_exact_outer(self):
+        # h_res == h_post (x) h_pre (entry [i,j] = h_post_i * h_pre_j) -> 0.
+        s, b, n = 3, 2, 4
+        h_pre = torch.rand(s, b, n)
+        h_post = torch.rand(s, b, n) * 2
+        outer = h_post.unsqueeze(-1) * h_pre.unsqueeze(-2)
+        self.assertAlmostEqual(mhc_metrics.outer_deviation(outer, h_pre, h_post).item(), 0.0, places=6)
+        # Identity vs a zero outer product -> ||I||_F = sqrt(n).
+        ident = torch.eye(n).reshape(1, 1, n, n).expand(s, b, n, n)
+        zeros = torch.zeros(s, b, n)
+        self.assertAlmostEqual(mhc_metrics.outer_deviation(ident, zeros, zeros).item(), n**0.5, places=5)
+
+    def test_outer_deviation_is_index_oriented(self):
+        # Asymmetric gates: the transposed orientation must NOT read as 0.
+        h_pre = torch.tensor([[[1.0, 0.0]]])
+        h_post = torch.tensor([[[0.0, 2.0]]])
+        outer = h_post.unsqueeze(-1) * h_pre.unsqueeze(-2)  # [[0,0],[2,0]]
+        self.assertAlmostEqual(mhc_metrics.outer_deviation(outer, h_pre, h_post).item(), 0.0, places=6)
+        self.assertAlmostEqual(
+            mhc_metrics.outer_deviation(outer.transpose(-2, -1), h_pre, h_post).item(),
+            (2 * 2.0**2) ** 0.5,
+            places=5,
+        )
+
 
 class MHCMonitorTest(unittest.TestCase):
     def setUp(self):
@@ -130,6 +173,11 @@ class MHCMonitorTest(unittest.TestCase):
                 "amax_gain_bwd",
                 "composite_amax_gain_fwd",
                 "composite_amax_gain_bwd",
+                "h_res_orth_dev",
+                "composite_h_res_orth_dev",
+                "h_res_beta_mean",
+                "h_res_beta_std",
+                "h_res_outer_dev",
             ):
                 self.assertIn(f"mhc_health/layer_0/{comp}_{key}", latest)
             self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_amax_gain_fwd"], 1.0, places=4)
@@ -138,6 +186,11 @@ class MHCMonitorTest(unittest.TestCase):
             # h_pre == 0.5 everywhere, h_post == 1.0 everywhere.
             self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_pre_mean"], 0.5, places=5)
             self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_post_mean"], 1.0, places=5)
+            # h_res == I -> orthogonal, zero trace deficit; ||I - 0.5*J||_F == 2.0.
+            self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_orth_dev"], 0.0, places=5)
+            self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_beta_mean"], 0.0, places=5)
+            self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_beta_std"], 0.0, places=5)
+            self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_outer_dev"], 2.0, places=5)
         # global aggregate is derived too.
         self.assertIn("mhc_health/global_attn_amax_gain_fwd", latest)
 

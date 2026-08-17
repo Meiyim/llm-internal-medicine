@@ -4,19 +4,24 @@ Monitors the three per-token mappings of every ``HyperConnectionModule`` in an
 mHC (Manifold-Constrained Hyper-Connections) model:
 
 - ``h_pre`` / ``h_post`` — the aggregation / expansion gates: mean and std.
-- ``h_res``              — the doubly-stochastic residual-mixing matrix: the
-  paper's ``amax_gain`` forward (max-abs row sum) and backward (max-abs column
-  sum), computed both on this layer's ``h_res`` and on the running **composite
-  mapping** (cumulative product of ``h_res`` across the layers local to this
-  pipeline stage / VPP chunk).
+- ``h_res``              — the residual-mixing matrix: the paper's ``amax_gain``
+  forward (max-abs row sum) and backward (max-abs column sum), computed both on
+  this layer's ``h_res`` and on the running **composite mapping** (cumulative
+  product of ``h_res`` across the layers local to this pipeline stage / VPP
+  chunk); its deviation from orthogonality; its trace deficit ``n - tr(H_res)``
+  (= the rank-1 ablation's erase strength ``beta``); and its distance from the
+  read-write outer product ``h_post (x) h_pre``.
 
-Per hyper-connection module (a layer has two: ``attn`` and ``mlp``) we emit 8
+Per hyper-connection module (a layer has two: ``attn`` and ``mlp``) we emit 13
 mean-aggregated series, name-prefixed by component:
 
     {attn,mlp}_h_pre_mean   {attn,mlp}_h_pre_std
     {attn,mlp}_h_post_mean  {attn,mlp}_h_post_std
     {attn,mlp}_amax_gain_fwd            {attn,mlp}_amax_gain_bwd
     {attn,mlp}_composite_amax_gain_fwd  {attn,mlp}_composite_amax_gain_bwd
+    {attn,mlp}_h_res_orth_dev           {attn,mlp}_composite_h_res_orth_dev
+    {attn,mlp}_h_res_beta_mean          {attn,mlp}_h_res_beta_std
+    {attn,mlp}_h_res_outer_dev
 
 ``h_pre`` is not part of ``HyperConnectionModule.forward``'s return, so we cannot
 use a forward hook. Instead we wrap the module's ``compute_mappings`` bound method
@@ -37,7 +42,13 @@ import torch
 import torch.nn as nn
 
 from .base import TorchProbe
-from .mhc_metrics import amax_gain, gate_stats
+from .mhc_metrics import (
+    amax_gain,
+    erase_beta_stats,
+    gate_stats,
+    orthogonality_deviation,
+    outer_deviation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +73,11 @@ _METRIC_NAMES = (
     "amax_gain_bwd",
     "composite_amax_gain_fwd",
     "composite_amax_gain_bwd",
+    "h_res_orth_dev",
+    "composite_h_res_orth_dev",
+    "h_res_beta_mean",
+    "h_res_beta_std",
+    "h_res_outer_dev",
 )
 
 # (component_name, layer attribute) — attn runs before mlp in the layer forward.
@@ -246,6 +262,16 @@ class MHCHealthMonitor(TorchProbe):
 
                     self.record_layer_metric(layer_idx, f"{component}_amax_gain_fwd", amax_gain(h_res, dim=-1))
                     self.record_layer_metric(layer_idx, f"{component}_amax_gain_bwd", amax_gain(h_res, dim=-2))
+                    self.record_layer_metric(layer_idx, f"{component}_h_res_orth_dev", orthogonality_deviation(h_res))
+
+                    # beta = n - tr(H_res): the rank-1 erase strength (exact for
+                    # H_res = I - beta*u u^T), else the trace deficit.
+                    beta_mean, beta_std = erase_beta_stats(h_res)
+                    self.record_layer_metric(layer_idx, f"{component}_h_res_beta_mean", beta_mean)
+                    self.record_layer_metric(layer_idx, f"{component}_h_res_beta_std", beta_std)
+                    self.record_layer_metric(
+                        layer_idx, f"{component}_h_res_outer_dev", outer_deviation(h_res, h_pre, h_post)
+                    )
 
                     # Composite mapping M_k = h_res_k @ M_{k-1} (per token).
                     s, b, n, _ = h_res.shape
@@ -263,6 +289,11 @@ class MHCHealthMonitor(TorchProbe):
 
                     self.record_layer_metric(layer_idx, f"{component}_composite_amax_gain_fwd", amax_gain(M, dim=-1))
                     self.record_layer_metric(layer_idx, f"{component}_composite_amax_gain_bwd", amax_gain(M, dim=-2))
+                    self.record_layer_metric(
+                        layer_idx,
+                        f"{component}_composite_h_res_orth_dev",
+                        orthogonality_deviation(M.view(s, b, n, n)),
+                    )
             except Exception as e:
                 if self.verbose:
                     logger.error(f"[MHCMonitor] Error layer {layer_idx}/{component}: {e}")

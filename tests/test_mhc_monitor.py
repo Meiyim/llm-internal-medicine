@@ -114,6 +114,33 @@ class MHCMetricsTest(unittest.TestCase):
             places=5,
         )
 
+    def test_orth_dev_mean_and_ratio_on_orthogonal(self):
+        # Exactly orthogonal everywhere: mean 0 and the ratio floors at 1.0 (not 0/0).
+        n, s, b = 4, 8, 4
+        ident = torch.eye(n).reshape(1, 1, n, n).expand(s, b, n, n).contiguous()
+        mean, ratio = mhc_metrics.orthogonality_deviation(ident)
+        self.assertAlmostEqual(mean.item(), 0.0, places=6)
+        self.assertAlmostEqual(ratio.item(), 1.0, places=6)
+
+    def test_orth_dev_ratio_exposes_tail_the_mean_hides(self):
+        # 1 non-orthogonal token in 65536: the mean still displays as 0.0000 at the
+        # log's 4 decimals while the ratio reports the tail. R3's Schulz failure mode.
+        n, s, b = 4, 1 << 16, 1
+        mats = torch.eye(n).reshape(1, 1, n, n).expand(s, b, n, n).clone()
+        mats[0, 0] = torch.eye(n) * 2.0**0.5  # gram - I = I -> frob = sqrt(n) = 2
+        mean, ratio = mhc_metrics.orthogonality_deviation(mats)
+        self.assertLess(mean.item(), 5e-5, "token mean rounds to 0.0000 in the log")
+        self.assertGreater(ratio.item(), 1e5)
+
+    def test_orth_dev_ratio_recovers_the_true_ratio(self):
+        # Deviations well above eps: the ratio is max/median, not eps-dominated.
+        n, s, b = 2, 4, 1
+        # gram - I = (c^2 - 1) I -> frob = sqrt(n) * |c^2 - 1|
+        cs = [3.0, 3.0, 3.0, 5.0]  # devs ~ [11.3, 11.3, 11.3, 33.9]
+        mats = torch.stack([torch.eye(n) * c for c in cs]).reshape(s, b, n, n)
+        _, ratio = mhc_metrics.orthogonality_deviation(mats)
+        self.assertAlmostEqual(ratio.item(), 24.0 / 8.0, places=3)
+
 
 class MHCMonitorTest(unittest.TestCase):
     def setUp(self):
@@ -175,6 +202,8 @@ class MHCMonitorTest(unittest.TestCase):
                 "composite_amax_gain_bwd",
                 "h_res_orth_dev",
                 "composite_h_res_orth_dev",
+                "h_res_orth_dev_max_med_ratio",
+                "composite_h_res_orth_dev_max_med_ratio",
                 "h_res_beta_mean",
                 "h_res_beta_std",
                 "h_res_outer_dev",
@@ -188,11 +217,18 @@ class MHCMonitorTest(unittest.TestCase):
             self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_post_mean"], 1.0, places=5)
             # h_res == I -> orthogonal, zero trace deficit; ||I - 0.5*J||_F == 2.0.
             self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_orth_dev"], 0.0, places=5)
+            self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_orth_dev_max_med_ratio"], 1.0, places=5)
+            self.assertAlmostEqual(
+                latest[f"mhc_health/layer_0/{comp}_composite_h_res_orth_dev_max_med_ratio"], 1.0, places=5
+            )
             self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_beta_mean"], 0.0, places=5)
             self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_beta_std"], 0.0, places=5)
             self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_outer_dev"], 2.0, places=5)
         # global aggregate is derived too.
         self.assertIn("mhc_health/global_attn_amax_gain_fwd", latest)
+        # the ratios are max-aggregated end to end: monitor buffer + training_logs suffix.
+        self.assertIn("attn_h_res_orth_dev_max_med_ratio", MHCHealthMonitor.MAX_AGGREGATED)
+        self.assertTrue(training_logs._is_max_metric("mhc_health/layer_0/attn_h_res_orth_dev_max_med_ratio"))
 
     def test_remove_hooks_restores_compute_mappings(self):
         n, s, b = 4, 2, 3

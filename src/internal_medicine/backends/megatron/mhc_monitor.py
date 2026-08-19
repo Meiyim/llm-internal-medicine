@@ -8,18 +8,22 @@ mHC (Manifold-Constrained Hyper-Connections) model:
   forward (max-abs row sum) and backward (max-abs column sum), computed both on
   this layer's ``h_res`` and on the running **composite mapping** (cumulative
   product of ``h_res`` across the layers local to this pipeline stage / VPP
-  chunk); its deviation from orthogonality; its trace deficit ``n - tr(H_res)``
-  (= the rank-1 ablation's erase strength ``beta``); and its distance from the
-  read-write outer product ``h_post (x) h_pre``.
+  chunk); its deviation from orthogonality (token mean, plus a max/median ratio
+  over tokens that catches a non-orthogonal tail the mean hides); its trace
+  deficit ``n - tr(H_res)`` (= the rank-1 ablation's erase strength ``beta``);
+  and its distance from the read-write outer product ``h_post (x) h_pre``.
 
-Per hyper-connection module (a layer has two: ``attn`` and ``mlp``) we emit 13
-mean-aggregated series, name-prefixed by component:
+Per hyper-connection module (a layer has two: ``attn`` and ``mlp``) we emit 15
+series, name-prefixed by component — 13 mean-aggregated plus the two ratios,
+which are max-aggregated:
 
     {attn,mlp}_h_pre_mean   {attn,mlp}_h_pre_std
     {attn,mlp}_h_post_mean  {attn,mlp}_h_post_std
     {attn,mlp}_amax_gain_fwd            {attn,mlp}_amax_gain_bwd
     {attn,mlp}_composite_amax_gain_fwd  {attn,mlp}_composite_amax_gain_bwd
     {attn,mlp}_h_res_orth_dev           {attn,mlp}_composite_h_res_orth_dev
+    {attn,mlp}_h_res_orth_dev_max_med_ratio
+    {attn,mlp}_composite_h_res_orth_dev_max_med_ratio
     {attn,mlp}_h_res_beta_mean          {attn,mlp}_h_res_beta_std
     {attn,mlp}_h_res_outer_dev
 
@@ -75,6 +79,8 @@ _METRIC_NAMES = (
     "composite_amax_gain_bwd",
     "h_res_orth_dev",
     "composite_h_res_orth_dev",
+    "h_res_orth_dev_max_med_ratio",
+    "composite_h_res_orth_dev_max_med_ratio",
     "h_res_beta_mean",
     "h_res_beta_std",
     "h_res_outer_dev",
@@ -86,16 +92,21 @@ _COMPONENTS = (
     ("mlp", "mlp_hyper_connection"),
 )
 
+# The max/median ratios compose across microbatches / ranks with max, not mean:
+# averaging a tail detector hides the tail it exists to catch.
+_MAX_METRIC_NAMES = ("h_res_orth_dev_max_med_ratio", "composite_h_res_orth_dev_max_med_ratio")
+_MAX_AGGREGATED = {f"{comp}_{name}" for comp, _ in _COMPONENTS for name in _MAX_METRIC_NAMES}
+
 
 class MHCHealthMonitor(TorchProbe):
     """Monitor the h_pre / h_post / h_res mappings of mHC hyper-connection layers."""
 
     METRIC_PREFIX = "mhc_health"
-    # Every metric is a mean over tokens/batch (and over microbatches/ranks at
-    # flush). No max/min series, so both classification sets stay empty. The
-    # metric names end in _mean/_std/_fwd/_bwd — never a `_max`/`_min` boundary —
-    # so training_logs' suffix classifier also keeps them as "mean".
-    MAX_AGGREGATED: set[str] = set()
+    # All series are means over tokens/batch (and over microbatches/ranks at flush)
+    # except the two orth_dev max/median ratios, which are max-aggregated. Those two
+    # names are also listed in training_logs.MAX_AGGREGATED_SUFFIXES so the suffix
+    # classifier composes them across ranks with max instead of mean.
+    MAX_AGGREGATED: set[str] = _MAX_AGGREGATED
     MIN_AGGREGATED: set[str] = set()
 
     def __init__(
@@ -262,7 +273,9 @@ class MHCHealthMonitor(TorchProbe):
 
                     self.record_layer_metric(layer_idx, f"{component}_amax_gain_fwd", amax_gain(h_res, dim=-1))
                     self.record_layer_metric(layer_idx, f"{component}_amax_gain_bwd", amax_gain(h_res, dim=-2))
-                    self.record_layer_metric(layer_idx, f"{component}_h_res_orth_dev", orthogonality_deviation(h_res))
+                    orth_mean, orth_ratio = orthogonality_deviation(h_res)
+                    self.record_layer_metric(layer_idx, f"{component}_h_res_orth_dev", orth_mean)
+                    self.record_layer_metric(layer_idx, f"{component}_h_res_orth_dev_max_med_ratio", orth_ratio)
 
                     # beta = n - tr(H_res): the rank-1 erase strength (exact for
                     # H_res = I - beta*u u^T), else the trace deficit.
@@ -289,10 +302,12 @@ class MHCHealthMonitor(TorchProbe):
 
                     self.record_layer_metric(layer_idx, f"{component}_composite_amax_gain_fwd", amax_gain(M, dim=-1))
                     self.record_layer_metric(layer_idx, f"{component}_composite_amax_gain_bwd", amax_gain(M, dim=-2))
+                    comp_orth_mean, comp_orth_ratio = orthogonality_deviation(M.view(s, b, n, n))
+                    self.record_layer_metric(layer_idx, f"{component}_composite_h_res_orth_dev", comp_orth_mean)
                     self.record_layer_metric(
                         layer_idx,
-                        f"{component}_composite_h_res_orth_dev",
-                        orthogonality_deviation(M.view(s, b, n, n)),
+                        f"{component}_composite_h_res_orth_dev_max_med_ratio",
+                        comp_orth_ratio,
                     )
             except Exception as e:
                 if self.verbose:

@@ -56,14 +56,16 @@ internal_medicine_monitors:
 - `step()` 每步清空 `self._composite`，`remove_hooks()` 一并清空。
 
 热路径纪律见 `.claude/skills/monitor-hook-perf-rules`：hook 内无 D2H 同步、无集合通信，schema 在 `allocate_buffers`
-前声明。TP 不沿 `n` 切分映射，故无需 hook 内通信；跨 rank 归约在 flush 时由 `gather_and_aggregate` 完成（mean）。
+前声明。TP 不沿 `n` 切分映射，故无需 hook 内通信；跨 rank 归约在 flush 时由 `gather_and_aggregate` 完成
+（mean，两个 `*_orth_dev_max_med_ratio` 走 max）。
 
 ---
 
 ## 监控指标
 
-每个 hc 模块产出 13 个指标，指标名以 `attn_` / `mlp_` 前缀区分，全部按 token/batch 求均值
-（并在 flush 时对 microbatch/rank 求均值）。日志键形如 `mhc_health/layer_{i}/{c}_{name}`，`{c}` ∈ `{attn, mlp}`；
+每个 hc 模块产出 15 个指标，指标名以 `attn_` / `mlp_` 前缀区分。除两个 `*_orth_dev_max_med_ratio` 按 **max**
+合成外，其余全部按 token/batch 求均值（并在 flush 时对 microbatch/rank 求均值）。日志键形如
+`mhc_health/layer_{i}/{c}_{name}`，`{c}` ∈ `{attn, mlp}`；
 对应的 `mhc_health/global_{c}_{name}` 由逐层累加器在 flush 时自动派生。
 
 ### 门控统计（h_pre / h_post）
@@ -101,9 +103,18 @@ amax_gain_bwd = mean_t( max_j | Σ_i  M_ij | )      # 列和（backward）
 |------|------|----------|
 | `{c}_h_res_orth_dev` | `mean_t( \|\| h_resᵀ h_res − I \|\|_F )` | 偏离正交（等距）的程度：0 = 精确保范 |
 | `{c}_composite_h_res_orth_dev` | 同上，作用于复合映射 | 跨层累积的非等距程度 |
+| `{c}_h_res_orth_dev_max_med_ratio` | `(max_t d + ε) / (med_t d + ε)`，`d` 同上，`ε = 1e-6` | 逐 token 尾部集中度：1.0 = 无尾 |
+| `{c}_composite_h_res_orth_dev_max_med_ratio` | 同上，作用于复合映射 | 跨层累积后的尾部集中度 |
 | `{c}_h_res_beta_mean` | `mean_t( n − tr(h_res) )` | rank-1 擦除强度 β |
 | `{c}_h_res_beta_std` | `std_t( n − tr(h_res) )` | β 的 token 级离散度：→0 说明退化成逐层常数 |
 | `{c}_h_res_outer_dev` | `mean_t( \|\| h_res − h_post ⊗ h_pre \|\|_F )` | 残差混合中「读写外积」解释不掉的部分 |
+
+**max/median 比值：均值抓不到的尾巴。** `orth_dev` 是 token 均值，所以「少数 token 完全不正交」和「全体精确正交」
+在日志上可以长得一模一样：R3 的 15 步 Schulz 迭代掉出收敛盆的 token 占比约 1e-3，均值全程显示 `0.00000`，
+而那批 token 主导了反向传播。比值把这件事变成可读的：分母是 median（对尾部免疫的「典型 token」水平），
+分子是 max，`ε = 1e-6` 是视作「与精确正交不可区分」的 fp32 舍入底 —— 精确正交时读数是 **1.0**，不是 0/0。
+跨 microbatch / rank 按 **max** 合成（取均值会抹平尾部），所以全局值是各 rank 比值的最大者，不是全局 max/median。
+Cayley 参数化下构造上恒为 1.0；迭代式正交化（Schulz）与 Sinkhorn/擦除构型下才有信息量。
 
 **β = `n − tr(h_res)`。** 对 `H_res = I − β·ûûᵀ`（`‖û‖ = 1`）这个迹亏损**精确等于** β，所以 rank-1 擦除消融的核心判据
 （β 收敛到 0 / (0,2) / 2）可以直接读这条曲线，不必再从 `orth_dev = 2β − β²` 反推 —— 后者在 β=0 与 β=2 处都是 0，

@@ -77,17 +77,25 @@ def outer_deviation(mat: torch.Tensor, h_pre: torch.Tensor, h_post: torch.Tensor
     return (mat - outer).pow(2).sum(dim=(-2, -1)).sqrt().mean()
 
 
-def orthogonality_deviation(mat: torch.Tensor) -> torch.Tensor:
-    """Frobenius norm of (H_res^T @ H_res - I) averaged over tokens.
+def orthogonality_deviation(mat: torch.Tensor, eps: float = 1e-6) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-token ``||H_res^T H_res - I||_F``: token mean, plus its max/median ratio.
 
-    Measures how far ``h_res`` is from orthogonal. For a perfectly orthogonal
-    matrix this returns 0; for doubly-stochastic (Sinkhorn baseline) it will be
-    positive. Returns a 0-dim GPU tensor; no host sync.
+    The mean measures how far ``h_res`` is from orthogonal: 0 for a perfectly
+    orthogonal matrix, positive for doubly-stochastic (Sinkhorn baseline).
+
+    The ratio is the tail detector the mean cannot be. An iterative
+    orthogonalization (e.g. the R3 Schulz path) that drops a ~1e-3 fraction of
+    tokens out of its convergence basin keeps the mean displaying 0.0000 while
+    those tokens dominate the backward pass, so the mean alone cannot separate
+    "exact everywhere" from "exact except for a tail". ``eps`` is the deviation
+    level treated as indistinguishable from exact (fp32 rounding floor): an
+    exactly-orthogonal ``h_res`` reads 1.0 rather than 0/0.
+
+    Returns two 0-dim GPU tensors ``(mean, max_median_ratio)``; no host sync.
     """
     s, b, n, _ = mat.shape
     m = mat.reshape(s * b, n, n)
     gram = torch.bmm(m.transpose(-2, -1), m)
     eye = torch.eye(n, device=mat.device, dtype=mat.dtype).unsqueeze(0)
-    diff = gram - eye
-    frob = diff.pow(2).sum(dim=(-2, -1)).sqrt()
-    return frob.mean()
+    frob = (gram - eye).pow(2).sum(dim=(-2, -1)).sqrt()  # [s*b], one scalar per token
+    return frob.mean(), (frob.amax() + eps) / (frob.median() + eps)

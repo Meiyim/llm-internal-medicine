@@ -34,7 +34,7 @@ internal_medicine_monitors:
 
 ---
 
-## 采集方式：wrap `compute_mappings`（非重算）
+## 采集方式：wrap `compute_mappings` 与 `fused_h_res_h_post_bda`（非重算）
 
 `h_pre` 不在 `HyperConnectionModule.forward` 的返回中，普通 forward hook 看不到它。因此本 monitor **包裹
 （wrap）每个 mHC 模块的 `compute_mappings` 绑定方法**，直接捕获其真实返回的 `(h_pre, h_post, h_res)` —— 不重算。
@@ -43,6 +43,10 @@ internal_medicine_monitors:
   `self.compute_mappings(...)` 调用，且**不被 checkpoint**，因此在 grad-enabled 的正向中恰好执行一次；实例属性
   wrapper 干净地遮蔽类方法。
 - 整个捕获逻辑受 `_should_monitor()` 门控（含 grad 门），非监控步只是 `orig(x)` + 一次布尔判断。
+- wrapper 自己的入参 `x`（`[s, b, n*C]`，聚合前的多流隐状态）也在作用域内，多流几何指标即由它算出，无需额外 hook。
+- 能量分解还需要 sublayer 输出 `o` 与更新后的残差，只有 `fused_h_res_h_post_bda` 同时持有它们，故该绑定方法也被包裹。
+  它是外层 dispatcher（内部再分派 native / checkpoint 两条路径），在 grad-enabled 正向中每模块恰好调用一次；其入参
+  `original_residual` 与 `compute_mappings` 收到的 `x` 逐位相同（`transformer_layer` 在聚合前捕获 `residual = hidden_states`）。
 - `remove_hooks()` 恢复原始方法并清空所有状态。
 
 ### VRAM 安全（无泄漏）
@@ -57,14 +61,17 @@ internal_medicine_monitors:
 
 热路径纪律见 `.claude/skills/monitor-hook-perf-rules`：hook 内无 D2H 同步、无集合通信，schema 在 `allocate_buffers`
 前声明。TP 不沿 `n` 切分映射，故无需 hook 内通信；跨 rank 归约在 flush 时由 `gather_and_aggregate` 完成
-（mean，两个 `*_orth_dev_max_med_ratio` 走 max）。
+（mean，两个 `*_orth_dev_max_med_ratio`、`*_stream_norm_max_min_ratio`、`*_stream_gram_offdiag_max` 走 max）。
+序列并行下 `x` 按 token 切分但隐藏维完整，逐 token 的多流几何在本 rank 就是完备的，同样不需要 hook 内通信。
 
 ---
 
 ## 监控指标
 
-每个 hc 模块产出 15 个指标，指标名以 `attn_` / `mlp_` 前缀区分。除两个 `*_orth_dev_max_med_ratio` 按 **max**
-合成外，其余全部按 token/batch 求均值（并在 flush 时对 microbatch/rank 求均值）。日志键形如
+每个 hc 模块产出 `25 + n` 个指标（`n` 条逐流 norm），指标名以 `attn_` / `mlp_` 前缀区分。除两个
+`*_orth_dev_max_med_ratio`、`*_stream_norm_max_min_ratio`、`*_stream_gram_offdiag_max`、
+`*_mix_write_cos_abs_max` 按 **max** 合成外，
+其余全部按 token/batch 求均值（并在 flush 时对 microbatch/rank 求均值）。日志键形如
 `mhc_health/layer_{i}/{c}_{name}`，`{c}` ∈ `{attn, mlp}`；
 对应的 `mhc_health/global_{c}_{name}` 由逐层累加器在 flush 时自动派生。
 
@@ -125,6 +132,64 @@ Cayley 参数化下构造上恒为 1.0；迭代式正交化（Schulz）与 Sinkh
 本指标即残差混合与这个读写外积的 Frobenius 距离。注意它未减掉恒等分量，所以近似恒等的 `h_res` 会有一个 `√n` 量级的底；
 对称的 `h_res`（如 rank-1 擦除）两个下标方向给出同一个值，方向只在 dense/正交构型下才有区别。
 
+### 多流几何（stream 本身，而非映射）
+
+上面所有指标测的都是**映射**（`h_pre`/`h_post`/`h_res`），且都沿 stream 轴做了归约。这一组测的是映射所作用的
+**那 n 条流本身**，输入是 wrapper 入参 `x` reshape 成 `[T, n, C]` 后的 Gram 矩阵（`T = s·b`）：
+
+| 指标 | 公式 | 诊断意义 |
+|------|------|----------|
+| `{c}_stream_norm_{i}` | `mean_t( ‖x_i‖₂ )`，`i = 0..n−1` | 第 `i` 条流的量级，**逐流**给出 |
+| `{c}_stream_norm_max_min_ratio` | `mean_t( (max_i ‖x_i‖ + ε) / (min_i ‖x_i‖ + ε) )` | 流间量级失衡：1.0 = 均衡，↑ = 出现主导流 |
+| `{c}_stream_gram_offdiag_mean` | `mean_t mean_{i≠j} \|cos(x_i, x_j)\|` | 流间方向冗余：0 = 相互正交，→1 = 塌缩到同一方向 |
+| `{c}_stream_gram_offdiag_max` | `mean_t max_{i≠j} \|cos(x_i, x_j)\|` | 同上的逐 token 尾部（少数 token 塌缩，均值看不见） |
+
+**为什么必须逐流。** 其余每一条指标都沿 stream 轴归约（`mean(h_pre)`、逐 token 行和 …），所以「1 条流承载全部信号、
+另外 `n−1` 条衰减成噪声」与「n 条流均衡工作」在它们身上读数相同 —— `stream_norm_mean` 这种把 stream 轴也平均掉的
+写法同样看不见主导流。多流残差退化成单流有两条路：量级失衡（由 `max_min_ratio` 抓）和方向塌缩（由 Gram 非对角
+`|cos|` 抓），这组指标就是这两条路的读数。
+
+**实现上的两点。** Gram 由原始（bf16）流直接 `bmm` 得到、只把 `[T, n, n]` 的输出升到 fp32：先把 `x` 升 fp32 会在
+forward 里产生一个 `[T, n, C]` 的临时拷贝（s=8192、n=4、C=1024 时约 134 MB）。norm 取 Gram 对角线的平方根，
+不另算一遍；`ε = 1e-6` 是比值/余弦分母的下界，使某条流恰好为 0 时读数仍是有限值而不是 nan。
+
+### 能量分解（更新的交叉项）
+
+上面所有指标测的是映射与流的几何，没有一条能回答「这次更新给残差加了多少能量」。把单次更新写成
+`out = Q x + w`（`Q = h_res`，`w = h_post oᵗ`，即 `w_i = h_post_i · o`），在 `n×C` 上取 Frobenius 内积，
+逐指标展开后得到**精确**恒等式：
+
+```
+‖out‖² = ‖Qx‖² + W + X
+    R = ‖x‖²,              W = ‖h_post‖²‖o‖²,
+    X = 2⟨Qx, w⟩ = 2 (Qᵗh_post)ᵗ d,     d_j = ⟨x_j, o⟩ ∈ R^n
+```
+
+| 指标 | 公式 | 诊断意义 |
+|------|------|----------|
+| `{c}_write_over_resid` | `mean_t( W/R )` | 单次写入相对残差的能量占比 |
+| `{c}_cross_over_resid` | `mean_t( X/R )` | **有符号**交叉项；正交 `h_res` + 球面 `h_post` 都约束不到它 |
+| `{c}_cross_over_write` | `mean_t( X/W′ )`，`W′ = max(W, 1e-6·R)` | 交叉项相对写入能量；`< −1` ⟹ 本模块净减少残差能量 |
+| `{c}_mix_write_cos` | `mean_t( X / (2√(R·W′)) )` | `cos θ ∈ [−1,1]`，尺度无关、可跨层比 |
+| `{c}_mix_write_cos_abs_max` | `max_t \|cos θ\|` | 对齐写入的逐 token 尾部（**max** 合成） |
+| `{c}_resid_write_cos` | `mean_t( ⟨x, w⟩ / (‖x‖‖w‖) ) ` | 混合**前**的读写对齐；反 Hermite 写入会把它结构性归零 |
+| `{c}_resid_gain` | `mean_t( ‖out‖²/R )` | 单模块能量增益 |
+
+**为什么需要它。** `h_res` 正交（R3-Cayley）保证混合等距，`h_post` 球面化（R5）保证写入能量恒定，两者合起来的
+隐含前提是「残差能量只能按写入能量单调增长」。但 R5 实跑在 `attn3 → mlp3` 上残差范数 295.7 → 258.2
+（`ΔR ≈ −2.08e4 < 0`）—— 在 `Q` 正交、`W > 0` 下这只能来自 `X`。`X` 是残差范数能够**变小**的唯一途径，
+而在这组序列之前它完全不可观测。形式化与三个修法见训练仓 `conf/mai_ladder/mhc/R7_NORM_CONTROL.md`。
+
+**`resid_gain` 是记账自检。** 未加写入修正时它必须等于 `1 + W/R + X/R`；若开启 cross-free 写入（R7c）则必须变成
+`1 + (W/R)·sin²θ`。两个 regime 都对得上，才说明监控与 patch 都没写错。它同时给出增长是加性还是乘性。
+
+**实现上的三点。** `d` 是唯一需要 `C` 长度的计算（`n` 个内积，一次 `[T,n,C]×[T,C,1]` bmm），其余全是已经是
+fp32 的 `[T,n]` 小张量代数，`n*C × n*C` 算子从不构造；`R` 用 `‖x‖²` 代替 `‖Qx‖²`（`h_res` 正交时相等，
+Sinkhorn 基线下偏差等于其非正交度，精确算需要 `[T,n,n]` 流 Gram，4 倍 flops）；`o` 取 dropout **前**的值，
+`hidden_dropout > 0` 时 `resid_gain` 自检会按被丢弃的质量偏移（当前 mHC recipe 全为 0）。
+`X/W` 与 `cos` 的分母用**相对**下限 `1e-6·R` 而非绝对 eps：写入能量可忽略的 token 上这两个比值本身无意义，
+绝对 eps 会让它们贡献 ~1e17 而毁掉均值。
+
 ### 复合映射（composite mapping）
 
 复合映射是本 pipeline stage / VPP chunk 内、按 forward 执行顺序（attn→mlp，逐层递增）对 `h_res` 的累乘，每次 forward
@@ -144,3 +209,5 @@ Cayley 参数化下构造上恒为 1.0；迭代式正交化（Schulz）与 Sinkh
   状态自洽；非监控步不触发，下一监控步的 root 重置会重新 seed。
 - `_should_monitor()` 要求 grad enabled，故若外层 layer 被整体激活重算，仅 grad-enabled 的那次正向记录；`compute_mappings`
   本身不被 checkpoint，不会重复触发。
+- `fused_h_res_h_post_bda` 是外层 dispatcher，重算发生在它内部的 `CheckpointWithoutOutput` 里而非 wrapper 层，
+  故 `recompute_modules` 含 `"mhc"` 时能量分解仍每模块每 microbatch 只记录一次。

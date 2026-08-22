@@ -12,10 +12,20 @@ mHC (Manifold-Constrained Hyper-Connections) model:
   over tokens that catches a non-orthogonal tail the mean hides); its trace
   deficit ``n - tr(H_res)`` (= the rank-1 ablation's erase strength ``beta``);
   and its distance from the read-write outer product ``h_post (x) h_pre``.
+- the ``n`` residual **streams** themselves, from the module's own input: per-stream
+  L2 norm, the per-token max/min norm ratio, and the inter-stream ``|cosine|``
+  off-diagonal of the stream Gram (mean and per-token max). Everything above
+  reduces over the stream axis, so a dominant stream or a collapse of all ``n``
+  onto one direction is invisible in it; these series are what see that.
+- the **energy split** of the update ``out = h_res x + w`` (``w = h_post o^T``):
+  ``||out||^2 = ||h_res x||^2 + W + X`` with ``W`` the write energy and ``X = 2<h_res x, w>``
+  the cross term. ``X`` is unconstrained by both an orthogonal ``h_res`` (R3) and a
+  spherical ``h_post`` (R5), and is the only way a residual norm can shrink across a
+  module. See ``conf/mai_ladder/mhc/R7_NORM_CONTROL.md`` in the training repo.
 
-Per hyper-connection module (a layer has two: ``attn`` and ``mlp``) we emit 15
-series, name-prefixed by component — 13 mean-aggregated plus the two ratios,
-which are max-aggregated:
+Per hyper-connection module (a layer has two: ``attn`` and ``mlp``) we emit
+``25 + n`` series, name-prefixed by component — mean-aggregated except the three
+orth_dev / cos ratios, the norm ratio and the Gram max, which are max-aggregated:
 
     {attn,mlp}_h_pre_mean   {attn,mlp}_h_pre_std
     {attn,mlp}_h_post_mean  {attn,mlp}_h_post_std
@@ -26,11 +36,21 @@ which are max-aggregated:
     {attn,mlp}_composite_h_res_orth_dev_max_med_ratio
     {attn,mlp}_h_res_beta_mean          {attn,mlp}_h_res_beta_std
     {attn,mlp}_h_res_outer_dev
+    {attn,mlp}_stream_norm_0 .. _{n-1}  {attn,mlp}_stream_norm_max_min_ratio
+    {attn,mlp}_stream_gram_offdiag_mean {attn,mlp}_stream_gram_offdiag_max
+    {attn,mlp}_write_over_resid         {attn,mlp}_cross_over_resid
+    {attn,mlp}_cross_over_write         {attn,mlp}_mix_write_cos
+    {attn,mlp}_mix_write_cos_abs_max    {attn,mlp}_resid_write_cos
+    {attn,mlp}_resid_gain
 
 ``h_pre`` is not part of ``HyperConnectionModule.forward``'s return, so we cannot
 use a forward hook. Instead we wrap the module's ``compute_mappings`` bound method
-to capture its real ``(h_pre, h_post, h_res)`` — no recompute. Everything is
-detached and computed under ``no_grad`` (see the VRAM-safety notes on the hook).
+to capture its real ``(h_pre, h_post, h_res)`` — no recompute. The wrapper's own
+argument is the pre-aggregation ``[s, b, n*C]`` hidden state, which is where the
+stream-geometry series come from. The energy split needs ``o`` and the final output as
+well, which only ``fused_h_res_h_post_bda`` holds, so that bound method is wrapped too.
+Everything is detached and computed under ``no_grad`` (see the VRAM-safety notes on
+the hook).
 
 The monitor is a hard no-op unless the model actually uses the mHC layer: if the
 mHC classes cannot be imported, or no ``HyperConnectionTransformerLayer`` is
@@ -52,6 +72,8 @@ from .mhc_metrics import (
     gate_stats,
     orthogonality_deviation,
     outer_deviation,
+    residual_energy_split,
+    stream_gram_stats,
 )
 
 logger = logging.getLogger(__name__)
@@ -86,15 +108,53 @@ _METRIC_NAMES = (
     "h_res_outer_dev",
 )
 
+# Geometry of the n streams the mappings act on, from the module's own input. Fixed part;
+# the n per-stream norm series are added per module by _stream_metric_names (n is a config
+# constant, so the schema is still fully determined before allocate_buffers locks it).
+_STREAM_METRIC_NAMES = (
+    "stream_norm_max_min_ratio",
+    "stream_gram_offdiag_mean",
+    "stream_gram_offdiag_max",
+)
+
+
+def _stream_metric_names(n: int) -> tuple[str, ...]:
+    return tuple(f"stream_norm_{i}" for i in range(n)) + _STREAM_METRIC_NAMES
+
+
+# Energy split of one update, from ``fused_h_res_h_post_bda``. All ratios are per-token,
+# then meaned. R = ||x||^2, W = write energy, X = 2<h_res x, w>, Out = ||out||^2.
+#
+# X is computed from the module's INPUTS, so under R7c (cross-free write) these series
+# still report the PRE-correction cross term — i.e. the alignment the model is asking
+# for, not a monitor bug. What R7c changes is ``resid_gain``, which must move from
+# 1 + W/R + X/R to 1 + (W/R) sin^2(theta).
+_ENERGY_METRIC_NAMES = (
+    "write_over_resid",  # W/R
+    "cross_over_resid",  # X/R                            signed
+    "cross_over_write",  # X/W'    W' = W floored at 1e-6 R
+    "mix_write_cos",  # cos(theta) = X / (2 sqrt(RW'))    scale-free, comparable across layers
+    "mix_write_cos_abs_max",  # max |cos(theta)|          tail detector
+    "resid_write_cos",  # <x, w> / (||x|| ||w||)          pre-mix; what an anti-Hermitian write zeroes
+    "resid_gain",  # Out/R                                growth law + bookkeeping self-check
+)
+
+
 # (component_name, layer attribute) — attn runs before mlp in the layer forward.
 _COMPONENTS = (
     ("attn", "self_attention_hyper_connection"),
     ("mlp", "mlp_hyper_connection"),
 )
 
-# The max/median ratios compose across microbatches / ranks with max, not mean:
+# The max/median and max/min ratios compose across microbatches / ranks with max, not mean:
 # averaging a tail detector hides the tail it exists to catch.
-_MAX_METRIC_NAMES = ("h_res_orth_dev_max_med_ratio", "composite_h_res_orth_dev_max_med_ratio")
+_MAX_METRIC_NAMES = (
+    "h_res_orth_dev_max_med_ratio",
+    "composite_h_res_orth_dev_max_med_ratio",
+    "stream_norm_max_min_ratio",
+    "stream_gram_offdiag_max",
+    "mix_write_cos_abs_max",
+)
 _MAX_AGGREGATED = {f"{comp}_{name}" for comp, _ in _COMPONENTS for name in _MAX_METRIC_NAMES}
 
 
@@ -103,7 +163,7 @@ class MHCHealthMonitor(TorchProbe):
 
     METRIC_PREFIX = "mhc_health"
     # All series are means over tokens/batch (and over microbatches/ranks at flush)
-    # except the two orth_dev max/median ratios, which are max-aggregated. Those two
+    # except the ratios and the Gram off-diagonal max, which are max-aggregated. Those
     # names are also listed in training_logs.MAX_AGGREGATED_SUFFIXES so the suffix
     # classifier composes them across ranks with max instead of mean.
     MAX_AGGREGATED: set[str] = _MAX_AGGREGATED
@@ -126,8 +186,8 @@ class MHCHealthMonitor(TorchProbe):
         )
         # chunk_id -> running composite mapping [s*b, n, n], detached (no graph).
         self._composite: dict[int, torch.Tensor] = {}
-        # (module, original_compute_mappings) pairs, for remove_hooks() restoration.
-        self._wrapped: list[tuple[nn.Module, object]] = []
+        # (module, attr_name, original_bound_method) triples, for remove_hooks() restoration.
+        self._wrapped: list[tuple[nn.Module, str, object]] = []
 
     # ------------------------------------------------------------------
     # Discovery
@@ -182,8 +242,8 @@ class MHCHealthMonitor(TorchProbe):
         entries = self._find_hc_modules(model, layer_offset=layer_offset)
         if not entries:
             return []
-        for global_idx, comp, _ in entries:
-            for name in _METRIC_NAMES:
+        for global_idx, comp, mod in entries:
+            for name in _METRIC_NAMES + _stream_metric_names(int(mod.n)) + _ENERGY_METRIC_NAMES:
                 self.declare_layer_metric(global_idx, f"{comp}_{name}")
         # The chunk root = the attn hc of the lowest-index layer; it is the first
         # hc module executed on this stage, so it resets the composite each forward.
@@ -192,10 +252,16 @@ class MHCHealthMonitor(TorchProbe):
 
     def _attach_hooks(self, targets):
         for layer_idx, comp, mod, chunk_id, is_root in targets:
-            orig = mod.compute_mappings
-            mod.compute_mappings = self._make_capture(orig, layer_idx, comp, chunk_id, is_root)
-            self._wrapped.append((mod, orig))
-        logger.info(f"[MHCMonitor] Wrapped {len(self._wrapped)} hyper-connection modules.")
+            n = int(mod.n)
+            # both originals are read before any setattr, so neither wrapper sees the other
+            wrappers = {
+                "compute_mappings": self._make_capture(mod.compute_mappings, layer_idx, comp, chunk_id, is_root, n),
+                "fused_h_res_h_post_bda": self._make_bda_capture(mod.fused_h_res_h_post_bda, layer_idx, comp, n),
+            }
+            for attr, wrapper in wrappers.items():
+                self._wrapped.append((mod, attr, getattr(mod, attr)))
+                setattr(mod, attr, wrapper)
+        logger.info(f"[MHCMonitor] Wrapped {len(self._wrapped)} bound methods on hyper-connection modules.")
 
     def register_hooks(self, model: nn.Module):
         """Single-chunk convenience path. Prefer ``setup_mhc_monitor`` for VPP."""
@@ -218,11 +284,11 @@ class MHCHealthMonitor(TorchProbe):
     def remove_hooks(self):
         # Restore the original bound methods and drop all cross-call state so the
         # monitor holds no module references or composite tensors after teardown.
-        for mod, orig in self._wrapped:
+        for mod, attr, orig in self._wrapped:
             try:
-                del mod.compute_mappings  # fall back to the class method
+                delattr(mod, attr)  # fall back to the class method
             except AttributeError:
-                mod.compute_mappings = orig
+                setattr(mod, attr, orig)
         self._wrapped = []
         self._composite.clear()
         super().remove_hooks()
@@ -238,7 +304,7 @@ class MHCHealthMonitor(TorchProbe):
     # Capture wrapper (the hot path)
     # ------------------------------------------------------------------
 
-    def _make_capture(self, orig, layer_idx: int, component: str, chunk_id: int, is_root: bool):
+    def _make_capture(self, orig, layer_idx: int, component: str, chunk_id: int, is_root: bool, n_streams: int):
         """Wrap ``compute_mappings`` to record metrics from its real return value.
 
         VRAM safety: the mappings arrive attached to the training autograd graph;
@@ -263,6 +329,14 @@ class MHCHealthMonitor(TorchProbe):
                     h_pre = h_pre.detach()
                     h_post = h_post.detach()
                     h_res = h_res.detach()
+
+                    # Stream geometry of this module's own input, before any mixing.
+                    s_norms, norm_ratio, gram_mean, gram_max = stream_gram_stats(x.detach(), n_streams)
+                    for i in range(n_streams):
+                        self.record_layer_metric(layer_idx, f"{component}_stream_norm_{i}", s_norms[i])
+                    self.record_layer_metric(layer_idx, f"{component}_stream_norm_max_min_ratio", norm_ratio)
+                    self.record_layer_metric(layer_idx, f"{component}_stream_gram_offdiag_mean", gram_mean)
+                    self.record_layer_metric(layer_idx, f"{component}_stream_gram_offdiag_max", gram_max)
 
                     pre_mean, pre_std = gate_stats(h_pre)
                     post_mean, post_std = gate_stats(h_post)
@@ -312,6 +386,59 @@ class MHCHealthMonitor(TorchProbe):
             except Exception as e:
                 if self.verbose:
                     logger.error(f"[MHCMonitor] Error layer {layer_idx}/{component}: {e}")
+            return out
+
+        return wrapped
+
+    def _make_bda_capture(self, orig, layer_idx: int, component: str, n_streams: int):
+        """Wrap ``fused_h_res_h_post_bda`` for the energy split of the update it performs.
+
+        This is the only method holding ``h_res``, the pre-update residual, ``h_post``, the
+        sublayer output ``o`` and the final output at once. The signature is replicated from
+        upstream ``HyperConnectionModule`` (all call sites pass positionally); the return
+        value is passed through untouched.
+
+        ``original_residual`` is bit-identically the ``x`` that ``compute_mappings`` saw —
+        ``transformer_layer`` captures ``residual = hidden_states`` before aggregation.
+
+        ``o`` is taken before dropout, so with ``hidden_dropout > 0`` while training the
+        ``resid_gain`` bookkeeping check is biased by the dropped mass (every current mHC
+        recipe runs ``hidden_dropout = 0.0``).
+        """
+
+        def wrapped(
+            h_res,
+            original_residual,
+            h_post,
+            layer_output_with_bias,
+            dropout_prob,
+            training,
+            fused,
+            manager=None,
+        ):
+            out = orig(h_res, original_residual, h_post, layer_output_with_bias, dropout_prob, training, fused, manager)
+            if not self._should_monitor():
+                return out
+            try:
+                with torch.no_grad():
+                    o, bias = layer_output_with_bias
+                    o = o.detach()
+                    # the bda adds bias into the write, so it belongs to the write energy
+                    if bias is not None:
+                        o = o + bias.detach()
+                    vals = residual_energy_split(
+                        original_residual.detach(),
+                        out.detach(),
+                        o,
+                        h_post.detach(),
+                        h_res.detach(),
+                        n_streams,
+                    )
+                    for name, val in zip(_ENERGY_METRIC_NAMES, vals, strict=True):
+                        self.record_layer_metric(layer_idx, f"{component}_{name}", val)
+            except Exception as e:
+                if self.verbose:
+                    logger.error(f"[MHCMonitor] Energy-split error layer {layer_idx}/{component}: {e}")
             return out
 
         return wrapped

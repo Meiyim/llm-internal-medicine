@@ -23,7 +23,7 @@ MHCHealthMonitor = mhc_monitor.MHCHealthMonitor
 
 
 class FakeHC(nn.Module):
-    """Stand-in for HyperConnectionModule exposing compute_mappings + layer_number."""
+    """Stand-in for HyperConnectionModule exposing compute_mappings / the bda + layer_number."""
 
     def __init__(self, n, layer_number, h_pre, h_post, h_res):
         super().__init__()
@@ -35,6 +35,18 @@ class FakeHC(nn.Module):
 
     def compute_mappings(self, x):
         return self._h_pre, self._h_post, self._h_res
+
+    def fused_h_res_h_post_bda(
+        self, h_res, original_residual, h_post, layer_output_with_bias, dropout_prob, training, fused, manager=None
+    ):
+        """Reference ``out = h_res x + h_post (x) (o + bias)`` with the upstream signature."""
+        s, b, nc = original_residual.shape
+        x = original_residual.reshape(s, b, self.n, nc // self.n)
+        o, bias = layer_output_with_bias
+        if bias is not None:
+            o = o + bias
+        mixed = torch.einsum("sbij,sbjc->sbic", h_res, x)
+        return (mixed + h_post.unsqueeze(-1) * o.unsqueeze(-2)).reshape(s, b, nc)
 
     def forward(self, hidden_states, mhc_recompute_manager=None):  # pragma: no cover - unused
         return hidden_states, self._h_res, self._h_post
@@ -50,6 +62,23 @@ class FakeLayer(nn.Module):
 
 def _mhc_model(layers):
     return SimpleNamespace(decoder=SimpleNamespace(layers=nn.ModuleList(layers)))
+
+
+ENERGY_NAMES = mhc_monitor._ENERGY_METRIC_NAMES
+
+
+def _energy_split(h_res, x, o, h_post):
+    """Build ``out = h_res x + h_post (x) o`` and return (metrics dict, per-token R/W/X)."""
+    s, b, n, _ = x.shape
+    mixed = torch.einsum("sbij,sbjc->sbic", h_res, x)
+    w = h_post.unsqueeze(-1) * o.unsqueeze(-2)
+    out = (mixed + w).reshape(s, b, -1)
+    residual = x.reshape(s, b, -1)
+    vals = mhc_metrics.residual_energy_split(residual, out, o, h_post, h_res, n)
+    r = x.pow(2).sum(dim=(-2, -1))
+    w_e = h_post.pow(2).sum(-1) * o.pow(2).sum(-1)
+    cross = 2.0 * (mixed * w).sum(dim=(-2, -1))
+    return dict(zip(ENERGY_NAMES, vals, strict=True)), (r, w_e, cross, out, mixed, w)
 
 
 class MHCMetricsTest(unittest.TestCase):
@@ -141,6 +170,137 @@ class MHCMetricsTest(unittest.TestCase):
         _, ratio = mhc_metrics.orthogonality_deviation(mats)
         self.assertAlmostEqual(ratio.item(), 24.0 / 8.0, places=3)
 
+    def test_stream_gram_on_an_orthogonal_frame(self):
+        # 4 orthogonal streams with norms 1..4: per-stream norms recovered exactly, the
+        # imbalance shows up in the ratio (a stream-axis mean would report a flat 2.5).
+        n, c = 4, 4
+        streams = torch.eye(c) * torch.tensor([1.0, 2.0, 3.0, 4.0]).unsqueeze(-1)
+        x = streams.reshape(1, 1, n * c).expand(3, 2, n * c).contiguous()
+        norms, ratio, off_mean, off_max = mhc_metrics.stream_gram_stats(x, n)
+        self.assertEqual(tuple(norms.shape), (n,))
+        for i, expected in enumerate((1.0, 2.0, 3.0, 4.0)):
+            self.assertAlmostEqual(norms[i].item(), expected, places=5)
+        self.assertAlmostEqual(ratio.item(), 4.0, places=5)
+        self.assertAlmostEqual(off_mean.item(), 0.0, places=6)
+        self.assertAlmostEqual(off_max.item(), 0.0, places=6)
+
+    def test_stream_gram_collapse_is_unit_cosine(self):
+        # All n streams on one direction: |cosine| == 1 off-diagonal, norms still balanced.
+        n, c = 4, 8
+        one = torch.randn(c)
+        x = one.repeat(n).reshape(1, 1, n * c).expand(5, 2, n * c).contiguous()
+        norms, ratio, off_mean, off_max = mhc_metrics.stream_gram_stats(x, n)
+        self.assertAlmostEqual(ratio.item(), 1.0, places=5)
+        self.assertAlmostEqual(off_mean.item(), 1.0, places=5)
+        self.assertAlmostEqual(off_max.item(), 1.0, places=5)
+        self.assertAlmostEqual(norms[0].item(), one.norm().item(), places=4)
+
+    def test_stream_gram_offdiag_max_exposes_tail_the_mean_hides(self):
+        # Token 0 orthogonal, token 1 has two parallel streams: mean 1/6, per-token max 1/2.
+        n, c = 3, 3
+        tok0 = torch.eye(n)
+        tok1 = torch.stack([torch.eye(n)[0], torch.eye(n)[0], torch.eye(n)[2]])
+        x = torch.stack([tok0.reshape(-1), tok1.reshape(-1)]).reshape(2, 1, n * c)
+        _, ratio, off_mean, off_max = mhc_metrics.stream_gram_stats(x, n)
+        self.assertAlmostEqual(off_mean.item(), 1.0 / 6.0, places=5)
+        self.assertAlmostEqual(off_max.item(), 0.5, places=5)
+        self.assertAlmostEqual(ratio.item(), 1.0, places=5)
+
+    def test_stream_gram_survives_a_dead_stream(self):
+        # A zero stream must not produce nan/inf through the norm or cosine denominators.
+        n, c = 4, 6
+        streams = torch.randn(n, c)
+        streams[2] = 0.0
+        x = streams.reshape(1, 1, n * c).expand(4, 2, n * c).contiguous()
+        for t in mhc_metrics.stream_gram_stats(x, n):
+            self.assertTrue(torch.isfinite(t).all(), t)
+
+    def test_energy_split_is_the_exact_identity(self):
+        # ||out||^2 = R + W + X for an orthogonal h_res; every series must match the
+        # naive C-length computation it was algebraically folded out of.
+        torch.manual_seed(0)
+        n, c, s, b = 4, 6, 3, 2
+        q, _ = torch.linalg.qr(torch.randn(n, n))
+        h_res = q.reshape(1, 1, n, n).expand(s, b, n, n).contiguous()
+        x = torch.randn(s, b, n, c)
+        o = torch.randn(s, b, c)
+        h_post = torch.rand(s, b, n) * 2.0
+
+        m, (r, w_e, cross, out, _, w) = _energy_split(h_res, x, o, h_post)
+        self.assertAlmostEqual(m["write_over_resid"].item(), (w_e / r).mean().item(), places=5)
+        self.assertAlmostEqual(m["cross_over_resid"].item(), (cross / r).mean().item(), places=5)
+        self.assertAlmostEqual(m["cross_over_write"].item(), (cross / w_e).mean().item(), places=4)
+        # the accounting self-check: measured Out/R == 1 + W/R + X/R
+        self.assertAlmostEqual(m["resid_gain"].item(), (out.pow(2).sum(-1) / r).mean().item(), places=5)
+        self.assertAlmostEqual(m["resid_gain"].item(), ((r + w_e + cross) / r).mean().item(), places=5)
+
+        cos = cross / (2.0 * (r * w_e).sqrt())
+        self.assertAlmostEqual(m["mix_write_cos"].item(), cos.mean().item(), places=5)
+        self.assertAlmostEqual(m["mix_write_cos_abs_max"].item(), cos.abs().amax().item(), places=5)
+        pre = (x * w).sum(dim=(-2, -1)) / (r * w_e).sqrt()
+        self.assertAlmostEqual(m["resid_write_cos"].item(), pre.mean().item(), places=5)
+
+    def test_energy_split_write_orthogonal_to_every_stream(self):
+        # o outside span{x_j} -> d = 0 -> X = 0 and the energy is purely additive.
+        torch.manual_seed(1)
+        n, c, s, b = 2, 4, 3, 2
+        q, _ = torch.linalg.qr(torch.randn(n, n))
+        h_res = q.reshape(1, 1, n, n).expand(s, b, n, n).contiguous()
+        basis = torch.eye(c)
+        x = torch.stack([basis[0], basis[1]]).reshape(1, 1, n, c).expand(s, b, n, c) * 3.0
+        o = basis[2].reshape(1, 1, c).expand(s, b, c) * 2.0
+        h_post = torch.ones(s, b, n)
+
+        m, (r, w_e, _, _, _, _) = _energy_split(h_res, x.contiguous(), o.contiguous(), h_post)
+        self.assertAlmostEqual(m["cross_over_resid"].item(), 0.0, places=6)
+        self.assertAlmostEqual(m["mix_write_cos"].item(), 0.0, places=6)
+        self.assertAlmostEqual(m["resid_write_cos"].item(), 0.0, places=6)
+        self.assertAlmostEqual(m["resid_gain"].item(), (1.0 + w_e / r).mean().item(), places=5)
+
+    def test_energy_split_catches_a_shrinking_residual(self):
+        # The R5 attn3->mlp3 signature: an anti-aligned write makes Out < R, which is
+        # impossible from W alone. h_res = I, o = -k x_i -> X = -2 k ||v||^2 sum(h_post).
+        n, c, s, b = 2, 5, 2, 2
+        k = 0.5
+        v = torch.randn(c)
+        x = v.reshape(1, 1, 1, c).expand(s, b, n, c).contiguous()
+        o = (-k * v).reshape(1, 1, c).expand(s, b, c).contiguous()
+        h_res = torch.eye(n).reshape(1, 1, n, n).expand(s, b, n, n).contiguous()
+        h_post = torch.ones(s, b, n)
+
+        m, (r, _, _, out, _, _) = _energy_split(h_res, x, o, h_post)
+        self.assertLess(out.pow(2).sum(-1).mean().item(), r.mean().item())
+        self.assertLess(m["resid_gain"].item(), 1.0)
+        self.assertAlmostEqual(m["cross_over_write"].item(), -2.0 / k, places=4)
+        self.assertAlmostEqual(m["mix_write_cos"].item(), -1.0, places=4)
+
+    def test_energy_split_non_orthogonal_mix_loses_energy(self):
+        # R stands in for ||h_res x||^2; for a doubly-stochastic (non-orthogonal) mix the
+        # measured gain must sit strictly below the 1 + W/R + X/R the identity predicts.
+        torch.manual_seed(2)
+        n, c, s, b = 4, 6, 3, 2
+        h_res = torch.full((s, b, n, n), 1.0 / n)
+        x = torch.randn(s, b, n, c)
+        o = torch.randn(s, b, c)
+        h_post = torch.rand(s, b, n) * 2.0
+
+        m, _ = _energy_split(h_res, x, o, h_post)
+        predicted = 1.0 + m["write_over_resid"].item() + m["cross_over_resid"].item()
+        self.assertLess(m["resid_gain"].item(), predicted)
+
+    def test_energy_split_survives_a_vanishing_write(self):
+        # W -> 0 makes X/W and cos ill-posed; the relative floor must keep them finite.
+        n, c, s, b = 4, 6, 2, 2
+        x = torch.randn(s, b, n, c)
+        o = torch.zeros(s, b, c)
+        h_res = torch.eye(n).reshape(1, 1, n, n).expand(s, b, n, n).contiguous()
+        h_post = torch.ones(s, b, n)
+
+        m, _ = _energy_split(h_res, x, o, h_post)
+        for name, val in m.items():
+            self.assertTrue(torch.isfinite(val).all(), f"{name} = {val}")
+        self.assertAlmostEqual(m["resid_gain"].item(), 1.0, places=6)
+
 
 class MHCMonitorTest(unittest.TestCase):
     def setUp(self):
@@ -207,6 +367,10 @@ class MHCMonitorTest(unittest.TestCase):
                 "h_res_beta_mean",
                 "h_res_beta_std",
                 "h_res_outer_dev",
+                "stream_norm_max_min_ratio",
+                "stream_gram_offdiag_mean",
+                "stream_gram_offdiag_max",
+                *(f"stream_norm_{i}" for i in range(n)),
             ):
                 self.assertIn(f"mhc_health/layer_0/{comp}_{key}", latest)
             self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_amax_gain_fwd"], 1.0, places=4)
@@ -230,6 +394,90 @@ class MHCMonitorTest(unittest.TestCase):
         self.assertIn("attn_h_res_orth_dev_max_med_ratio", MHCHealthMonitor.MAX_AGGREGATED)
         self.assertTrue(training_logs._is_max_metric("mhc_health/layer_0/attn_h_res_orth_dev_max_med_ratio"))
 
+    def test_stream_geometry_comes_from_the_hook_input(self):
+        # The stream series are computed from compute_mappings' own argument, not from the
+        # returned mappings — feed a known frame and read the exact values back out.
+        n, s, b = 4, 2, 3
+        layer = self._identity_layer(n, s, b, layer_number=1)
+        model = _mhc_model([layer])
+
+        monitor = MHCHealthMonitor(log_per_layer=True, log_global=True)
+        targets = monitor._prepare_layers(model, chunk_id=0)
+        monitor.allocate_buffers(torch.device("cpu"))
+        monitor._attach_hooks(targets)
+
+        c = 4
+        streams = torch.eye(c) * torch.tensor([1.0, 2.0, 3.0, 4.0]).unsqueeze(-1)
+        x = streams.reshape(1, 1, n * c).expand(4, 2, n * c).contiguous()
+        for _, _, mod, _, _ in targets:
+            mod.compute_mappings(x)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="mhc_health")
+        for comp in ("attn", "mlp"):
+            for i, expected in enumerate((1.0, 2.0, 3.0, 4.0)):
+                self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_stream_norm_{i}"], expected, places=4)
+            self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_stream_norm_max_min_ratio"], 4.0, places=4)
+            self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_stream_gram_offdiag_mean"], 0.0, places=5)
+            self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_stream_gram_offdiag_max"], 0.0, places=5)
+        # the imbalance ratio and the Gram tail are max-aggregated end to end.
+        self.assertIn("attn_stream_norm_max_min_ratio", MHCHealthMonitor.MAX_AGGREGATED)
+        self.assertIn("attn_stream_gram_offdiag_max", MHCHealthMonitor.MAX_AGGREGATED)
+        self.assertTrue(training_logs._is_max_metric("mhc_health/layer_0/attn_stream_norm_max_min_ratio"))
+        self.assertTrue(training_logs._is_max_metric("mhc_health/layer_0/attn_stream_gram_offdiag_max"))
+
+    def _bda_case(self, targets, n, c, s, b, bias=None):
+        """Drive every wrapped bda with a known update; return the expected mean Out/R."""
+        x = torch.randn(s, b, n, c)
+        o = torch.randn(s, b, c)
+        h_res = torch.eye(n).reshape(1, 1, n, n).expand(s, b, n, n).contiguous()
+        h_post = torch.ones(s, b, n)
+        for _, _, mod, _, _ in targets:
+            mod.fused_h_res_h_post_bda(h_res, x.reshape(s, b, n * c), h_post, (o, bias), 0.0, True, False)
+        o_eff = o if bias is None else o + bias
+        r = x.pow(2).sum(dim=(-2, -1))
+        w_e = h_post.pow(2).sum(-1) * o_eff.pow(2).sum(-1)
+        cross = 2.0 * (x * (h_post.unsqueeze(-1) * o_eff.unsqueeze(-2))).sum(dim=(-2, -1))
+        return ((r + w_e + cross) / r).mean().item()
+
+    def test_energy_split_series_reach_the_logs(self):
+        n, c, s, b = 4, 6, 3, 2
+        torch.manual_seed(3)
+        layer = self._identity_layer(n, s, b, layer_number=1)
+        model = _mhc_model([layer])
+
+        monitor = MHCHealthMonitor(log_per_layer=True, log_global=True)
+        targets = monitor._prepare_layers(model, chunk_id=0)
+        monitor.allocate_buffers(torch.device("cpu"))
+        monitor._attach_hooks(targets)
+        expected_gain = self._bda_case(targets, n, c, s, b)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="mhc_health")
+        for comp in ("attn", "mlp"):
+            for key in ENERGY_NAMES:
+                self.assertIn(f"mhc_health/layer_0/{comp}_{key}", latest)
+            self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_resid_gain"], expected_gain, places=4)
+        # the cos tail detector is max-aggregated end to end (the _max suffix is enough)
+        self.assertIn("attn_mix_write_cos_abs_max", MHCHealthMonitor.MAX_AGGREGATED)
+        self.assertTrue(training_logs._is_max_metric("mhc_health/layer_0/attn_mix_write_cos_abs_max"))
+
+    def test_energy_split_counts_the_bias_in_the_write(self):
+        n, c, s, b = 4, 6, 3, 2
+        torch.manual_seed(4)
+        layer = self._identity_layer(n, s, b, layer_number=1)
+        model = _mhc_model([layer])
+
+        monitor = MHCHealthMonitor(log_per_layer=True, log_global=True)
+        targets = monitor._prepare_layers(model, chunk_id=0)
+        monitor.allocate_buffers(torch.device("cpu"))
+        monitor._attach_hooks(targets)
+        expected_gain = self._bda_case(targets, n, c, s, b, bias=torch.randn(c))
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="mhc_health")
+        self.assertAlmostEqual(latest["mhc_health/layer_0/attn_resid_gain"], expected_gain, places=4)
+
     def test_remove_hooks_restores_compute_mappings(self):
         n, s, b = 4, 2, 3
         layer = self._identity_layer(n, s, b)
@@ -237,12 +485,15 @@ class MHCMonitorTest(unittest.TestCase):
         monitor = MHCHealthMonitor()
         targets = monitor._prepare_layers(model, chunk_id=0)
         monitor.allocate_buffers(torch.device("cpu"))
-        original = layer.self_attention_hyper_connection.compute_mappings
+        hc = layer.self_attention_hyper_connection
+        originals = {a: getattr(hc, a) for a in ("compute_mappings", "fused_h_res_h_post_bda")}
         monitor._attach_hooks(targets)
-        self.assertIsNot(layer.self_attention_hyper_connection.compute_mappings, original)
+        for attr, original in originals.items():
+            self.assertIsNot(getattr(hc, attr), original)
         monitor.remove_hooks()
-        # falls back to the (bound) class method
-        self.assertEqual(layer.self_attention_hyper_connection.compute_mappings.__func__, FakeHC.compute_mappings)
+        # both fall back to the (bound) class methods
+        self.assertEqual(hc.compute_mappings.__func__, FakeHC.compute_mappings)
+        self.assertEqual(hc.fused_h_res_h_post_bda.__func__, FakeHC.fused_h_res_h_post_bda)
         self.assertEqual(monitor._wrapped, [])
         self.assertEqual(monitor._composite, {})
 

@@ -16,9 +16,9 @@ mixing matrix bounds the worst-case forward-pass expansion, and the max-abs
 ``h_res`` across layers) they drift away from 1.0 with depth, flagging
 residual-stream amplification.
 
-All functions return 0-dim GPU tensors and never sync the host (no ``.item()`` /
-``.cpu()``), so they are safe to call from a forward hot path. See
-``.claude/skills/monitor-hook-perf-rules``.
+All functions return 0-dim GPU tensors (``stream_gram_stats`` additionally returns one ``[n]``
+vector) and never sync the host (no ``.item()`` / ``.cpu()``), so they are safe to call from a
+forward hot path. See ``.claude/skills/monitor-hook-perf-rules``.
 """
 
 import torch
@@ -99,3 +99,131 @@ def orthogonality_deviation(mat: torch.Tensor, eps: float = 1e-6) -> tuple[torch
     eye = torch.eye(n, device=mat.device, dtype=mat.dtype).unsqueeze(0)
     frob = (gram - eye).pow(2).sum(dim=(-2, -1)).sqrt()  # [s*b], one scalar per token
     return frob.mean(), (frob.amax() + eps) / (frob.median() + eps)
+
+
+def stream_gram_stats(
+    x: torch.Tensor, n: int, eps: float = 1e-6
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Geometry of the ``n`` hidden STREAMS themselves (not the ``H_res`` operator).
+
+    ``orthogonality_deviation`` measures the mixing MATRIX; this measures the frame it acts on.
+    Every other metric here reduces over the stream axis (``h_pre.mean()``, per-token row sums),
+    so a run where one stream carries the signal and the other ``n-1`` decay into noise — or
+    where all ``n`` collapse onto a single direction — looks perfectly healthy in all of them.
+    That is the blind spot this closes: stream-norm imbalance and inter-stream ``|cosine|`` are
+    the two ways the ``n``-stream residual can stop being ``n`` streams.
+
+    Args:
+        x: pre-aggregation hidden state ``[s, b, n*C]``, exactly the tensor
+            ``HyperConnectionModule.compute_mappings`` receives.
+        n: ``num_residual_streams``; read from the module, not inferred from ``x``.
+        eps: floor for the norm ratios / cosines (avoids 0/0 on a dead stream).
+
+    Returns, no host sync:
+      * ``stream_norm``               — ``[n]`` per-stream mean L2 norm (per-stream, not meaned
+        over the stream axis: a dominant stream is invisible in the mean).
+      * ``stream_norm_max_min_ratio`` — per-token max/min stream-norm ratio, meaned over tokens.
+      * ``gram_offdiag_abs_mean``     — mean |cosine| between distinct streams (0 = orthogonal,
+        ->1 = collapsed onto one direction).
+      * ``gram_offdiag_abs_max``      — worst |cosine| over the off-diagonal, meaned over tokens
+        (tail detector, mirroring ``orthogonality_deviation``'s max/median).
+    """
+    xs = x.reshape(-1, n, x.shape[-1] // n)  # [T, n, C], view
+    # Gram from raw streams, fp32 only on the [T,n,n] output: upcasting x first would cost a
+    # transient [T,n,C] fp32 copy (~134MB at s=8192,n=4,C=1024) inside the forward.
+    gram = torch.bmm(xs, xs.transpose(-2, -1)).float()  # [T, n, n]
+    norms = gram.diagonal(dim1=-2, dim2=-1).clamp_min(0).sqrt()  # [T, n]
+    cos = (gram / (norms.unsqueeze(-1) * norms.unsqueeze(-2)).clamp_min(eps)).abs()
+
+    off = ~torch.eye(n, device=xs.device, dtype=torch.bool)  # [n, n] off-diagonal mask
+    off_vals = cos[:, off]  # [T, n*(n-1)]
+    return (
+        norms.mean(dim=0),
+        ((norms.amax(dim=-1) + eps) / (norms.amin(dim=-1) + eps)).mean(),
+        off_vals.mean(),
+        off_vals.amax(dim=-1).mean(),
+    )
+
+
+def residual_energy_split(
+    residual: torch.Tensor,
+    output: torch.Tensor,
+    sublayer_out: torch.Tensor,
+    h_post: torch.Tensor,
+    h_res: torch.Tensor,
+    n: int,
+    rel_floor: float = 1e-6,
+) -> tuple[torch.Tensor, ...]:
+    """Per-token energy split of one hyper-connection update ``out = Q x + w``.
+
+    With ``x`` the ``n x C`` residual, ``Q = h_res``, ``o`` the sublayer output and
+    ``w = h_post o^T`` the write (``w_i = h_post_i * o``), the Frobenius energy of the
+    update is EXACTLY::
+
+        ||out||^2 = ||Qx||^2 + W + X
+            W = ||h_post||^2 ||o||^2
+            X = 2 <Qx, w> = 2 (Q^T h_post)^T d,   d_j = <x_j, o>
+
+    ``X`` is the term that neither an orthogonal ``h_res`` (R3-Cayley) nor a spherical
+    ``h_post`` (R5) constrains, and it is the only way a per-token residual norm can
+    *shrink* across a module. Measuring it is the whole point of these series: on R5 at
+    iter~2250 the attn3->mlp3 module lost 2.08e4 of energy, which is impossible without it.
+
+    ``d`` is the only ``C``-length work (``n`` inner products); the rest is ``[T, n]``
+    algebra on the already-fp32 mappings. No ``n*C x n*C`` operator is ever formed.
+
+    Two documented approximations:
+
+    * ``R = ||x||^2`` stands in for ``||Qx||^2``. They are equal iff ``Q`` is orthogonal
+      (exact under R3-Cayley to fp32 rounding; off by the Sinkhorn baseline's
+      non-orthogonality otherwise). Computing ``||Qx||^2`` would need the ``[T, n, n]``
+      stream Gram, 4x the flops of ``d``.
+    * ``d`` is a bf16 ``bmm`` (~0.4% relative), to avoid a second fp32 copy of the
+      residual inside the forward.
+
+    Args:
+        residual: pre-update residual ``x``, ``[s, b, n*C]`` (native contiguous layout,
+            so ``reshape(T, n, C)`` is a zero-copy view).
+        output: post-update residual ``out``, same shape.
+        sublayer_out: sublayer output ``o``, ``[s, b, C]``, BEFORE dropout — with
+            ``hidden_dropout > 0`` while training, ``resid_gain``'s bookkeeping check is
+            biased by exactly the dropped mass.
+        h_post: ``[s, b, n]`` write gate (fp32 from ``compute_mappings``).
+        h_res: ``[s, b, n, n]`` residual mixing (fp32).
+        n: ``num_residual_streams``, read from the module.
+        rel_floor: floor on the write energy, RELATIVE to ``R``. A token whose write
+            energy is negligible has no meaningful ``X/W`` or ``cos``; an absolute eps
+            would let such tokens contribute ~1e17 and destroy the means.
+
+    Returns 7 0-dim GPU tensors, no host sync, in the order the monitor declares them:
+    ``(write_over_resid, cross_over_resid, cross_over_write, mix_write_cos,
+    mix_write_cos_abs_max, resid_write_cos, resid_gain)``.
+    """
+    c = residual.shape[-1] // n
+    xs = residual.reshape(-1, n, c)  # [T, n, C], view
+    t = xs.shape[0]
+    d = torch.bmm(xs, sublayer_out.reshape(t, c, 1)).reshape(t, n).float()  # d_j = <x_j, o>
+
+    r = torch.linalg.vector_norm(residual, dim=-1, dtype=torch.float32).reshape(t).pow(2)
+    out_e = torch.linalg.vector_norm(output, dim=-1, dtype=torch.float32).reshape(t).pow(2)
+    o_e = torch.linalg.vector_norm(sublayer_out, dim=-1, dtype=torch.float32).reshape(t).pow(2)
+
+    hp = h_post.reshape(t, n).float()
+    w_e = hp.pow(2).sum(dim=-1) * o_e  # W
+    # (Q^T h_post)_j = sum_i h_res[i, j] h_post_i
+    qth = (h_res.reshape(t, n, n) * hp.unsqueeze(-1)).sum(dim=-2)
+    cross = 2.0 * (qth * d).sum(dim=-1)  # X = 2<Qx, w>
+    pre_cross = (hp * d).sum(dim=-1)  # <x, w>, pre-mix
+
+    rc = r.clamp_min(torch.finfo(torch.float32).tiny)
+    wc = w_e.clamp_min(rel_floor * rc)
+    cos = cross / (2.0 * (rc * wc).sqrt())
+    return (
+        (w_e / rc).mean(),
+        (cross / rc).mean(),
+        (cross / wc).mean(),
+        cos.mean(),
+        cos.abs().amax(),
+        (pre_cross / (rc * wc).sqrt()).mean(),
+        (out_e / rc).mean(),
+    )

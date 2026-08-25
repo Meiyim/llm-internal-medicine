@@ -13,7 +13,9 @@ mHC (Manifold-Constrained Hyper-Connections) model:
   deficit ``n - tr(H_res)`` (= the rank-1 ablation's erase strength ``beta``);
   its distance from the read-write outer product ``h_post (x) h_pre``; and
   ``Sigma``, its singular values on ``1^perp`` (min and mean) — the learnable part
-  of any mean-preserving mix, and the criterion for the R8 spectral-sphere runs.
+  of any mean-preserving mix, and the criterion for the R8 spectral-sphere runs. At
+  ``n = 4`` also its two ``SO(4)`` rotation angles, the pair ``beta = n - tr`` cannot
+  separate (it reads only their cosine sum).
 - the ``n`` residual **streams** themselves, from the module's own input: per-stream
   L2 norm, the per-token max/min norm ratio, and the inter-stream ``|cosine|``
   off-diagonal of the stream Gram (mean and per-token max). Everything above
@@ -26,8 +28,9 @@ mHC (Manifold-Constrained Hyper-Connections) model:
   module. See ``conf/mai_ladder/mhc/R7_NORM_CONTROL.md`` in the training repo.
 
 Per hyper-connection module (a layer has two: ``attn`` and ``mlp``) we emit
-``27 + n`` series, name-prefixed by component — mean-aggregated except the three
-orth_dev / cos ratios, the norm ratio and the Gram max, which are max-aggregated:
+``27 + n`` series (``29 + n`` at ``n = 4``), name-prefixed by component — mean-aggregated
+except the three orth_dev / cos ratios, the norm ratio and the Gram max, which are
+max-aggregated:
 
     {attn,mlp}_h_pre_mean   {attn,mlp}_h_pre_std
     {attn,mlp}_h_post_mean  {attn,mlp}_h_post_std
@@ -39,6 +42,7 @@ orth_dev / cos ratios, the norm ratio and the Gram max, which are max-aggregated
     {attn,mlp}_h_res_beta_mean          {attn,mlp}_h_res_beta_std
     {attn,mlp}_h_res_outer_dev
     {attn,mlp}_h_res_sigma_min          {attn,mlp}_h_res_sigma_mean
+    {attn,mlp}_h_res_theta_lo           {attn,mlp}_h_res_theta_hi      (n = 4 only)
     {attn,mlp}_stream_norm_0 .. _{n-1}  {attn,mlp}_stream_norm_max_min_ratio
     {attn,mlp}_stream_gram_offdiag_mean {attn,mlp}_stream_gram_offdiag_max
     {attn,mlp}_write_over_resid         {attn,mlp}_cross_over_resid
@@ -77,6 +81,7 @@ from .mhc_metrics import (
     outer_deviation,
     residual_energy_split,
     sigma_stats,
+    so4_angle_stats,
     stream_gram_stats,
 )
 
@@ -126,6 +131,15 @@ _STREAM_METRIC_NAMES = (
 
 def _stream_metric_names(n: int) -> tuple[str, ...]:
     return tuple(f"stream_norm_{i}" for i in range(n)) + _STREAM_METRIC_NAMES
+
+
+# The two rotation angles of an SO(4) h_res. Only declared at n = 4 (the formula's constants are
+# n-specific); n is a config constant, so the schema is still fixed before allocate_buffers.
+_SO4_METRIC_NAMES = ("h_res_theta_lo", "h_res_theta_hi")
+
+
+def _so4_metric_names(n: int) -> tuple[str, ...]:
+    return _SO4_METRIC_NAMES if n == 4 else ()
 
 
 # Energy split of one update, from ``fused_h_res_h_post_bda``. All ratios are per-token,
@@ -249,7 +263,8 @@ class MHCHealthMonitor(TorchProbe):
         if not entries:
             return []
         for global_idx, comp, mod in entries:
-            for name in _METRIC_NAMES + _stream_metric_names(int(mod.n)) + _ENERGY_METRIC_NAMES:
+            n = int(mod.n)
+            for name in _METRIC_NAMES + _stream_metric_names(n) + _so4_metric_names(n) + _ENERGY_METRIC_NAMES:
                 self.declare_layer_metric(global_idx, f"{comp}_{name}")
         # The chunk root = the attn hc of the lowest-index layer; it is the first
         # hc module executed on this stage, so it resets the composite each forward.
@@ -370,6 +385,12 @@ class MHCHealthMonitor(TorchProbe):
                     sig_min, sig_mean = sigma_stats(h_res)
                     self.record_layer_metric(layer_idx, f"{component}_h_res_sigma_min", sig_min)
                     self.record_layer_metric(layer_idx, f"{component}_h_res_sigma_mean", sig_mean)
+
+                    # The SO(4) conjugacy class needs BOTH angles; beta reads only their cosine sum.
+                    if n_streams == 4:
+                        theta_lo, theta_hi = so4_angle_stats(h_res)
+                        self.record_layer_metric(layer_idx, f"{component}_h_res_theta_lo", theta_lo)
+                        self.record_layer_metric(layer_idx, f"{component}_h_res_theta_hi", theta_hi)
 
                     # Composite mapping M_k = h_res_k @ M_{k-1} (per token).
                     s, b, n, _ = h_res.shape

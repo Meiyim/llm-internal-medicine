@@ -174,6 +174,49 @@ def sigma_stats(mat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return sig.amin(dim=-1).mean(), sig.mean()
 
 
+def so4_angle_stats(mat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """The TWO rotation angles of an ``n = 4`` ``H_res``, as token means, ascending.
+
+    An element of ``SO(4)`` is not one rotation: it splits into independent rotations by ``alpha``
+    and ``gamma`` on two invariant 2-planes, spectrum ``{e^{+-i alpha}, e^{+-i gamma}}``, and *that
+    pair* is the conjugacy class. ``erase_beta_stats`` reads only ``4 - tr = 4 - 2(cos alpha +
+    cos gamma)``, a sum — two runs at very different angle pairs can share a ``beta``. These two
+    series are the sufficient statistic ``beta`` is not, so they measure how much of ``SO(4)`` the
+    mix actually uses (R3-Cayley and R9 alike).
+
+    Both invariants come from elementwise algebra, no matmul and no eigendecomposition
+    (``eigvalsh`` / ``svdvals`` sync the host — see ``_eigvalsh_sym3``)::
+
+        s     = tr(Q) / 2                    = cos alpha + cos gamma
+        tr Q^2 = (Q * Q^T).sum((-2, -1))     = 4 (cos^2 alpha + cos^2 gamma) - 4
+        cc    = (s^2 - (tr Q^2 + 4) / 4) / 2 = cos alpha cos gamma
+
+    ``cos alpha, cos gamma`` are then the roots of ``z^2 - s z + cc``. The ``4``s are ``n``-specific:
+    this is for ``n = 4`` only, and the caller gates on that.
+
+    Only an ORTHOGONAL ``h_res`` (R3-Cayley, R9, R8b) has a conjugacy class for these to report; the
+    clamps keep the formula finite on any other mix, but the numbers then describe no ``SO(4)``
+    element.
+
+    Splitting the pair goes through ``sqrt((cos alpha - cos gamma)^2)``, which halves the significant
+    digits when the two angles nearly coincide, so from an fp32 ``h_res`` the SPREAD carries a noise
+    floor of ~3e-2 rad and is biased outward (``sqrt`` of a squared quantity plus noise). Do not read
+    a small ``theta_hi - theta_lo`` as real anisotropy. The floor shrinks as the angles separate
+    (~9e-4 rad at the isoclinic ``theta ~ 0.36`` where the R3 run sits, ~2e-7 by ``(1.0, 2.0)``), and
+    the mean of the two is always well conditioned — it is a reparameterization of ``tr(Q)``.
+    Accumulating in fp64 does not help: the loss happens in ``h_res``'s own fp32 rounding.
+
+    Returns two 0-dim GPU tensors ``(theta_lo_mean, theta_hi_mean)`` in radians; no host sync.
+    """
+    s = mat.diagonal(dim1=-2, dim2=-1).sum(dim=-1) * 0.5  # [s, b]
+    tr_sq = (mat * mat.transpose(-2, -1)).sum(dim=(-2, -1))  # tr(Q^2), no matmul
+    cc = 0.5 * (s.pow(2) - 0.25 * (tr_sq + 4.0))
+    disc = (s.pow(2) - 4.0 * cc).clamp_min(0).sqrt()
+    lo = torch.acos((0.5 * (s + disc)).clamp(-1.0, 1.0))  # larger cos = smaller angle
+    hi = torch.acos((0.5 * (s - disc)).clamp(-1.0, 1.0))
+    return lo.mean(), hi.mean()
+
+
 def stream_gram_stats(
     x: torch.Tensor, n: int, eps: float = 1e-6
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:

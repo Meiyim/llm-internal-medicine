@@ -7,7 +7,7 @@
 - **[QK Stats](./docs/qk_logits.md)** — 注意力 QK 统计监控 (9 指标)
 - **[Massive Activation Health](./docs/massive_activation.md)** — Residual Stream Massive Activation 健康监控 (21 指标)
 - **[PLE Health](./docs/ple_health.md)** — Per-Layer Embedding 健康监控 (7 指标)
-- **[mHC Health](./docs/mhc_health.md)** — Manifold-Constrained Hyper-Connections 映射与多流几何监控 (每 hc 模块 `27 + n` 指标；仅在开启 mHC 层时生效)
+- **[mHC Health](./docs/mhc_health.md)** — Manifold-Constrained Hyper-Connections 映射与多流几何监控 (每 hc 模块 `27 + n` 指标，`n = 4` 时 `29 + n`；仅在开启 mHC 层时生效)
 - **[LAR (Log-Alignment Ratio)](./docs/lar.md)** — output_layer + 每个 MoE router 的 LAR，泛化/过拟合诊断信号（无 SVD、每步 O(1) 通信）
 
 外加一个非指标类工具：
@@ -316,7 +316,8 @@ Massive activations 是 pre-norm Transformer 的**架构副产品**，独立于�
 这些映射所作用的 `n` 条残差流本身的几何，以及每次更新 `out = h_res x + w`（`w = h_post oᵗ`）的能量分解
 `‖out‖² = ‖h_res x‖² + W + X`。只在模型开启 mHC 层时生效——mHC 类无法 import 或模型不含
 `HyperConnectionTransformerLayer` 时该 monitor 为彻底 no-op（不 wrap、不产生指标）。每层含两个
-hyper-connection 模块（`attn` / `mlp`），各产出以下 `27 + n` 个指标（`n = num_residual_streams`），
+hyper-connection 模块（`attn` / `mlp`），各产出以下 `27 + n` 个指标（`n = num_residual_streams`；`n = 4`
+时另加两条 `＋` 标记的 `SO(4)` 转角序列，共 `29 + n`，它们不参与下表编号），
 指标名以 `attn_` / `mlp_` 前缀区分；除两个 `*_max_med_ratio`、`*_stream_norm_max_min_ratio`、
 `*_stream_gram_offdiag_max`、`*_mix_write_cos_abs_max`（按 max 聚合）外全部按 token/batch 求均值。
 
@@ -339,6 +340,8 @@ hyper-connection 模块（`attn` / `mlp`），各产出以下 `27 + n` 个指标
 | 15 | `{c}_h_res_outer_dev` | `mhc_health/layer_{i}/{c}_h_res_outer_dev` | `mean_t(\|\|h_res − h_post ⊗ h_pre\|\|_F)` | 每层+全局 | 残差混合中「读写外积」解释不掉的部分 |
 | 16 | `{c}_h_res_sigma_min` | `mhc_health/layer_{i}/{c}_h_res_sigma_min` | `mean_t(min_k σ_k)`，`σ = svdvals(h_res \|_{1^⊥})` | 每层+全局 | 保均值混合在 `1^⊥` 上的最弱方向：1 = 等距，→0 = `h_res → J`（每条流被流均值取代，弱于普通残差）；R8 谱球面的判据 |
 | 17 | `{c}_h_res_sigma_mean` | `mhc_health/layer_{i}/{c}_h_res_sigma_mean` | `mean_t(mean_k σ_k)` | 每层+全局 | 同上取均值；单看它会漏掉「`n−1` 个方向里塌了 1 个」，必须与 `sigma_min` 对读 |
+| ＋ | `{c}_h_res_theta_lo` | `mhc_health/layer_{i}/{c}_h_res_theta_lo` | `min(α, γ)`，`{e^{±iα}, e^{±iγ}} = spec(h_res)`，闭式（无特征分解） | 每层+全局（**仅 `n = 4`**） | `SO(4)` 元素由**两个**转角刻画，这一对才是共轭类；`β = n − tr` 只读到 `cos α + cos γ` 这个和，分不开它们 |
+| ＋ | `{c}_h_res_theta_hi` | `mhc_health/layer_{i}/{c}_h_res_theta_hi` | `max(α, γ)`，同上 | 每层+全局（**仅 `n = 4`**） | 与 `theta_lo` 一起量出 `h_res` 实际用掉多少 `SO(4)`（R3-Cayley / R9 / R8b）；两角接近时**差值**有 ~3e-2 rad 噪声底，不可当各向异性读 |
 | 18..17+n | `{c}_stream_norm_{k}` | `mhc_health/layer_{i}/{c}_stream_norm_{k}` | `mean_t(\|\|x_k\|\|₂)`，`k = 0..n−1` | 每层+全局 | 第 `k` 条残差流的量级（**逐流**，均值看不见主导流） |
 | 18+n | `{c}_stream_norm_max_min_ratio` | `mhc_health/layer_{i}/{c}_stream_norm_max_min_ratio` | `mean_t((max_k \|\|x_k\|\| + ε)/(min_k \|\|x_k\|\| + ε))` | 每层+全局（**max** 聚合） | 流间量级失衡：1.0 = 均衡，↑ = 出现主导流 |
 | 19+n | `{c}_stream_gram_offdiag_mean` | `mhc_health/layer_{i}/{c}_stream_gram_offdiag_mean` | `mean_t mean_{j≠k} \|cos(x_j, x_k)\|` | 每层+全局 | 流间方向冗余：0 = 相互正交，→1 = 塌缩到同一方向 |

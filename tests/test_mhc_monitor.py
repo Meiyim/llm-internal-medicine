@@ -1,4 +1,5 @@
 import importlib
+import math
 import sys
 import unittest
 from pathlib import Path
@@ -79,6 +80,41 @@ def _energy_split(h_res, x, o, h_post):
     w_e = h_post.pow(2).sum(-1) * o.pow(2).sum(-1)
     cross = 2.0 * (mixed * w).sum(dim=(-2, -1))
     return dict(zip(ENERGY_NAMES, vals, strict=True)), (r, w_e, cross, out, mixed, w)
+
+
+def _canonical_so4(alpha, gamma, dtype=torch.float64):
+    """Canonical SO(4): rotation by ``alpha`` on span(e0, e1), by ``gamma`` on span(e2, e3)."""
+
+    def rot(t):
+        c, s = math.cos(t), math.sin(t)
+        return torch.tensor([[c, -s], [s, c]], dtype=dtype)
+
+    m = torch.zeros(4, 4, dtype=dtype)
+    m[:2, :2] = rot(alpha)
+    m[2:, 2:] = rot(gamma)
+    return m
+
+
+def _conjugate_so4(m, seed):
+    """Random ``P m P^T``, ``P`` in SO(4) — same conjugacy class, so the same angle pair."""
+    torch.manual_seed(seed)
+    p, _ = torch.linalg.qr(torch.randn(4, 4, dtype=m.dtype))
+    if torch.linalg.det(p) < 0:
+        p[:, 0] = -p[:, 0]
+    return p @ m @ p.T
+
+
+def _quat_pair_so4(q, r):
+    """``L_q R_rbar``, i.e. ``x -> q x rbar`` — the R9 parameterization, built the explicit way.
+
+    The training repo's patch never forms these two factors (that is the point of its constant
+    GEMM); here they keep the fixture independent of it.
+    """
+    qw, qx, qy, qz = q
+    rw, rx, ry, rz = r
+    left = torch.tensor([[qw, -qx, -qy, -qz], [qx, qw, -qz, qy], [qy, qz, qw, -qx], [qz, -qy, qx, qw]], dtype=q.dtype)
+    right = torch.tensor([[rw, rx, ry, rz], [-rx, rw, -rz, ry], [-ry, rz, rw, -rx], [-rz, -ry, rx, rw]], dtype=r.dtype)
+    return left @ right
 
 
 class MHCMetricsTest(unittest.TestCase):
@@ -218,6 +254,87 @@ class MHCMetricsTest(unittest.TestCase):
         s_min, s_mean = mhc_metrics.sigma_stats(h.reshape(1, 1, n, n))
         self.assertAlmostEqual(s_min.item(), 0.0, places=5)
         self.assertAlmostEqual(s_mean.item(), 2.0 / 3.0, places=5)
+
+    def test_so4_angles_recover_a_planted_conjugated_pair(self):
+        # The angle pair IS the conjugacy class, so a random SO(4) conjugation must not move it.
+        for alpha, gamma in ((0.4, 1.9), (1.0, 2.0), (0.15, 0.9), (2.5, 3.0)):
+            m = _conjugate_so4(_canonical_so4(alpha, gamma), seed=7)
+            lo, hi = mhc_metrics.so4_angle_stats(m.reshape(1, 1, 4, 4))
+            self.assertAlmostEqual(lo.item(), min(alpha, gamma), places=7)
+            self.assertAlmostEqual(hi.item(), max(alpha, gamma), places=7)
+
+    def test_so4_angles_match_the_spectrum_on_haar_samples(self):
+        # Cross-check the closed form against eigvals (which a hook may not call) over the group.
+        torch.manual_seed(3)
+        for _ in range(20):
+            p, _ = torch.linalg.qr(torch.randn(4, 4, dtype=torch.float64))
+            if torch.linalg.det(p) < 0:
+                p[:, 0] = -p[:, 0]
+            want = sorted({round(abs(torch.angle(e).item()), 9) for e in torch.linalg.eigvals(p)})
+            lo, hi = mhc_metrics.so4_angle_stats(p.reshape(1, 1, 4, 4))
+            self.assertAlmostEqual(lo.item(), want[0], places=7)
+            self.assertAlmostEqual(hi.item(), want[-1], places=7)
+
+    def test_so4_angles_on_the_three_boundary_points(self):
+        eye = torch.eye(4, dtype=torch.float64)
+        for m, want in (
+            (eye, (0.0, 0.0)),
+            (torch.diag(torch.tensor([-1.0, -1.0, 1.0, 1.0], dtype=torch.float64)), (0.0, math.pi)),
+            (-eye, (math.pi, math.pi)),
+        ):
+            lo, hi = mhc_metrics.so4_angle_stats(m.reshape(1, 1, 4, 4))
+            self.assertAlmostEqual(lo.item(), want[0], places=3)
+            self.assertAlmostEqual(hi.item(), want[1], places=3)
+
+    def test_so4_angles_separate_a_pair_beta_cannot(self):
+        # Why these series exist: beta = 4 - tr reads only cos alpha + cos gamma, so it is blind to
+        # any move along that level set. Two very different mixes, one identical beta.
+        alpha, gamma = 1.0, 2.0
+        other_alpha = 0.2
+        other_gamma = math.acos(math.cos(alpha) + math.cos(gamma) - math.cos(other_alpha))
+        a = _canonical_so4(alpha, gamma).reshape(1, 1, 4, 4).expand(2, 1, 4, 4)
+        b = _canonical_so4(other_alpha, other_gamma).reshape(1, 1, 4, 4).expand(2, 1, 4, 4)
+        self.assertAlmostEqual(
+            mhc_metrics.erase_beta_stats(a)[0].item(), mhc_metrics.erase_beta_stats(b)[0].item(), places=9
+        )
+        a_lo, a_hi = mhc_metrics.so4_angle_stats(a)
+        b_lo, b_hi = mhc_metrics.so4_angle_stats(b)
+        self.assertGreater(abs(a_lo.item() - b_lo.item()), 0.5)
+        self.assertGreater(abs(a_hi.item() - b_hi.item()), 0.5)
+
+    def test_so4_isoclinic_slice_is_where_beta_is_one_angle(self):
+        # On alpha == gamma the two series collapse onto beta's single angle: beta = 4(1 - cos theta).
+        for theta in (0.1, 0.36, 1.2):
+            m = _conjugate_so4(_canonical_so4(theta, theta), seed=11).reshape(1, 1, 4, 4).expand(2, 1, 4, 4)
+            lo, hi = mhc_metrics.so4_angle_stats(m)
+            self.assertAlmostEqual(lo.item(), theta, places=4)
+            self.assertAlmostEqual(hi.item(), theta, places=4)
+            beta = mhc_metrics.erase_beta_stats(m)[0].item()
+            self.assertAlmostEqual(beta, 4.0 * (1.0 - math.cos(theta)), places=7)
+
+    def test_so4_angles_on_a_quaternion_pair_h_res(self):
+        # R9's H_res: x -> q x rbar rotates by theta_q + theta_r and by |theta_q - theta_r|
+        # (cos theta = the w component), which is why one quaternion could not cover SO(4).
+        tq, tr = 0.5, 1.1
+        axis = torch.tensor([1.0, -2.0, 0.5], dtype=torch.float64)
+        axis = axis / axis.norm()
+        q = torch.cat([torch.tensor([math.cos(tq)], dtype=torch.float64), math.sin(tq) * axis])
+        r = torch.cat([torch.tensor([math.cos(tr)], dtype=torch.float64), math.sin(tr) * axis])
+        m = _quat_pair_so4(q, r)
+        self.assertLess((m.T @ m - torch.eye(4, dtype=torch.float64)).abs().amax().item(), 1e-12)
+        lo, hi = mhc_metrics.so4_angle_stats(m.reshape(1, 1, 4, 4))
+        self.assertAlmostEqual(lo.item(), tr - tq, places=7)
+        self.assertAlmostEqual(hi.item(), tq + tr, places=7)
+
+    def test_so4_angles_stay_finite_on_a_non_orthogonal_mix(self):
+        # The Sinkhorn baseline has no conjugacy class; the clamps must still keep the read finite.
+        torch.manual_seed(5)
+        m = torch.rand(6, 2, 4, 4)
+        for _ in range(20):  # crude Sinkhorn to doubly stochastic
+            m = m / m.sum(-1, keepdim=True)
+            m = m / m.sum(-2, keepdim=True)
+        for t in mhc_metrics.so4_angle_stats(m):
+            self.assertTrue(torch.isfinite(t).all(), t)
 
     def test_stream_gram_on_an_orthogonal_frame(self):
         # 4 orthogonal streams with norms 1..4: per-stream norms recovered exactly, the
@@ -418,6 +535,8 @@ class MHCMonitorTest(unittest.TestCase):
                 "h_res_outer_dev",
                 "h_res_sigma_min",
                 "h_res_sigma_mean",
+                "h_res_theta_lo",
+                "h_res_theta_hi",
                 "stream_norm_max_min_ratio",
                 "stream_gram_offdiag_mean",
                 "stream_gram_offdiag_max",
@@ -442,6 +561,9 @@ class MHCMonitorTest(unittest.TestCase):
             # h_res == I is a mean-preserving isometry: sigma is flat 1 on 1^perp.
             self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_sigma_min"], 1.0, places=5)
             self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_sigma_mean"], 1.0, places=5)
+            # ...and it rotates by nothing: both SO(4) angles are 0 (fp32 acos floor near cos = 1).
+            self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_theta_lo"], 0.0, places=3)
+            self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_theta_hi"], 0.0, places=3)
         # global aggregate is derived too.
         self.assertIn("mhc_health/global_attn_amax_gain_fwd", latest)
         # the ratios are max-aggregated end to end: monitor buffer + training_logs suffix.
@@ -479,6 +601,66 @@ class MHCMonitorTest(unittest.TestCase):
         self.assertIn("attn_stream_gram_offdiag_max", MHCHealthMonitor.MAX_AGGREGATED)
         self.assertTrue(training_logs._is_max_metric("mhc_health/layer_0/attn_stream_norm_max_min_ratio"))
         self.assertTrue(training_logs._is_max_metric("mhc_health/layer_0/attn_stream_gram_offdiag_max"))
+
+    def test_so4_angle_series_reach_the_logs_from_a_quaternion_pair_h_res(self):
+        # End to end on an R9-shaped h_res: the two angles must survive the hook, the fp32 buffer
+        # and the flush, and land at the pair the construction planted.
+        n, s, b = 4, 3, 2
+        tq, tr = 0.5, 1.1
+        axis = torch.tensor([1.0, -2.0, 0.5], dtype=torch.float64)
+        axis = axis / axis.norm()
+        q = torch.cat([torch.tensor([math.cos(tq)], dtype=torch.float64), math.sin(tq) * axis])
+        r = torch.cat([torch.tensor([math.cos(tr)], dtype=torch.float64), math.sin(tr) * axis])
+        h_res = _quat_pair_so4(q, r).float().reshape(1, 1, n, n).expand(s, b, n, n).contiguous()
+
+        def make_hc():
+            return FakeHC(
+                n=n,
+                layer_number=1,
+                h_pre=torch.full((s, b, n), 0.5),
+                h_post=torch.ones(s, b, n),
+                h_res=h_res,
+            )
+
+        model = _mhc_model([FakeLayer(layer_number=1, attn=make_hc(), mlp=make_hc())])
+        monitor = MHCHealthMonitor(log_per_layer=True, log_global=True)
+        targets = monitor._prepare_layers(model, chunk_id=0)
+        monitor.allocate_buffers(torch.device("cpu"))
+        monitor._attach_hooks(targets)
+        self._drive(targets, x_dim=n * 8)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="mhc_health")
+        for comp in ("attn", "mlp"):
+            self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_theta_lo"], tr - tq, places=4)
+            self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_theta_hi"], tq + tr, places=4)
+            # constructively orthogonal, and beta only sees the cosine sum of the two angles
+            self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_orth_dev"], 0.0, places=5)
+            self.assertAlmostEqual(
+                latest[f"mhc_health/layer_0/{comp}_h_res_beta_mean"],
+                4.0 - 2.0 * (math.cos(tq + tr) + math.cos(tr - tq)),
+                places=4,
+            )
+        # mean-aggregated: no _max suffix, so nothing to add to MAX_AGGREGATED
+        self.assertNotIn("attn_h_res_theta_hi", MHCHealthMonitor.MAX_AGGREGATED)
+        self.assertFalse(training_logs._is_max_metric("mhc_health/layer_0/attn_h_res_theta_hi"))
+
+    def test_so4_angle_series_are_absent_when_n_is_not_four(self):
+        # The formula's constants are n-specific, so the schema must not declare them at n != 4.
+        n, s, b = 3, 2, 2
+        self.assertEqual(mhc_monitor._so4_metric_names(n), ())
+        model = _mhc_model([self._identity_layer(n, s, b, layer_number=1)])
+        monitor = MHCHealthMonitor(log_per_layer=True, log_global=True)
+        targets = monitor._prepare_layers(model, chunk_id=0)
+        monitor.allocate_buffers(torch.device("cpu"))
+        monitor._attach_hooks(targets)
+        self._drive(targets, x_dim=n * 8)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="mhc_health")
+        self.assertIn("mhc_health/layer_0/attn_h_res_sigma_min", latest)
+        self.assertNotIn("mhc_health/layer_0/attn_h_res_theta_lo", latest)
+        self.assertNotIn("mhc_health/layer_0/attn_h_res_theta_hi", latest)
 
     def _bda_case(self, targets, n, c, s, b, bias=None):
         """Drive every wrapped bda with a known update; return the expected mean Out/R."""

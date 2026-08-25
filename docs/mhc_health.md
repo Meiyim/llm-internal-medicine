@@ -68,7 +68,8 @@ internal_medicine_monitors:
 
 ## 监控指标
 
-每个 hc 模块产出 `27 + n` 个指标（`n` 条逐流 norm），指标名以 `attn_` / `mlp_` 前缀区分。除两个
+每个 hc 模块产出 `27 + n` 个指标（`n` 条逐流 norm）；`n = 4` 时另加两条 `SO(4)` 转角序列
+（`h_res_theta_lo` / `h_res_theta_hi`），共 `29 + n`。指标名以 `attn_` / `mlp_` 前缀区分。除两个
 `*_orth_dev_max_med_ratio`、`*_stream_norm_max_min_ratio`、`*_stream_gram_offdiag_max`、
 `*_mix_write_cos_abs_max` 按 **max** 合成外，
 其余全部按 token/batch 求均值（并在 flush 时对 microbatch/rank 求均值）。日志键形如
@@ -117,6 +118,8 @@ amax_gain_bwd = mean_t( max_j | Σ_i  M_ij | )      # 列和（backward）
 | `{c}_h_res_outer_dev` | `mean_t( \|\| h_res − h_post ⊗ h_pre \|\|_F )` | 残差混合中「读写外积」解释不掉的部分 |
 | `{c}_h_res_sigma_min` | `mean_t( min_k σ_k )`，`σ = svdvals(h_res \|_{1^⊥})` | `1^⊥` 上最弱方向的增益：1 = 等距，→0 = `h_res → J` |
 | `{c}_h_res_sigma_mean` | `mean_t( mean_k σ_k )` | 同上取均值；必须与 `sigma_min` 对读 |
+| `{c}_h_res_theta_lo` | `min(α, γ)`，`spec(h_res) = {e^{±iα}, e^{±iγ}}`（闭式，无特征分解；**仅 `n = 4`**） | `SO(4)` 的共轭类是这**一对**转角 |
+| `{c}_h_res_theta_hi` | `max(α, γ)`，同上 | `h_res` 实际用掉多少 `SO(4)`；两角接近时差值有 ~3e-2 rad 噪声底 |
 
 **max/median 比值：均值抓不到的尾巴。** `orth_dev` 是 token 均值，所以「少数 token 完全不正交」和「全体精确正交」
 在日志上可以长得一模一样：R3 的 15 步 Schulz 迭代掉出收敛盆的 token 占比约 1e-3，均值全程显示 `0.00000`，
@@ -142,6 +145,17 @@ Cayley 参数化下构造上恒为 1.0；迭代式正交化（Schulz）与 Sinkh
 `n−1` 个方向里塌掉 1 个，均值仍然读得很健康。非仿射的 `h_res`（R1 恒等、R3-Cayley、R4 擦除）下 `1^⊥` 并不不变，
 此时读到的是 `HᵗH` 压缩到 `1^⊥` 上的谱 —— 仍被 `‖h_res‖₂` 界住，但不再是算子的分解。
 `n = 4`（即 `m = 3`）走闭式三次特征值解（Cardano），因为 `eigvalsh`/`svdvals` 会同步 host，hook 内不允许。
+
+**两个转角：`SO(4)` 的共轭类不是一个角。** `SO(4)` 的元素不是「一个转动」——它分裂成两个不变 2-平面上各自
+按 `α`、`γ` 的独立转动，谱为 `{e^{±iα}, e^{±iγ}}`，**这一对**才是共轭类。而 `β = n − tr(h_res) = 4 − 2(cos α + cos γ)`
+只读到两个余弦的**和**：`(α, γ) = (1.0, 2.0)` 与 `(0.2, 2.5981)` 的 `β` 同为 3.7517，前者两个平面都在中等角度上转，
+后者近乎「一个平面几乎不动、另一个几乎翻转」，是完全不同的算子。`theta_lo/hi` 把这两种情形分开（相差 > 0.5 rad），
+也直接量出等倾（`α = γ`）的偏离程度 —— R3-Cayley 的 β ∈ [0.253, 0.291] 一直被当成等倾 `θ ≈ 0.36` 读，这条曲线
+是该假设第一次可验证。两个不变量都来自逐元素代数（`tr Q` 与 `tr Q² = (Q ⊙ Qᵗ).sum`），无 matmul、无特征分解。
+**只有 `h_res` 正交时**（R3-Cayley / R9 / R8b）这两个数才是共轭类角；其他混合上 clamp 保证读数有限，但不描述
+任何 `SO(4)` 元素。分开两角要过 `sqrt((cos α − cos γ)²)`，两角接近时有效位折半，故**差值**有 ~3e-2 rad 的 fp32
+噪声底且系统性偏大（等倾 `θ ≈ 0.36` 处降到 ~9e-4，`(1.0, 2.0)` 处 ~2e-7）；均值恒稳（它是 `tr Q` 的重参数化）。
+用 fp64 累加没用 —— 精度丢在 `h_res` 自己的 fp32 舍入里。
 
 ### 多流几何（stream 本身，而非映射）
 

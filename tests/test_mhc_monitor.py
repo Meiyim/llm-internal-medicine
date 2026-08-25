@@ -170,6 +170,55 @@ class MHCMetricsTest(unittest.TestCase):
         _, ratio = mhc_metrics.orthogonality_deviation(mats)
         self.assertAlmostEqual(ratio.item(), 24.0 / 8.0, places=3)
 
+    def test_sym3_eigvals_match_linalg(self):
+        # The closed form replaces eigvalsh only to avoid its host sync; it must agree with it.
+        torch.manual_seed(0)
+        a = torch.randn(4096, 3, 3, dtype=torch.float64)
+        a = a + a.transpose(-2, -1)
+        got = mhc_metrics._eigvalsh_sym3(a)
+        want = torch.linalg.eigvalsh(a)  # ascending
+        self.assertLess((got - want).abs().amax().item(), 1e-10)
+
+    def test_sigma_stats_recovers_a_planted_spectrum(self):
+        # H = I + Q (diag(sigma) - I) Q^T with Q an orthonormal basis of 1^perp: the singular
+        # values on 1^perp ARE sigma, and this is how R8's H_res is built.
+        n, s, b = 4, 3, 2
+        q = mhc_metrics._complement_basis(n, torch.device("cpu"), torch.float64)
+        sig = torch.tensor([0.2, 0.55, 0.9], dtype=torch.float64)
+        eye_m = torch.eye(n - 1, dtype=torch.float64)
+        h = torch.eye(n, dtype=torch.float64) + q @ (torch.diag(sig) - eye_m) @ q.T
+        mats = h.reshape(1, 1, n, n).expand(s, b, n, n).contiguous()
+        s_min, s_mean = mhc_metrics.sigma_stats(mats)
+        self.assertAlmostEqual(s_min.item(), 0.2, places=8)
+        self.assertAlmostEqual(s_mean.item(), sig.mean().item(), places=8)
+
+    def test_sigma_stats_is_flat_one_on_a_mean_preserving_isometry(self):
+        # R8b's contract, and the isotropic (p2 == 0) branch of the closed form: exactly 1.0,
+        # not 1 +- the eigensolver's degeneracy floor.
+        n, s, b = 4, 8, 4
+        ident = torch.eye(n).reshape(1, 1, n, n).expand(s, b, n, n).contiguous()
+        s_min, s_mean = mhc_metrics.sigma_stats(ident)
+        self.assertAlmostEqual(s_min.item(), 1.0, places=6)
+        self.assertAlmostEqual(s_mean.item(), 1.0, places=6)
+
+    def test_sigma_stats_reads_zero_on_the_stream_mean_collapse(self):
+        # H_res = J replaces every stream by the stream mean: sigma == 0, the R8a alarm.
+        n, s, b = 4, 2, 3
+        j = torch.full((n, n), 1.0 / n).reshape(1, 1, n, n).expand(s, b, n, n).contiguous()
+        s_min, s_mean = mhc_metrics.sigma_stats(j)
+        self.assertAlmostEqual(s_min.item(), 0.0, places=6)
+        self.assertAlmostEqual(s_mean.item(), 0.0, places=6)
+
+    def test_sigma_min_sees_one_collapsed_direction_the_mean_hides(self):
+        # The amax_gain lesson: 1 of n-1 directions gone still reads a healthy 0.67 mean.
+        n = 4
+        q = mhc_metrics._complement_basis(n, torch.device("cpu"), torch.float32)
+        sig = torch.tensor([0.0, 1.0, 1.0])
+        h = torch.eye(n) + q @ (torch.diag(sig) - torch.eye(n - 1)) @ q.T
+        s_min, s_mean = mhc_metrics.sigma_stats(h.reshape(1, 1, n, n))
+        self.assertAlmostEqual(s_min.item(), 0.0, places=5)
+        self.assertAlmostEqual(s_mean.item(), 2.0 / 3.0, places=5)
+
     def test_stream_gram_on_an_orthogonal_frame(self):
         # 4 orthogonal streams with norms 1..4: per-stream norms recovered exactly, the
         # imbalance shows up in the ratio (a stream-axis mean would report a flat 2.5).
@@ -367,6 +416,8 @@ class MHCMonitorTest(unittest.TestCase):
                 "h_res_beta_mean",
                 "h_res_beta_std",
                 "h_res_outer_dev",
+                "h_res_sigma_min",
+                "h_res_sigma_mean",
                 "stream_norm_max_min_ratio",
                 "stream_gram_offdiag_mean",
                 "stream_gram_offdiag_max",
@@ -388,6 +439,9 @@ class MHCMonitorTest(unittest.TestCase):
             self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_beta_mean"], 0.0, places=5)
             self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_beta_std"], 0.0, places=5)
             self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_outer_dev"], 2.0, places=5)
+            # h_res == I is a mean-preserving isometry: sigma is flat 1 on 1^perp.
+            self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_sigma_min"], 1.0, places=5)
+            self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_sigma_mean"], 1.0, places=5)
         # global aggregate is derived too.
         self.assertIn("mhc_health/global_attn_amax_gain_fwd", latest)
         # the ratios are max-aggregated end to end: monitor buffer + training_logs suffix.

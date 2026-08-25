@@ -68,7 +68,7 @@ internal_medicine_monitors:
 
 ## 监控指标
 
-每个 hc 模块产出 `25 + n` 个指标（`n` 条逐流 norm），指标名以 `attn_` / `mlp_` 前缀区分。除两个
+每个 hc 模块产出 `27 + n` 个指标（`n` 条逐流 norm），指标名以 `attn_` / `mlp_` 前缀区分。除两个
 `*_orth_dev_max_med_ratio`、`*_stream_norm_max_min_ratio`、`*_stream_gram_offdiag_max`、
 `*_mix_write_cos_abs_max` 按 **max** 合成外，
 其余全部按 token/batch 求均值（并在 flush 时对 microbatch/rank 求均值）。日志键形如
@@ -115,6 +115,8 @@ amax_gain_bwd = mean_t( max_j | Σ_i  M_ij | )      # 列和（backward）
 | `{c}_h_res_beta_mean` | `mean_t( n − tr(h_res) )` | rank-1 擦除强度 β |
 | `{c}_h_res_beta_std` | `std_t( n − tr(h_res) )` | β 的 token 级离散度：→0 说明退化成逐层常数 |
 | `{c}_h_res_outer_dev` | `mean_t( \|\| h_res − h_post ⊗ h_pre \|\|_F )` | 残差混合中「读写外积」解释不掉的部分 |
+| `{c}_h_res_sigma_min` | `mean_t( min_k σ_k )`，`σ = svdvals(h_res \|_{1^⊥})` | `1^⊥` 上最弱方向的增益：1 = 等距，→0 = `h_res → J` |
+| `{c}_h_res_sigma_mean` | `mean_t( mean_k σ_k )` | 同上取均值；必须与 `sigma_min` 对读 |
 
 **max/median 比值：均值抓不到的尾巴。** `orth_dev` 是 token 均值，所以「少数 token 完全不正交」和「全体精确正交」
 在日志上可以长得一模一样：R3 的 15 步 Schulz 迭代掉出收敛盆的 token 占比约 1e-3，均值全程显示 `0.00000`，
@@ -131,6 +133,15 @@ Cayley 参数化下构造上恒为 1.0；迭代式正交化（Schulz）与 Sinkh
 `h_post_i · Σ_j h_pre_j·x_j`，所以与 `h_res` 下标同序的 rank-1 矩阵是 `h_post ⊗ h_pre`（元素 `[i,j] = h_post_i·h_pre_j`），
 本指标即残差混合与这个读写外积的 Frobenius 距离。注意它未减掉恒等分量，所以近似恒等的 `h_res` 会有一个 `√n` 量级的底；
 对称的 `h_res`（如 rank-1 擦除）两个下标方向给出同一个值，方向只在 dense/正交构型下才有区别。
+
+**Σ：保均值混合在 `1^⊥` 上的谱。** 任何保均值的混合（`H·1 = 1`、`1ᵗH = 1ᵗ` —— R8 的谱球面**和** Sinkhorn 基线都满足）
+都保持 `1^⊥` 不变，于是 `QᵗHᵗHQ = Σ²`（`Q` 为 `1^⊥` 的任一正交基），等价地 `svdvals(H) = {1} ∪ {|σ_i|}`：
+`1` 方向被固定、不含信息，`Σ` 才是这个算子全部可学的部分。**这是 R8a 唯一的判据** —— `σ → 1` 是模型自己在要求
+一个保均值的**等距**（R8b 直接硬编码了它，因此 R8b 必须读到平坦的 1.0）；`σ → 0` 则是 `h_res → J`，
+每条流被流均值取代，即比普通残差**更弱**的 rank-1 塌缩。同时给 `min` 与 `mean` 是 `amax_gain` 的教训：
+`n−1` 个方向里塌掉 1 个，均值仍然读得很健康。非仿射的 `h_res`（R1 恒等、R3-Cayley、R4 擦除）下 `1^⊥` 并不不变，
+此时读到的是 `HᵗH` 压缩到 `1^⊥` 上的谱 —— 仍被 `‖h_res‖₂` 界住，但不再是算子的分解。
+`n = 4`（即 `m = 3`）走闭式三次特征值解（Cardano），因为 `eigvalsh`/`svdvals` 会同步 host，hook 内不允许。
 
 ### 多流几何（stream 本身，而非映射）
 

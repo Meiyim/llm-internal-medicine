@@ -11,7 +11,9 @@ mHC (Manifold-Constrained Hyper-Connections) model:
   chunk); its deviation from orthogonality (token mean, plus a max/median ratio
   over tokens that catches a non-orthogonal tail the mean hides); its trace
   deficit ``n - tr(H_res)`` (= the rank-1 ablation's erase strength ``beta``);
-  and its distance from the read-write outer product ``h_post (x) h_pre``.
+  its distance from the read-write outer product ``h_post (x) h_pre``; and
+  ``Sigma``, its singular values on ``1^perp`` (min and mean) — the learnable part
+  of any mean-preserving mix, and the criterion for the R8 spectral-sphere runs.
 - the ``n`` residual **streams** themselves, from the module's own input: per-stream
   L2 norm, the per-token max/min norm ratio, and the inter-stream ``|cosine|``
   off-diagonal of the stream Gram (mean and per-token max). Everything above
@@ -24,7 +26,7 @@ mHC (Manifold-Constrained Hyper-Connections) model:
   module. See ``conf/mai_ladder/mhc/R7_NORM_CONTROL.md`` in the training repo.
 
 Per hyper-connection module (a layer has two: ``attn`` and ``mlp``) we emit
-``25 + n`` series, name-prefixed by component — mean-aggregated except the three
+``27 + n`` series, name-prefixed by component — mean-aggregated except the three
 orth_dev / cos ratios, the norm ratio and the Gram max, which are max-aggregated:
 
     {attn,mlp}_h_pre_mean   {attn,mlp}_h_pre_std
@@ -36,6 +38,7 @@ orth_dev / cos ratios, the norm ratio and the Gram max, which are max-aggregated
     {attn,mlp}_composite_h_res_orth_dev_max_med_ratio
     {attn,mlp}_h_res_beta_mean          {attn,mlp}_h_res_beta_std
     {attn,mlp}_h_res_outer_dev
+    {attn,mlp}_h_res_sigma_min          {attn,mlp}_h_res_sigma_mean
     {attn,mlp}_stream_norm_0 .. _{n-1}  {attn,mlp}_stream_norm_max_min_ratio
     {attn,mlp}_stream_gram_offdiag_mean {attn,mlp}_stream_gram_offdiag_max
     {attn,mlp}_write_over_resid         {attn,mlp}_cross_over_resid
@@ -73,6 +76,7 @@ from .mhc_metrics import (
     orthogonality_deviation,
     outer_deviation,
     residual_energy_split,
+    sigma_stats,
     stream_gram_stats,
 )
 
@@ -106,6 +110,8 @@ _METRIC_NAMES = (
     "h_res_beta_mean",
     "h_res_beta_std",
     "h_res_outer_dev",
+    "h_res_sigma_min",
+    "h_res_sigma_mean",
 )
 
 # Geometry of the n streams the mappings act on, from the module's own input. Fixed part;
@@ -359,6 +365,11 @@ class MHCHealthMonitor(TorchProbe):
                     self.record_layer_metric(
                         layer_idx, f"{component}_h_res_outer_dev", outer_deviation(h_res, h_pre, h_post)
                     )
+
+                    # Sigma on 1^perp: the learnable part of any mean-preserving mix. R8's criterion.
+                    sig_min, sig_mean = sigma_stats(h_res)
+                    self.record_layer_metric(layer_idx, f"{component}_h_res_sigma_min", sig_min)
+                    self.record_layer_metric(layer_idx, f"{component}_h_res_sigma_mean", sig_mean)
 
                     # Composite mapping M_k = h_res_k @ M_{k-1} (per token).
                     s, b, n, _ = h_res.shape

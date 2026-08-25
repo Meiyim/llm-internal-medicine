@@ -21,6 +21,8 @@ vector) and never sync the host (no ``.item()`` / ``.cpu()``), so they are safe 
 forward hot path. See ``.claude/skills/monitor-hook-perf-rules``.
 """
 
+import math
+
 import torch
 
 
@@ -99,6 +101,77 @@ def orthogonality_deviation(mat: torch.Tensor, eps: float = 1e-6) -> tuple[torch
     eye = torch.eye(n, device=mat.device, dtype=mat.dtype).unsqueeze(0)
     frob = (gram - eye).pow(2).sum(dim=(-2, -1)).sqrt()  # [s*b], one scalar per token
     return frob.mean(), (frob.amax() + eps) / (frob.median() + eps)
+
+
+_COMPLEMENT_BASIS: dict = {}
+
+
+def _complement_basis(n: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Cached ``[n, n-1]`` orthonormal basis of ``1^perp`` (truncated Helmert): ``Q^T 1 = 0``.
+
+    Only the span matters here — the sigma spectrum below is invariant to which basis of
+    ``1^perp`` is used, so this need not match the basis the H_res parameterization picked.
+    """
+    key = (n, device, dtype)
+    q = _COMPLEMENT_BASIS.get(key)
+    if q is None:
+        i = torch.arange(n, device=device)[:, None]
+        j = torch.arange(n - 1, device=device)[None, :]
+        col = (j + 1).to(dtype)
+        q = (i <= j).to(dtype) - col * (i == j + 1).to(dtype)
+        q = q / (col * (col + 1)).sqrt()
+        _COMPLEMENT_BASIS[key] = q
+    return q
+
+
+def _eigvalsh_sym3(a: torch.Tensor) -> torch.Tensor:
+    """Ascending eigenvalues of a batched symmetric ``[..., 3, 3]``, in closed form.
+
+    ``linalg.eigvalsh`` / ``svdvals`` round-trip cuSOLVER's info flag and sync the host, which a
+    forward hook must not do; the trigonometric (Cardano) route is branch-free elementwise algebra.
+    ``p2 = 0`` (the isotropic case, e.g. an exactly orthogonal ``H_res``) returns ``tr/3`` exactly:
+    ``p = 0`` kills both cosine terms, and the clamped denominator only guards ``0/0``.
+    """
+    d = a.diagonal(dim1=-2, dim2=-1)
+    q = d.mean(dim=-1)
+    b00, b11, b22 = d[..., 0] - q, d[..., 1] - q, d[..., 2] - q
+    b01, b02, b12 = a[..., 0, 1], a[..., 0, 2], a[..., 1, 2]
+    off = b01.pow(2) + b02.pow(2) + b12.pow(2)
+    p2 = (b00.pow(2) + b11.pow(2) + b22.pow(2) + 2 * off) / 6
+    p = p2.sqrt()
+    det = b00 * (b11 * b22 - b12.pow(2)) - b01 * (b01 * b22 - b12 * b02) + b02 * (b01 * b12 - b11 * b02)
+    denom = (2 * p2 * p).clamp_min(torch.finfo(a.dtype).tiny)
+    phi = torch.acos((det / denom).clamp(-1.0, 1.0)) / 3.0
+    hi = q + 2 * p * torch.cos(phi)
+    lo = q + 2 * p * torch.cos(phi + 2.0 * math.pi / 3.0)
+    return torch.stack([lo, 3 * q - hi - lo, hi], dim=-1)
+
+
+def sigma_stats(mat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """``Sigma`` — the singular values of ``H_res`` on ``1^perp`` — as a token min and mean.
+
+    Any mean-preserving mix (``H 1 = 1``, ``1^T H = 1^T``: the R8 sphere AND the Sinkhorn
+    baseline) keeps ``1^perp`` invariant, so ``Q^T H^T H Q = Sigma^2`` with ``Q`` any orthonormal
+    basis of it. Equivalently ``svdvals(H_res) = {1} u {|sigma_i|}``: the ``1`` direction is fixed
+    and carries no information, and ``Sigma`` is the whole learnable part of the operator.
+
+    This is R8a's only criterion. ``sigma -> 1`` is the model asking for a mean-preserving
+    ISOMETRY (which is what R8b hard-codes, so R8b must read a flat 1.0 here); ``sigma -> 0`` is
+    ``H_res -> J``, every stream replaced by the stream mean, i.e. a rank-1 collapse that is
+    strictly weaker than a plain residual. ``min`` is reported alongside ``mean`` because one
+    collapsed direction out of ``n-1`` is exactly what a mean hides (the ``amax_gain`` lesson).
+
+    On a non-affine ``H_res`` (R1 identity, R3-Cayley, R4 erase) ``1^perp`` is not invariant and
+    this reads the spectrum of ``H^T H`` compressed onto it — still bounded by ``||H_res||_2``,
+    but no longer a factorization of the operator.
+
+    Returns two 0-dim GPU tensors ``(sigma_min, sigma_mean)``; no host sync.
+    """
+    qb = _complement_basis(mat.shape[-1], mat.device, mat.dtype)
+    g = qb.transpose(-2, -1) @ (mat.transpose(-2, -1) @ mat) @ qb  # [..., n-1, n-1], = Sigma^2
+    ev = _eigvalsh_sym3(g) if g.shape[-1] == 3 else torch.linalg.eigvalsh(g)
+    sig = ev.clamp_min(0).sqrt()
+    return sig.amin(dim=-1).mean(), sig.mean()
 
 
 def stream_gram_stats(

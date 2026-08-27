@@ -19,8 +19,9 @@ mHC (Manifold-Constrained Hyper-Connections) model:
   ``n = 4`` also its two ``SO(4)`` rotation angles, the pair ``beta = n - tr`` cannot
   separate (it reads only their cosine sum).
 - the ``n`` residual **streams** themselves, from the module's own input: per-stream
-  L2 norm, the per-token max/min norm ratio, and the inter-stream ``|cosine|``
-  off-diagonal of the stream Gram (mean and per-token max). Everything above
+  L2 norm, the per-token max/min norm ratio, the inter-stream cosine off-diagonal of the
+  stream Gram (SIGNED mean + per-token ``|cos|`` max), and the cross-stream coefficient
+  of variation ``stream_cv``. Everything above
   reduces over the stream axis, so a dominant stream or a collapse of all ``n``
   onto one direction is invisible in it; these series are what see that.
 - the **energy split** of the update ``out = h_res x + w`` (``w = h_post o^T``):
@@ -30,7 +31,7 @@ mHC (Manifold-Constrained Hyper-Connections) model:
   module. See ``conf/mai_ladder/mhc/R7_NORM_CONTROL.md`` in the training repo.
 
 Per hyper-connection module (a layer has two: ``attn`` and ``mlp``) we emit
-``29 + n`` series (``31 + n`` at ``n = 4``), name-prefixed by component — mean-aggregated
+``34 + n`` series (``36 + n`` at ``n = 4``), name-prefixed by component — mean-aggregated
 except the three orth_dev / cos ratios, the norm ratio and the Gram max, which are
 max-aggregated:
 
@@ -46,9 +47,12 @@ max-aggregated:
     {attn,mlp}_h_res_beta_mean          {attn,mlp}_h_res_beta_std
     {attn,mlp}_h_res_outer_dev
     {attn,mlp}_h_res_sigma_min          {attn,mlp}_h_res_sigma_mean
+    {attn,mlp}_composite_h_res_sigma_min_fwd   {attn,mlp}_composite_h_res_sigma_mean_fwd
+    {attn,mlp}_composite_h_res_sigma_min_bwd   {attn,mlp}_composite_h_res_sigma_mean_bwd
     {attn,mlp}_h_res_theta_lo           {attn,mlp}_h_res_theta_hi      (n = 4 only)
     {attn,mlp}_stream_norm_0 .. _{n-1}  {attn,mlp}_stream_norm_max_min_ratio
     {attn,mlp}_stream_gram_offdiag_mean {attn,mlp}_stream_gram_offdiag_max
+    {attn,mlp}_stream_cv
     {attn,mlp}_write_over_resid         {attn,mlp}_cross_over_resid
     {attn,mlp}_cross_over_write         {attn,mlp}_mix_write_cos
     {attn,mlp}_mix_write_cos_abs_max    {attn,mlp}_resid_write_cos
@@ -123,6 +127,10 @@ _METRIC_NAMES = (
     "h_res_outer_dev",
     "h_res_sigma_min",
     "h_res_sigma_mean",
+    "composite_h_res_sigma_min_fwd",
+    "composite_h_res_sigma_mean_fwd",
+    "composite_h_res_sigma_min_bwd",
+    "composite_h_res_sigma_mean_bwd",
 )
 
 # Geometry of the n streams the mappings act on, from the module's own input. Fixed part;
@@ -132,6 +140,7 @@ _STREAM_METRIC_NAMES = (
     "stream_norm_max_min_ratio",
     "stream_gram_offdiag_mean",
     "stream_gram_offdiag_max",
+    "stream_cv",
 )
 
 
@@ -419,6 +428,13 @@ class MHCHealthMonitor(TorchProbe):
                 self.record_layer_metric(
                     layer_idx, f"{component}_composite_h_res_orth_dev_{direction}_max_med_ratio", orth_ratio
                 )
+                # Sigma on 1^perp of the COMPOSITE: the headline orthogonal-vs-DS curve. A
+                # doubly-stochastic stack annihilates 1^perp with depth (sigma_min -> 0, measured
+                # 0.14 -> 8e-4 -> 0 over 12 layers), a mean-fixing orthogonal one is an isometry
+                # at any depth (sigma_min == 1). Pair with stream_cv, which sees the consequence.
+                sig_min, sig_mean = sigma_stats(acc.unsqueeze(0))
+                self.record_layer_metric(layer_idx, f"{component}_composite_h_res_sigma_min_{direction}", sig_min)
+                self.record_layer_metric(layer_idx, f"{component}_composite_h_res_sigma_mean_{direction}", sig_mean)
 
     # ------------------------------------------------------------------
     # Capture wrapper (the hot path)
@@ -450,12 +466,13 @@ class MHCHealthMonitor(TorchProbe):
                     h_res = h_res.detach()
 
                     # Stream geometry of this module's own input, before any mixing.
-                    s_norms, norm_ratio, gram_mean, gram_max = stream_gram_stats(x.detach(), n_streams)
+                    s_norms, norm_ratio, gram_mean, gram_max, stream_cv = stream_gram_stats(x.detach(), n_streams)
                     for i in range(n_streams):
                         self.record_layer_metric(layer_idx, f"{component}_stream_norm_{i}", s_norms[i])
                     self.record_layer_metric(layer_idx, f"{component}_stream_norm_max_min_ratio", norm_ratio)
                     self.record_layer_metric(layer_idx, f"{component}_stream_gram_offdiag_mean", gram_mean)
                     self.record_layer_metric(layer_idx, f"{component}_stream_gram_offdiag_max", gram_max)
+                    self.record_layer_metric(layer_idx, f"{component}_stream_cv", stream_cv)
 
                     pre_mean, pre_std = gate_stats(h_pre)
                     post_mean, post_std = gate_stats(h_post)

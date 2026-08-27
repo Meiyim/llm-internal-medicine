@@ -70,8 +70,8 @@ internal_medicine_monitors:
 
 ## 监控指标
 
-每个 hc 模块产出 `29 + n` 个指标（`n` 条逐流 norm）；`n = 4` 时另加两条 `SO(4)` 转角序列
-（`h_res_theta_lo` / `h_res_theta_hi`），共 `31 + n`。指标名以 `attn_` / `mlp_` 前缀区分。除三个
+每个 hc 模块产出 `34 + n` 个指标（`n` 条逐流 norm）；`n = 4` 时另加两条 `SO(4)` 转角序列
+（`h_res_theta_lo` / `h_res_theta_hi`），共 `36 + n`。指标名以 `attn_` / `mlp_` 前缀区分。除三个
 `*_orth_dev*_max_med_ratio`、`*_stream_norm_max_min_ratio`、`*_stream_gram_offdiag_max`、
 `*_mix_write_cos_abs_max` 按 **max** 合成外，
 其余全部按 token/batch 求均值（并在 flush 时对 microbatch/rank 求均值）。日志键形如
@@ -126,6 +126,10 @@ amax_gain_bwd = mean_t( max_j | Σ_i  M_ij | )      # 列和（backward）
 | `{c}_h_res_outer_dev` | `mean_t( \|\| h_res − h_post ⊗ h_pre \|\|_F )` | 残差混合中「读写外积」解释不掉的部分 |
 | `{c}_h_res_sigma_min` | `mean_t( min_k σ_k )`，`σ = svdvals(h_res \|_{1^⊥})` | `1^⊥` 上最弱方向的增益：1 = 等距，→0 = `h_res → J` |
 | `{c}_h_res_sigma_mean` | `mean_t( mean_k σ_k )` | 同上取均值；必须与 `sigma_min` 对读 |
+| `{c}_composite_h_res_sigma_min_fwd` | 同上，作用于**前缀积** `M_l` | 入口到本层累积后 `1^⊥` 的最弱方向：**正交 vs 双随机的主曲线** |
+| `{c}_composite_h_res_sigma_mean_fwd` | 同上取均值 | 与 `_min_fwd` 对读 |
+| `{c}_composite_h_res_sigma_min_bwd` | 同上，作用于**后缀积** `S_l` | 梯度路径上是否保持流的可分性 |
+| `{c}_composite_h_res_sigma_mean_bwd` | 同上取均值 | 与 `_min_bwd` 对读 |
 | `{c}_h_res_theta_lo` | `min(α, γ)`，`spec(h_res) = {e^{±iα}, e^{±iγ}}`（闭式，无特征分解；**仅 `n = 4`**） | `SO(4)` 的共轭类是这**一对**转角 |
 | `{c}_h_res_theta_hi` | `max(α, γ)`，同上 | `h_res` 实际用掉多少 `SO(4)`；两角接近时差值有 ~3e-2 rad 噪声底 |
 
@@ -154,6 +158,21 @@ Cayley 参数化下构造上恒为 1.0；迭代式正交化（Schulz）与 Sinkh
 此时读到的是 `HᵗH` 压缩到 `1^⊥` 上的谱 —— 仍被 `‖h_res‖₂` 界住，但不再是算子的分解。
 `n = 4`（即 `m = 3`）走闭式三次特征值解（Cardano），因为 `eigvalsh`/`svdvals` 会同步 host，hook 内不允许。
 
+**复合 σ：正交优于双随机的主曲线。** 单层 σ 只说明这一层压了多少，真正的问题是**跨深度累积**之后还剩多少。
+双随机 `H_res` 固定流**均值**方向（σ_max = 1）但可以压扁流**差**子空间 `1^⊥`，累乘之后把 `n` 条残差流压到一条方向上
+—— 信息损失。保均值的正交 `H_res`（R3-Cayley / R9 quat_pair）在 `1^⊥` 上是等距，任何深度都保持 σ_min = σ_max = 1。
+实测（`n = 4`，逐层随机）：
+
+| depth | DS（Sinkhorn）σ_min | 正交（保均值 Cayley）σ_min |
+|---|---|---|
+| 1 | 0.144 | 1.000000 |
+| 3 | 8.35e-4 | 1.000000 |
+| 6 | 0.000000 | 1.000000 |
+| 12 | 0.000000 | 1.000000 |
+
+`fwd`（前缀积）与 `bwd`（后缀积）都报：前者答「入口到本层累积后流还剩多少可分性」，与 `stream_cv` 配对；
+后者答「梯度路径上是否保持可分性」。两条链共用同一个累乘循环，故这四条序列的额外开销为零。
+
 **两个转角：`SO(4)` 的共轭类不是一个角。** `SO(4)` 的元素不是「一个转动」——它分裂成两个不变 2-平面上各自
 按 `α`、`γ` 的独立转动，谱为 `{e^{±iα}, e^{±iγ}}`，**这一对**才是共轭类。而 `β = n − tr(h_res) = 4 − 2(cos α + cos γ)`
 只读到两个余弦的**和**：`(α, γ) = (1.0, 2.0)` 与 `(0.2, 2.5981)` 的 `β` 同为 3.7517，前者两个平面都在中等角度上转，
@@ -174,17 +193,31 @@ Cayley 参数化下构造上恒为 1.0；迭代式正交化（Schulz）与 Sinkh
 |------|------|----------|
 | `{c}_stream_norm_{i}` | `mean_t( ‖x_i‖₂ )`，`i = 0..n−1` | 第 `i` 条流的量级，**逐流**给出 |
 | `{c}_stream_norm_max_min_ratio` | `mean_t( (max_i ‖x_i‖ + ε) / (min_i ‖x_i‖ + ε) )` | 流间量级失衡：1.0 = 均衡，↑ = 出现主导流 |
-| `{c}_stream_gram_offdiag_mean` | `mean_t mean_{i≠j} \|cos(x_i, x_j)\|` | 流间方向冗余：0 = 相互正交，→1 = 塌缩到同一方向 |
-| `{c}_stream_gram_offdiag_max` | `mean_t max_{i≠j} \|cos(x_i, x_j)\|` | 同上的逐 token 尾部（少数 token 塌缩，均值看不见） |
+| `{c}_stream_gram_offdiag_mean` | `mean_t mean_{i≠j} cos(x_i, x_j)`，**带符号** | 流间方向关系 ∈ [−1,1]：0 = 相互正交，+1 = 塌缩到共同均值，负 = 反向对齐 |
+| `{c}_stream_gram_offdiag_max` | `mean_t max_{i≠j} \|cos(x_i, x_j)\|` | 同上的逐 token 尾部（少数 token 塌缩，均值看不见）；保持 `\|cos\|` |
+| `{c}_stream_cv` | `mean_t( sqrt(Var) / ‖m‖ )`，`m = mean_i x_i`，`Var = (1/n)Σ_i‖x_i − m‖²` | 跨流变异系数：→0 = 流塌缩到共同均值，大 = 各流携带独立内容 |
 
 **为什么必须逐流。** 其余每一条指标都沿 stream 轴归约（`mean(h_pre)`、逐 token 行和 …），所以「1 条流承载全部信号、
 另外 `n−1` 条衰减成噪声」与「n 条流均衡工作」在它们身上读数相同 —— `stream_norm_mean` 这种把 stream 轴也平均掉的
 写法同样看不见主导流。多流残差退化成单流有两条路：量级失衡（由 `max_min_ratio` 抓）和方向塌缩（由 Gram 非对角
-`|cos|` 抓），这组指标就是这两条路的读数。
+余弦与 `stream_cv` 抓），这组指标就是这两条路的读数。
 
-**实现上的两点。** Gram 由原始（bf16）流直接 `bmm` 得到、只把 `[T, n, n]` 的输出升到 fp32：先把 `x` 升 fp32 会在
+**非对角均值为什么带符号。** `|cos|` 把「塌缩到共同均值」（带符号 → +1）和「反向对齐的旋转」（带符号 → −1）
+读成同一个 1.0，而这是两种相反的状态：实测 `+v/−v/+v/−v` 的 `|cos|` 均值是 1.000、带符号是 −1/3。所以**均值**用带
+符号，`_max` 仍用 `|cos|`（它是尾部/塌缩探测器，带符号的 max 会漏掉反向对齐的尾巴）。保均值的正交 `H_res` 不改变
+这个读数；一般（会旋转均值方向的）正交映射可以把它推到负值。
+
+**`stream_cv` 与复合 σ 是一对。** `composite_h_res_sigma_min_*` 测的是**算子**（机制：DS 把 `1^⊥` 压掉），
+`stream_cv` 测的是**表示**（后果：流真的塌缩了）。「正交优于双随机」的证据是这两者同步 —— 算子 σ_min → 0
+伴随 CV → 0 / 带符号 cos → +1，而正交栈下三者都随深度保持不变。
+
+**实现上的三点。** Gram 由原始（bf16）流直接 `bmm` 得到、只把 `[T, n, n]` 的输出升到 fp32：先把 `x` 升 fp32 会在
 forward 里产生一个 `[T, n, C]` 的临时拷贝（s=8192、n=4、C=1024 时约 134 MB）。norm 取 Gram 对角线的平方根，
 不另算一遍；`ε = 1e-6` 是比值/余弦分母的下界，使某条流恰好为 0 时读数仍是有限值而不是 nan。
+`stream_cv` 完全从同一个 `gram` 导出（平行轴定理：`Σ_i‖x_i‖² = tr(gram)`、`‖m‖² = Σ_ij gram_ij / n²`，故
+`Var = tr/n − ‖m‖²`），不新增张量也不多一次 bmm；`‖m‖²` 的下限是**相对**的（`1e-6 · tr/n`）而非绝对 eps ——
+各流相消的 token 上 CV 本身无意义，绝对 eps 会让它贡献巨大值而毁掉均值，与 `residual_energy_split` 的
+`rel_floor` 同一 pattern。
 
 ### 能量分解（更新的交叉项）
 

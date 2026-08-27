@@ -342,7 +342,7 @@ class MHCMetricsTest(unittest.TestCase):
         n, c = 4, 4
         streams = torch.eye(c) * torch.tensor([1.0, 2.0, 3.0, 4.0]).unsqueeze(-1)
         x = streams.reshape(1, 1, n * c).expand(3, 2, n * c).contiguous()
-        norms, ratio, off_mean, off_max = mhc_metrics.stream_gram_stats(x, n)
+        norms, ratio, off_mean, off_max, _ = mhc_metrics.stream_gram_stats(x, n)
         self.assertEqual(tuple(norms.shape), (n,))
         for i, expected in enumerate((1.0, 2.0, 3.0, 4.0)):
             self.assertAlmostEqual(norms[i].item(), expected, places=5)
@@ -351,15 +351,66 @@ class MHCMetricsTest(unittest.TestCase):
         self.assertAlmostEqual(off_max.item(), 0.0, places=6)
 
     def test_stream_gram_collapse_is_unit_cosine(self):
-        # All n streams on one direction: |cosine| == 1 off-diagonal, norms still balanced.
+        # All n streams on one direction: cosine == 1 off-diagonal, norms still balanced.
         n, c = 4, 8
         one = torch.randn(c)
         x = one.repeat(n).reshape(1, 1, n * c).expand(5, 2, n * c).contiguous()
-        norms, ratio, off_mean, off_max = mhc_metrics.stream_gram_stats(x, n)
+        norms, ratio, off_mean, off_max, cv = mhc_metrics.stream_gram_stats(x, n)
         self.assertAlmostEqual(ratio.item(), 1.0, places=5)
         self.assertAlmostEqual(off_mean.item(), 1.0, places=5)
         self.assertAlmostEqual(off_max.item(), 1.0, places=5)
         self.assertAlmostEqual(norms[0].item(), one.norm().item(), places=4)
+        # Collapsed onto the common mean -> zero cross-stream spread.
+        self.assertAlmostEqual(cv.item(), 0.0, places=3)
+
+    def test_stream_gram_offdiag_mean_is_signed(self):
+        """The off-diagonal MEAN is the signed cosine; only the MAX stays on ``|cos|``.
+
+        ``|cos|`` reads 1.0 both for "all streams collapsed onto the common mean" and for
+        "alternating +v/-v", which are opposite conditions. The signed mean separates them
+        (+1 vs negative); the max must stay absolute or it would miss an anti-aligned tail.
+        """
+        n, c = 4, 8
+        v = torch.randn(c)
+
+        _, _, same_mean, same_max, _ = mhc_metrics.stream_gram_stats(v.repeat(n).reshape(1, 1, n * c), n)
+        self.assertAlmostEqual(same_mean.item(), 1.0, places=5)
+        self.assertAlmostEqual(same_max.item(), 1.0, places=5)
+
+        # +v, -v, +v, -v: 4 aligned and 8 anti-aligned off-diagonal pairs -> mean -1/3.
+        alt = torch.stack([v, -v, v, -v]).reshape(1, 1, n * c)
+        _, _, alt_mean, alt_max, _ = mhc_metrics.stream_gram_stats(alt, n)
+        self.assertAlmostEqual(alt_mean.item(), -1.0 / 3.0, places=5)
+        self.assertAlmostEqual(alt_max.item(), 1.0, places=5, msg="max must stay on |cos|")
+
+        _, _, orth_mean, orth_max, _ = mhc_metrics.stream_gram_stats(torch.eye(n).reshape(1, 1, n * n), n)
+        self.assertAlmostEqual(orth_mean.item(), 0.0, places=6)
+        self.assertAlmostEqual(orth_max.item(), 0.0, places=6)
+
+    def test_stream_cv_matches_the_closed_form(self):
+        torch.manual_seed(4)
+        n, c, t = 4, 7, 5
+        xs = torch.randn(t, n, c)
+        *_, cv = mhc_metrics.stream_gram_stats(xs.reshape(t, 1, n * c), n)
+
+        m = xs.mean(dim=1)  # [t, c]
+        var = (xs - m.unsqueeze(1)).pow(2).sum(dim=(-2, -1)) / n
+        expected = (var.sqrt() / m.norm(dim=-1)).mean()
+        self.assertAlmostEqual(cv.item(), expected.item(), places=5)
+
+    def test_stream_cv_survives_a_zero_common_mean(self):
+        """Streams summing to zero make ``||m|| -> 0``; the relative floor must keep CV finite.
+
+        An absolute eps here would let such a token contribute a huge value and destroy the
+        token mean — this is the one place raw CV is fragile.
+        """
+        torch.manual_seed(5)
+        n, c, t = 4, 6, 3
+        xs = torch.randn(t, n, c)
+        xs = xs - xs.mean(dim=1, keepdim=True)  # exact zero stream mean
+        *_, cv = mhc_metrics.stream_gram_stats(xs.reshape(t, 1, n * c), n)
+        self.assertTrue(torch.isfinite(cv).all(), cv)
+        self.assertGreater(cv.item(), 1.0, "a zero common mean is maximal cross-stream spread")
 
     def test_stream_gram_offdiag_max_exposes_tail_the_mean_hides(self):
         # Token 0 orthogonal, token 1 has two parallel streams: mean 1/6, per-token max 1/2.
@@ -367,7 +418,7 @@ class MHCMetricsTest(unittest.TestCase):
         tok0 = torch.eye(n)
         tok1 = torch.stack([torch.eye(n)[0], torch.eye(n)[0], torch.eye(n)[2]])
         x = torch.stack([tok0.reshape(-1), tok1.reshape(-1)]).reshape(2, 1, n * c)
-        _, ratio, off_mean, off_max = mhc_metrics.stream_gram_stats(x, n)
+        _, ratio, off_mean, off_max, _ = mhc_metrics.stream_gram_stats(x, n)
         self.assertAlmostEqual(off_mean.item(), 1.0 / 6.0, places=5)
         self.assertAlmostEqual(off_max.item(), 0.5, places=5)
         self.assertAlmostEqual(ratio.item(), 1.0, places=5)
@@ -537,11 +588,16 @@ class MHCMonitorTest(unittest.TestCase):
                 "h_res_outer_dev",
                 "h_res_sigma_min",
                 "h_res_sigma_mean",
+                "composite_h_res_sigma_min_fwd",
+                "composite_h_res_sigma_mean_fwd",
+                "composite_h_res_sigma_min_bwd",
+                "composite_h_res_sigma_mean_bwd",
                 "h_res_theta_lo",
                 "h_res_theta_hi",
                 "stream_norm_max_min_ratio",
                 "stream_gram_offdiag_mean",
                 "stream_gram_offdiag_max",
+                "stream_cv",
                 *(f"stream_norm_{i}" for i in range(n)),
             ):
                 self.assertIn(f"mhc_health/layer_0/{comp}_{key}", latest)
@@ -561,9 +617,17 @@ class MHCMonitorTest(unittest.TestCase):
             self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_beta_mean"], 0.0, places=5)
             self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_beta_std"], 0.0, places=5)
             self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_outer_dev"], 2.0, places=5)
-            # h_res == I is a mean-preserving isometry: sigma is flat 1 on 1^perp.
+            # h_res == I is a mean-preserving isometry: sigma is flat 1 on 1^perp, and so is
+            # every composite of it, in both directions.
             self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_sigma_min"], 1.0, places=5)
             self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_sigma_mean"], 1.0, places=5)
+            for d in ("fwd", "bwd"):
+                self.assertAlmostEqual(
+                    latest[f"mhc_health/layer_0/{comp}_composite_h_res_sigma_min_{d}"], 1.0, places=5
+                )
+                self.assertAlmostEqual(
+                    latest[f"mhc_health/layer_0/{comp}_composite_h_res_sigma_mean_{d}"], 1.0, places=5
+                )
             # ...and it rotates by nothing: both SO(4) angles are 0 (fp32 acos floor near cos = 1).
             self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_theta_lo"], 0.0, places=3)
             self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_theta_hi"], 0.0, places=3)
@@ -572,6 +636,13 @@ class MHCMonitorTest(unittest.TestCase):
         # the ratios are max-aggregated end to end: monitor buffer + training_logs suffix.
         self.assertIn("attn_h_res_orth_dev_max_med_ratio", MHCHealthMonitor.MAX_AGGREGATED)
         self.assertTrue(training_logs._is_max_metric("mhc_health/layer_0/attn_h_res_orth_dev_max_med_ratio"))
+        # stream_cv and the composite sigmas are plain means; only sigma_min composes with min.
+        for key in ("attn_stream_cv", "attn_composite_h_res_sigma_mean_fwd"):
+            self.assertNotIn(key, MHCHealthMonitor.MAX_AGGREGATED)
+            self.assertFalse(training_logs._is_max_metric(f"mhc_health/layer_0/{key}"))
+            self.assertFalse(training_logs._is_min_metric(f"mhc_health/layer_0/{key}"))
+        # No separate signed-cosine key was added: the existing _mean slot changed meaning.
+        self.assertNotIn("mhc_health/layer_0/attn_stream_gram_offdiag_signed_mean", latest)
 
     def test_stream_geometry_comes_from_the_hook_input(self):
         # The stream series are computed from compute_mappings' own argument, not from the
@@ -937,6 +1008,140 @@ class MHCCompositeChainTest(unittest.TestCase):
         xs = {key: torch.randn(self.S, self.B, self.N * 4) for key in self._keys_in_order(targets)}
         for key in order:
             by_key[key].compute_mappings(xs[key])
+
+
+class MHCCompositeSigmaTest(unittest.TestCase):
+    """The composite sigma spectrum on ``1^perp`` — the orthogonal-vs-DS headline.
+
+    A doubly-stochastic ``H_res`` fixes the stream MEAN (sigma_max = 1) but can crush the
+    stream-DIFFERENCE subspace ``1^perp``. Composed across depth that annihilates it, so the
+    ``n`` streams collapse onto one direction. A mean-fixing orthogonal ``H_res`` is an
+    isometry on ``1^perp``, so its composite holds sigma == 1 at any depth. These tests pin
+    the mechanism; ``stream_cv`` measures the consequence.
+    """
+
+    N = 4
+
+    def setUp(self):
+        training_logs.reset()
+        self._orig_layer_cls = mhc_monitor.HyperConnectionTransformerLayer
+        self._orig_mod_cls = mhc_monitor.HyperConnectionModule
+        mhc_monitor.HyperConnectionTransformerLayer = FakeLayer
+        mhc_monitor.HyperConnectionModule = FakeHC
+
+    def tearDown(self):
+        mhc_monitor.HyperConnectionTransformerLayer = self._orig_layer_cls
+        mhc_monitor.HyperConnectionModule = self._orig_mod_cls
+        training_logs.reset()
+
+    @staticmethod
+    def _sinkhorn(a, iters=20, eps=1e-6):
+        a = a.abs() + eps
+        for _ in range(iters):
+            a = a / a.sum(dim=-1, keepdim=True)
+            a = a / a.sum(dim=-2, keepdim=True)
+        return a
+
+    @staticmethod
+    def _cayley(s):
+        """Mean-FIXING orthogonal: Cayley of a skew matrix that also kills ``1``.
+
+        A plain ``Cayley(S - S^T)`` is orthogonal but rotates the mean direction into
+        ``1^perp``, which changes the stream CV even though it is an isometry. Conjugating
+        by ``P = I - J/n`` first gives ``A 1 = 0``, hence ``Q 1 = 1`` — the R3 / R9 property
+        the DS baseline is being compared against.
+        """
+        n = s.shape[-1]
+        eye = torch.eye(n, dtype=s.dtype)
+        p = eye - torch.full((n, n), 1.0 / n, dtype=s.dtype)
+        sp = p @ s @ p
+        skew = sp - sp.transpose(-2, -1)
+        return torch.linalg.solve(eye - skew, eye + skew)
+
+    def _run(self, mats):
+        """Drive one hc module per matrix (2 per layer) and return the flushed metrics."""
+        n = self.N
+        layers = []
+        for li in range(0, len(mats), 2):
+            slots = [
+                FakeHC(
+                    n=n,
+                    layer_number=li // 2 + 1,
+                    h_pre=torch.full((2, 1, n), 0.5),
+                    h_post=torch.ones(2, 1, n),
+                    h_res=m.reshape(1, 1, n, n).expand(2, 1, n, n).contiguous(),
+                )
+                for m in mats[li : li + 2]
+            ]
+            layers.append(FakeLayer(layer_number=li // 2 + 1, attn=slots[0], mlp=slots[1]))
+
+        model = _mhc_model(layers)
+        monitor = MHCHealthMonitor(log_per_layer=True, log_global=True)
+        targets = monitor._prepare_layers(model, chunk_id=0)
+        monitor.allocate_buffers(torch.device("cpu"))
+        monitor._attach_hooks(targets)
+        for _, _, mod, _ in targets:
+            mod.compute_mappings(torch.randn(2, 1, n * 4))
+        monitor.step()
+        return training_logs.get_latest(prefix="mhc_health")
+
+    def test_identity_stack_holds_unit_sigma(self):
+        mats = [torch.eye(self.N) for _ in range(6)]
+        latest = self._run(mats)
+        for key, val in latest.items():
+            if "composite_h_res_sigma" in key:
+                self.assertAlmostEqual(val, 1.0, places=5, msg=key)
+
+    def test_doubly_stochastic_composite_sigma_min_decays_with_depth(self):
+        """The DS depth effect: the deepest composite must be far below a single layer."""
+        torch.manual_seed(0)
+        mats = [self._sinkhorn(torch.randn(self.N, self.N)) for _ in range(8)]
+        latest = self._run(mats)
+
+        single = latest["mhc_health/layer_0/attn_h_res_sigma_min"]
+        # fwd prefix at the LAST module spans all 8 factors; bwd suffix at the FIRST does too.
+        deep_fwd = latest["mhc_health/layer_3/mlp_composite_h_res_sigma_min_fwd"]
+        deep_bwd = latest["mhc_health/layer_0/attn_composite_h_res_sigma_min_bwd"]
+        for tag, deep in (("fwd", deep_fwd), ("bwd", deep_bwd)):
+            self.assertLess(deep, single * 0.5, f"{tag}: composite {deep:.3e} vs single-layer {single:.3e}")
+            self.assertLess(deep, 1e-2, f"{tag}: 1^perp should be nearly annihilated, got {deep:.3e}")
+
+        # The 1-factor ends of each chain must still equal the single-layer value.
+        self.assertAlmostEqual(latest["mhc_health/layer_0/attn_composite_h_res_sigma_min_fwd"], single, places=5)
+
+    def test_orthogonal_composite_sigma_stays_unit_at_depth(self):
+        """A mean-fixing orthogonal stack is an isometry on 1^perp at every depth."""
+        torch.manual_seed(1)
+        mats = [self._cayley(torch.randn(self.N, self.N) * 0.5) for _ in range(8)]
+        latest = self._run(mats)
+        for key, val in latest.items():
+            if "composite_h_res_sigma" in key:
+                self.assertAlmostEqual(val, 1.0, places=4, msg=key)
+
+    def test_doubly_stochastic_collapse_shows_in_stream_cv(self):
+        """The consequence side: pushing streams through a DS stack shrinks their CV.
+
+        ``stream_cv`` is read off each module's INPUT, so this drives the streams through the
+        matrices by hand and compares the CV of the frame before and after.
+        """
+        torch.manual_seed(2)
+        n, c = self.N, 6
+        xs = torch.randn(1, n, c)
+
+        def cv_of(frame):
+            *_, cv = mhc_metrics.stream_gram_stats(frame.reshape(1, 1, n * c), n)
+            return cv.item()
+
+        before = cv_of(xs)
+        ds = xs
+        for _ in range(8):
+            ds = self._sinkhorn(torch.randn(n, n)) @ ds
+        orth = xs
+        for _ in range(8):
+            orth = self._cayley(torch.randn(n, n) * 0.5) @ orth
+
+        self.assertLess(cv_of(ds), before * 0.1, "a DS stack should collapse the streams")
+        self.assertAlmostEqual(cv_of(orth), before, places=3, msg="an isometry preserves the spread")
 
 
 class MHCMonitorNoOpTest(unittest.TestCase):

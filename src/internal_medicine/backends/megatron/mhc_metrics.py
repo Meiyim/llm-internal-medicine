@@ -218,46 +218,68 @@ def so4_angle_stats(mat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def stream_gram_stats(
-    x: torch.Tensor, n: int, eps: float = 1e-6
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    x: torch.Tensor, n: int, eps: float = 1e-6, rel_floor: float = 1e-6
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Geometry of the ``n`` hidden STREAMS themselves (not the ``H_res`` operator).
 
     ``orthogonality_deviation`` measures the mixing MATRIX; this measures the frame it acts on.
     Every other metric here reduces over the stream axis (``h_pre.mean()``, per-token row sums),
     so a run where one stream carries the signal and the other ``n-1`` decay into noise — or
     where all ``n`` collapse onto a single direction — looks perfectly healthy in all of them.
-    That is the blind spot this closes: stream-norm imbalance and inter-stream ``|cosine|`` are
-    the two ways the ``n``-stream residual can stop being ``n`` streams.
+    That is the blind spot this closes: stream-norm imbalance, inter-stream cosine and the
+    cross-stream CV are the ways the ``n``-stream residual can stop being ``n`` streams.
 
     Args:
         x: pre-aggregation hidden state ``[s, b, n*C]``, exactly the tensor
             ``HyperConnectionModule.compute_mappings`` receives.
         n: ``num_residual_streams``; read from the module, not inferred from ``x``.
         eps: floor for the norm ratios / cosines (avoids 0/0 on a dead stream).
+        rel_floor: floor on ``||m||^2`` for the CV, RELATIVE to the per-token mean stream
+            energy. This is the one place raw CV is fragile (``||m|| -> 0`` on a token whose
+            streams cancel); an absolute eps would let such a token contribute ~1e6 and
+            dominate the mean. Mirrors ``residual_energy_split``'s ``rel_floor``.
 
     Returns, no host sync:
       * ``stream_norm``               — ``[n]`` per-stream mean L2 norm (per-stream, not meaned
         over the stream axis: a dominant stream is invisible in the mean).
       * ``stream_norm_max_min_ratio`` — per-token max/min stream-norm ratio, meaned over tokens.
-      * ``gram_offdiag_abs_mean``     — mean |cosine| between distinct streams (0 = orthogonal,
-        ->1 = collapsed onto one direction).
-      * ``gram_offdiag_abs_max``      — worst |cosine| over the off-diagonal, meaned over tokens
-        (tail detector, mirroring ``orthogonality_deviation``'s max/median).
+      * ``gram_offdiag_signed_mean``  — mean SIGNED cosine between distinct streams, range
+        ``[-1, 1]``. Signed, not ``|cos|``, because the absolute mean cannot tell "collapsed
+        onto the common mean" (signed -> +1) from "anti-aligned rotation" (signed -> -1): both
+        read 1.0. A mean-fixing orthogonal ``H_res`` leaves it at its input value; a general
+        (mean-rotating) one can push it negative.
+      * ``gram_offdiag_abs_max``      — worst ``|cosine|`` over the off-diagonal, meaned over
+        tokens. Stays on ``|cos|``: it is a tail/collapse detector, and a signed max would miss
+        an anti-aligned tail.
+      * ``stream_cv``                 — cross-stream coefficient of variation, ``sqrt(Var)/||m||``
+        with ``m`` the stream mean and ``Var = (1/n) sum_i ||x_i - m||^2``, per token then meaned.
+        ``-> 0`` means the streams have collapsed onto their common mean; large means they carry
+        independent content. Under a doubly-stochastic stack it shrinks with depth; under an
+        orthogonal (mean-fixing) one it holds. Computed from ``gram`` by the parallel-axis
+        identity — ``sum_i ||x_i||^2 = tr(gram)`` and ``||m||^2 = sum_ij gram_ij / n^2``, so
+        ``Var = tr/n - ||m||^2`` — hence no new large tensor and no extra bmm.
     """
     xs = x.reshape(-1, n, x.shape[-1] // n)  # [T, n, C], view
     # Gram from raw streams, fp32 only on the [T,n,n] output: upcasting x first would cost a
     # transient [T,n,C] fp32 copy (~134MB at s=8192,n=4,C=1024) inside the forward.
     gram = torch.bmm(xs, xs.transpose(-2, -1)).float()  # [T, n, n]
     norms = gram.diagonal(dim1=-2, dim2=-1).clamp_min(0).sqrt()  # [T, n]
-    cos = (gram / (norms.unsqueeze(-1) * norms.unsqueeze(-2)).clamp_min(eps)).abs()
+    cos = gram / (norms.unsqueeze(-1) * norms.unsqueeze(-2)).clamp_min(eps)
 
     off = ~torch.eye(n, device=xs.device, dtype=torch.bool)  # [n, n] off-diagonal mask
-    off_vals = cos[:, off]  # [T, n*(n-1)]
+    off_vals = cos[:, off]  # [T, n*(n-1)], signed
+
+    mean_stream_energy = gram.diagonal(dim1=-2, dim2=-1).sum(dim=-1) / n  # tr(gram)/n, [T]
+    m_energy = gram.sum(dim=(-2, -1)) / (n * n)  # ||m||^2, [T]
+    var = (mean_stream_energy - m_energy).clamp_min(0)
+    cv = (var / m_energy.clamp_min(rel_floor * mean_stream_energy)).sqrt()
+
     return (
         norms.mean(dim=0),
         ((norms.amax(dim=-1) + eps) / (norms.amin(dim=-1) + eps)).mean(),
         off_vals.mean(),
-        off_vals.amax(dim=-1).mean(),
+        off_vals.abs().amax(dim=-1).mean(),
+        cv.mean(),
     )
 
 

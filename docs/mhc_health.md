@@ -51,26 +51,28 @@ internal_medicine_monitors:
 
 ### VRAM 安全（无泄漏）
 
-跨调用状态仅有 `self._composite`（每 chunk 一个小 `[s*b, n, n]` 张量）与固定的 0 维累加器。规则：
+跨调用状态只有 `self._h_res`（本 microbatch 在飞的 detached `h_res` 引用）与固定的 0 维累加器。规则：
 
 - 捕获后立即对 `h_pre/h_post/h_res` `.detach()`，并在 `torch.no_grad()` 下做全部指标/复合计算——否则一个仍带梯度的
   张量会通过反向把整层 autograd graph 钉住（大泄漏）。
-- wrapper 原样返回 `out`，除 0 维标量外不保留任何对它/其视图的引用。
-- 复合映射 seed 用 `hb.clone()`（而非 `h_res` 的 reshape 视图），使 slot 不会 alias 模型的 `h_res` 存储。
-- `step()` 每步清空 `self._composite`，`remove_hooks()` 一并清空。
+- wrapper 原样返回 `out`，除 0 维标量与 detached `h_res` 外不保留任何对它/其视图的引用。
+- `self._h_res` 存的是已 detach 的 `h_res` 引用，那块 storage 在反向前本来就被 autograd graph 持有，故驻留成本≈0；
+  真正新增的只有累乘中间量，每条链一个 `[s*b, n, n]`（l12 / mbs4 / s4096 / n=4 下约 1 MiB）。
+- 一个 chunk 的模块集齐即在 forward 内立刻 drain（见下），**不跨 microbatch**；梯度累积下不会攒成
+  `ga_steps × 模块数` 份。`step()` 兜底 drain 残留的不完整 stash，`remove_hooks()` 一并清空。
 
 热路径纪律见 `.claude/skills/monitor-hook-perf-rules`：hook 内无 D2H 同步、无集合通信，schema 在 `allocate_buffers`
 前声明。TP 不沿 `n` 切分映射，故无需 hook 内通信；跨 rank 归约在 flush 时由 `gather_and_aggregate` 完成
-（mean，两个 `*_orth_dev_max_med_ratio`、`*_stream_norm_max_min_ratio`、`*_stream_gram_offdiag_max` 走 max）。
+（mean，三个 `*_orth_dev*_max_med_ratio`、`*_stream_norm_max_min_ratio`、`*_stream_gram_offdiag_max` 走 max）。
 序列并行下 `x` 按 token 切分但隐藏维完整，逐 token 的多流几何在本 rank 就是完备的，同样不需要 hook 内通信。
 
 ---
 
 ## 监控指标
 
-每个 hc 模块产出 `27 + n` 个指标（`n` 条逐流 norm）；`n = 4` 时另加两条 `SO(4)` 转角序列
-（`h_res_theta_lo` / `h_res_theta_hi`），共 `29 + n`。指标名以 `attn_` / `mlp_` 前缀区分。除两个
-`*_orth_dev_max_med_ratio`、`*_stream_norm_max_min_ratio`、`*_stream_gram_offdiag_max`、
+每个 hc 模块产出 `29 + n` 个指标（`n` 条逐流 norm）；`n = 4` 时另加两条 `SO(4)` 转角序列
+（`h_res_theta_lo` / `h_res_theta_hi`），共 `31 + n`。指标名以 `attn_` / `mlp_` 前缀区分。除三个
+`*_orth_dev*_max_med_ratio`、`*_stream_norm_max_min_ratio`、`*_stream_gram_offdiag_max`、
 `*_mix_write_cos_abs_max` 按 **max** 合成外，
 其余全部按 token/batch 求均值（并在 flush 时对 microbatch/rank 求均值）。日志键形如
 `mhc_health/layer_{i}/{c}_{name}`，`{c}` ∈ `{attn, mlp}`；
@@ -99,20 +101,26 @@ amax_gain_bwd = mean_t( max_j | Σ_i  M_ij | )      # 列和（backward）
 |------|----------|----------|
 | `{c}_amax_gain_fwd` | 本层 `h_res` | 单层前向最坏放大（双随机 → ≈1.0） |
 | `{c}_amax_gain_bwd` | 本层 `h_res` | 单层反向最坏放大（≈1.0） |
-| `{c}_composite_amax_gain_fwd` | 复合映射 `M_k = h_res_k @ M_{k-1}` | 跨层累积前向放大 |
-| `{c}_composite_amax_gain_bwd` | 复合映射 | 跨层累积反向放大 |
+| `{c}_composite_amax_gain_fwd` | **前缀积** `M_l = H_l ⋯ H_0` | 从 stage 入口累积到本层的前向放大 |
+| `{c}_composite_amax_gain_bwd` | **后缀积** `S_l = H_N ⋯ H_l` | 梯度从 stage 出口传到本层的反向放大 |
 
 单层 `h_res` 经 Sinkhorn 投影为双随机矩阵（行/列和 ≈ 1），故单层 amax-gain ≈ 1.0；复合映射的增益随深度偏离 1.0，
 正是残差流放大/收缩的信号。
+
+> **Sinkhorn 下这两条恒为 1。** 双随机矩阵之积仍是双随机矩阵，实测 12 层累乘后仍是 1.0000001。所以在 stock mHC
+> 上它们只是 Sinkhorn 收敛哨兵；真正有信息量的是 signed chart（`quat_pair` / `cayley` / `orth` / `erase` 等
+> variant），那里 `h_res` 不再非负，累积增益才会张开。
 
 ### 流形与结构（h_res 的形状诊断）
 
 | 指标 | 公式 | 诊断意义 |
 |------|------|----------|
 | `{c}_h_res_orth_dev` | `mean_t( \|\| h_resᵀ h_res − I \|\|_F )` | 偏离正交（等距）的程度：0 = 精确保范 |
-| `{c}_composite_h_res_orth_dev` | 同上，作用于复合映射 | 跨层累积的非等距程度 |
+| `{c}_composite_h_res_orth_dev_fwd` | 同上，作用于**前缀积** `M_l` | 从 stage 入口累积到本层的非等距程度 |
+| `{c}_composite_h_res_orth_dev_bwd` | 同上，作用于**后缀积** `S_l` | 本层以上累积的非等距程度 |
 | `{c}_h_res_orth_dev_max_med_ratio` | `(max_t d + ε) / (med_t d + ε)`，`d` 同上，`ε = 1e-6` | 逐 token 尾部集中度：1.0 = 无尾 |
-| `{c}_composite_h_res_orth_dev_max_med_ratio` | 同上，作用于复合映射 | 跨层累积后的尾部集中度 |
+| `{c}_composite_h_res_orth_dev_fwd_max_med_ratio` | 同上，作用于前缀积 | 前向累积后的尾部集中度 |
+| `{c}_composite_h_res_orth_dev_bwd_max_med_ratio` | 同上，作用于后缀积 | 反向累积后的尾部集中度 |
 | `{c}_h_res_beta_mean` | `mean_t( n − tr(h_res) )` | rank-1 擦除强度 β |
 | `{c}_h_res_beta_std` | `std_t( n − tr(h_res) )` | β 的 token 级离散度：→0 说明退化成逐层常数 |
 | `{c}_h_res_outer_dev` | `mean_t( \|\| h_res − h_post ⊗ h_pre \|\|_F )` | 残差混合中「读写外积」解释不掉的部分 |
@@ -217,22 +225,41 @@ Sinkhorn 基线下偏差等于其非正交度，精确算需要 `[T,n,n]` 流 Gr
 
 ### 复合映射（composite mapping）
 
-复合映射是本 pipeline stage / VPP chunk 内、按 forward 执行顺序（attn→mlp，逐层递增）对 `h_res` 的累乘，每次 forward
-在本 stage 首个 hc 模块（最低层 attn）处重置。
+设本 pipeline stage / VPP chunk 内的 hc 模块按 forward 执行顺序编号 `0..N`（逐层递增，层内 attn→mlp），
+第 `k` 个做的是 `r ← H_k r + w_k`。两条链分别是：
 
-**局限**：在流水并行（PP>1）下，复合映射只跨越本 stage 局部的层，并非整网的全局累乘；不同 stage/chunk 的逐层键因
+```
+前缀   M_l = H_l ⋯ H_0      = d(第 l 层输出) / d(stage 入口)
+后缀   S_l = H_N ⋯ H_l      = d(stage 出口)   / d(第 l 层输入)
+```
+
+`fwd` 系列读前缀，`bwd` 系列读后缀。**为什么 bwd 必须用后缀**：到达第 `l` 层输入的梯度是 `S_lᵀ g`，
+所以「梯度从 loss 传到第 l 层被放大了多少」只有后缀积能回答，前缀积看的是反方向（一个扰动从入口传到第 l 层）。
+`amax_gain(S, dim=-2)`（最大绝对**列**和）就是 `Sᵀ` 的最大绝对行和，即 `‖Sᵀ‖_∞` 那个反向界。
+
+**延迟计算。** `S_l` 需要第 `l` 层**以上**的所有 `h_res`，而那些层在第 `l` 层 hook 触发时还没跑。所以 wrapper 只把
+detached `h_res` 按 `(layer, component)` 暂存，等一个 chunk 的模块集齐后在 forward 内 drain：升序建前缀、降序建后缀。
+两条链都按**静态层序**遍历，不依赖 wrapper 触发顺序。
+
+> **这同时修掉了一个 full-recompute 下的静默错误。** `_should_monitor()` 要求 grad enabled，而
+> `recompute_granularity=full` 时 `CheckpointFunction.forward` 在 `no_grad` 下跑、只有反向重放 `enable_grad`。
+> 也就是说那种配置下 wrapper **只在反向触发，且顺序是降序**。旧的增量累乘（`M ← h_res @ M`，在 chunk root 处重置）
+> 因此会静默变成降序累乘、且 root 层被截断成单个因子。改成静态序遍历后，`full` 与 `selective` 给出相同结果。
+> Sinkhorn chart 下这个 bug 完全看不出来——双随机之积恒为 1.0，两种顺序都是 1.0。
+
+**局限**：在流水并行（PP>1）下，两条链都只跨越本 stage 局部的层，并非整网的全局累乘；不同 stage/chunk 的逐层键因
 层号不同不会冲突，但自动派生的 `global_*` 复合均值会混合深浅复合值——因此 composite 的**逐层视图**更有意义。PP=1 时精确。
-每 chunk 独立 slot，避免后一 chunk 的层污染前一 chunk 的累乘。
+每 chunk 独立 stash，避免后一 chunk 的层污染前一 chunk 的累乘。
 
 ---
 
 ## 与 microbatch / 激活重算的交互
 
-- 每个梯度累积 microbatch 都会按序重新调用所有 hc 模块；chunk root 先触发并重置复合映射，故复合映射按 microbatch 正确、
-  不跨 microbatch 泄漏。
-- 整个捕获受 `_should_monitor()` 门控；监控步内所有 wrapper 都触发（root 重置 → 同一 forward 内有序 bmm 累积），故复合
-  状态自洽；非监控步不触发，下一监控步的 root 重置会重新 seed。
-- `_should_monitor()` 要求 grad enabled，故若外层 layer 被整体激活重算，仅 grad-enabled 的那次正向记录；`compute_mappings`
-  本身不被 checkpoint，不会重复触发。
+- 每个梯度累积 microbatch 都会按序重新调用所有 hc 模块；一个 chunk 的模块集齐即 drain，故复合映射按 microbatch
+  正确、不跨 microbatch 泄漏（否则梯度累积下会攒成 `ga_steps × 模块数` 份 `h_res` 引用）。
+- 整个捕获受 `_should_monitor()` 门控；非监控步不触发，stash 保持为空。
+- `_should_monitor()` 要求 grad enabled。`recompute_granularity=full` 时唯一 grad-enabled 的 pass 是**反向重放**，
+  wrapper 于是只在反向按降序触发——两条链走静态层序，故结果与正向触发一致（见上）。`compute_mappings` 本身不被
+  checkpoint，不会重复触发。
 - `fused_h_res_h_post_bda` 是外层 dispatcher，重算发生在它内部的 `CheckpointWithoutOutput` 里而非 wrapper 层，
   故 `recompute_modules` 含 `"mhc"` 时能量分解仍每模块每 microbatch 只记录一次。

@@ -6,9 +6,11 @@ mHC (Manifold-Constrained Hyper-Connections) model:
 - ``h_pre`` / ``h_post`` — the aggregation / expansion gates: mean and std.
 - ``h_res``              — the residual-mixing matrix: the paper's ``amax_gain``
   forward (max-abs row sum) and backward (max-abs column sum), computed both on
-  this layer's ``h_res`` and on the running **composite mapping** (cumulative
-  product of ``h_res`` across the layers local to this pipeline stage / VPP
-  chunk); its deviation from orthogonality (token mean, plus a max/median ratio
+  this layer's own ``h_res`` and on two **composite mappings** over the layers local
+  to this pipeline stage / VPP chunk — the ascending prefix product for ``fwd`` and
+  the descending suffix product for ``bwd``, so each direction reads the chain it
+  actually propagates through (see ``_flush_composites``); its deviation from
+  orthogonality (token mean, plus a max/median ratio
   over tokens that catches a non-orthogonal tail the mean hides); its trace
   deficit ``n - tr(H_res)`` (= the rank-1 ablation's erase strength ``beta``);
   its distance from the read-write outer product ``h_post (x) h_pre``; and
@@ -28,7 +30,7 @@ mHC (Manifold-Constrained Hyper-Connections) model:
   module. See ``conf/mai_ladder/mhc/R7_NORM_CONTROL.md`` in the training repo.
 
 Per hyper-connection module (a layer has two: ``attn`` and ``mlp``) we emit
-``27 + n`` series (``29 + n`` at ``n = 4``), name-prefixed by component — mean-aggregated
+``29 + n`` series (``31 + n`` at ``n = 4``), name-prefixed by component — mean-aggregated
 except the three orth_dev / cos ratios, the norm ratio and the Gram max, which are
 max-aggregated:
 
@@ -36,9 +38,11 @@ max-aggregated:
     {attn,mlp}_h_post_mean  {attn,mlp}_h_post_std
     {attn,mlp}_amax_gain_fwd            {attn,mlp}_amax_gain_bwd
     {attn,mlp}_composite_amax_gain_fwd  {attn,mlp}_composite_amax_gain_bwd
-    {attn,mlp}_h_res_orth_dev           {attn,mlp}_composite_h_res_orth_dev
+    {attn,mlp}_h_res_orth_dev
+    {attn,mlp}_composite_h_res_orth_dev_fwd  {attn,mlp}_composite_h_res_orth_dev_bwd
     {attn,mlp}_h_res_orth_dev_max_med_ratio
-    {attn,mlp}_composite_h_res_orth_dev_max_med_ratio
+    {attn,mlp}_composite_h_res_orth_dev_fwd_max_med_ratio
+    {attn,mlp}_composite_h_res_orth_dev_bwd_max_med_ratio
     {attn,mlp}_h_res_beta_mean          {attn,mlp}_h_res_beta_std
     {attn,mlp}_h_res_outer_dev
     {attn,mlp}_h_res_sigma_min          {attn,mlp}_h_res_sigma_mean
@@ -109,9 +113,11 @@ _METRIC_NAMES = (
     "composite_amax_gain_fwd",
     "composite_amax_gain_bwd",
     "h_res_orth_dev",
-    "composite_h_res_orth_dev",
+    "composite_h_res_orth_dev_fwd",
+    "composite_h_res_orth_dev_bwd",
     "h_res_orth_dev_max_med_ratio",
-    "composite_h_res_orth_dev_max_med_ratio",
+    "composite_h_res_orth_dev_fwd_max_med_ratio",
+    "composite_h_res_orth_dev_bwd_max_med_ratio",
     "h_res_beta_mean",
     "h_res_beta_std",
     "h_res_outer_dev",
@@ -166,11 +172,15 @@ _COMPONENTS = (
     ("mlp", "mlp_hyper_connection"),
 )
 
+# Execution rank within a layer, for the static ordering the composite chains walk.
+_COMPONENT_RANK = {"attn": 0, "mlp": 1}
+
 # The max/median and max/min ratios compose across microbatches / ranks with max, not mean:
 # averaging a tail detector hides the tail it exists to catch.
 _MAX_METRIC_NAMES = (
     "h_res_orth_dev_max_med_ratio",
-    "composite_h_res_orth_dev_max_med_ratio",
+    "composite_h_res_orth_dev_fwd_max_med_ratio",
+    "composite_h_res_orth_dev_bwd_max_med_ratio",
     "stream_norm_max_min_ratio",
     "stream_gram_offdiag_max",
     "mix_write_cos_abs_max",
@@ -204,8 +214,15 @@ class MHCHealthMonitor(TorchProbe):
             verbose=verbose,
             hook_timing_enabled=hook_timing_enabled,
         )
-        # chunk_id -> running composite mapping [s*b, n, n], detached (no graph).
-        self._composite: dict[int, torch.Tensor] = {}
+        # chunk_id -> {(layer_idx, component): detached h_res [s, b, n, n]} for the
+        # microbatch currently in flight. Drained by _flush_composites() as soon as the
+        # chunk's full module set has fired, so the references live only inside one
+        # forward — where the autograd graph holds those storages anyway, making the
+        # residency cost ~free. The composite chains then walk the stash in STATIC
+        # layer order, so neither chain depends on wrapper firing order.
+        self._h_res: dict[int, dict[tuple[int, str], torch.Tensor]] = {}
+        # chunk_id -> number of hc modules discovered, i.e. a complete stash.
+        self._expected: dict[int, int] = {}
         # (module, attr_name, original_bound_method) triples, for remove_hooks() restoration.
         self._wrapped: list[tuple[nn.Module, str, object]] = []
 
@@ -266,17 +283,18 @@ class MHCHealthMonitor(TorchProbe):
             n = int(mod.n)
             for name in _METRIC_NAMES + _stream_metric_names(n) + _so4_metric_names(n) + _ENERGY_METRIC_NAMES:
                 self.declare_layer_metric(global_idx, f"{comp}_{name}")
-        # The chunk root = the attn hc of the lowest-index layer; it is the first
-        # hc module executed on this stage, so it resets the composite each forward.
-        root_idx = min(gi for gi, comp, _ in entries if comp == "attn")
-        return [(gi, comp, mod, chunk_id, comp == "attn" and gi == root_idx) for gi, comp, mod in entries]
+        # A stash of this size is a complete chunk, which is what triggers the
+        # composite pass (see _make_capture). Accumulated across calls because VPP
+        # discovery may add to the same chunk_id in several passes.
+        self._expected[chunk_id] = self._expected.get(chunk_id, 0) + len(entries)
+        return [(gi, comp, mod, chunk_id) for gi, comp, mod in entries]
 
     def _attach_hooks(self, targets):
-        for layer_idx, comp, mod, chunk_id, is_root in targets:
+        for layer_idx, comp, mod, chunk_id in targets:
             n = int(mod.n)
             # both originals are read before any setattr, so neither wrapper sees the other
             wrappers = {
-                "compute_mappings": self._make_capture(mod.compute_mappings, layer_idx, comp, chunk_id, is_root, n),
+                "compute_mappings": self._make_capture(mod.compute_mappings, layer_idx, comp, chunk_id, n),
                 "fused_h_res_h_post_bda": self._make_bda_capture(mod.fused_h_res_h_post_bda, layer_idx, comp, n),
             }
             for attr, wrapper in wrappers.items():
@@ -304,44 +322,124 @@ class MHCHealthMonitor(TorchProbe):
 
     def remove_hooks(self):
         # Restore the original bound methods and drop all cross-call state so the
-        # monitor holds no module references or composite tensors after teardown.
+        # monitor holds no module references or h_res tensors after teardown.
         for mod, attr, orig in self._wrapped:
             try:
                 delattr(mod, attr)  # fall back to the class method
             except AttributeError:
                 setattr(mod, attr, orig)
         self._wrapped = []
-        self._composite.clear()
+        self._h_res.clear()
+        self._expected.clear()
         super().remove_hooks()
 
     def step(self, global_step: int | None = None):
+        # Drain any stash a partial forward left behind, so those composite values land
+        # in this step's flush. A complete chunk already drained inside the forward.
+        self._flush_composites()
         super().step(global_step=global_step)
-        # Release the running composite between train steps so a [s*b, n, n]
-        # buffer never sits idle in VRAM; the root reseeds it next forward, so
-        # clearing is correctness-neutral.
-        self._composite.clear()
+
+    # ------------------------------------------------------------------
+    # Deferred composite chains
+    # ------------------------------------------------------------------
+
+    def _flush_composites(self, chunk_id: int | None = None) -> None:
+        """Build both composite chains from the stashed ``h_res``, in static layer order.
+
+        For hc modules ``0..N`` in execution order (each applying ``r <- H_k r + w_k``):
+
+            prefix   M_l = H_l @ ... @ H_0      d(output of l) / d(stage input)
+            suffix   S_l = H_N @ ... @ H_l      d(stage output) / d(input of l)
+
+        The gradient reaching module ``l``'s input is ``S_l^T g``, so the suffix chain is
+        what answers "how much is a gradient amplified on its way from the loss down to
+        layer l" — the prefix cannot, it looks the other way. ``amax_gain(S, dim=-2)``
+        (max-abs column sum) is the row sum of ``S^T``, i.e. the backward bound.
+
+        Deferred because ``S_l`` needs the layers above ``l``, which have not run when
+        ``l``'s hook fires. Walking a static order also makes both chains independent of
+        wrapper firing order, which matters: under ``recompute_granularity=full`` the
+        only grad-enabled pass is the BACKWARD replay, and it fires modules in
+        DESCENDING order.
+
+        ``chunk_id=None`` drains every chunk (called from ``step()`` to catch a stash
+        left partial by an incomplete forward).
+
+        Cost: two bmm chains over ``[s*b, n, n]``, one live intermediate each.
+        """
+        targets = list(self._h_res) if chunk_id is None else [chunk_id]
+        for cid in targets:
+            stash = self._h_res.pop(cid, None)
+            if not stash:
+                continue
+            # Static execution order: layer index, then attn before mlp within a layer.
+            keys = sorted(stash, key=lambda k: (k[0], _COMPONENT_RANK.get(k[1], 0)))
+            try:
+                mats = [stash[k].reshape(-1, stash[k].shape[-1], stash[k].shape[-1]) for k in keys]
+                shapes = {tuple(m.shape) for m in mats}
+                if len(shapes) > 1:
+                    # Variable s*b across modules (should not happen within one forward);
+                    # a chain would be ill-defined, so skip rather than report garbage.
+                    if self.verbose:
+                        logger.warning(f"[MHCMonitor] chunk {cid}: mixed h_res shapes {shapes}; skipping composites")
+                    continue
+                self._record_chain(keys, mats, "fwd")
+                self._record_chain(keys, mats, "bwd")
+            except Exception as e:
+                if self.verbose:
+                    logger.error(f"[MHCMonitor] Composite error on chunk {cid}: {e}")
+
+    def _record_chain(self, keys, mats, direction: str) -> None:
+        """Accumulate one chain and record its metrics.
+
+        ``fwd``: ascending, ``M_l = H_l @ M_{l-1}`` — new factor on the LEFT.
+        ``bwd``: descending, ``S_l = S_{l+1} @ H_l`` — new factor on the RIGHT.
+        """
+        ascending = direction == "fwd"
+        order = range(len(mats)) if ascending else range(len(mats) - 1, -1, -1)
+        gain_dim = -1 if ascending else -2
+
+        acc = None
+        with torch.no_grad():
+            for i in order:
+                h = mats[i]
+                if acc is None:
+                    acc = h.clone()  # noqa: SIM108 — own the buffer; never alias the model's h_res
+                elif ascending:
+                    acc = torch.bmm(h, acc)
+                else:
+                    acc = torch.bmm(acc, h)
+
+                layer_idx, component = keys[i]
+                self.record_layer_metric(
+                    layer_idx, f"{component}_composite_amax_gain_{direction}", amax_gain(acc, dim=gain_dim)
+                )
+                orth_mean, orth_ratio = orthogonality_deviation(acc.unsqueeze(0))
+                self.record_layer_metric(layer_idx, f"{component}_composite_h_res_orth_dev_{direction}", orth_mean)
+                self.record_layer_metric(
+                    layer_idx, f"{component}_composite_h_res_orth_dev_{direction}_max_med_ratio", orth_ratio
+                )
 
     # ------------------------------------------------------------------
     # Capture wrapper (the hot path)
     # ------------------------------------------------------------------
 
-    def _make_capture(self, orig, layer_idx: int, component: str, chunk_id: int, is_root: bool, n_streams: int):
+    def _make_capture(self, orig, layer_idx: int, component: str, chunk_id: int, n_streams: int):
         """Wrap ``compute_mappings`` to record metrics from its real return value.
 
         VRAM safety: the mappings arrive attached to the training autograd graph;
-        we ``.detach()`` them and do all metric/composite math under ``no_grad`` so
-        no stored tensor pins the graph through backward. The composite slot holds
-        one detached ``[s*b, n, n]`` tensor per chunk (cloned on seed so it never
-        aliases the model's ``h_res`` storage); ``step()`` clears it.
+        we ``.detach()`` them and do all metric math under ``no_grad`` so no stored
+        tensor pins the graph through backward. ``h_res`` is stashed by (layer,
+        component) for the deferred composite pass; the stash holds the detached view,
+        which shares storage the model keeps alive until backward anyway.
         """
 
         def wrapped(x):
             out = orig(x)  # the real mappings the model consumes — returned unchanged
-            # Gate the whole capture: metrics are only recorded on monitored steps,
-            # and the composite is reset at the chunk root on each such step, so
-            # gating here keeps the composite self-consistent (root reset -> ordered
-            # bmm builds within one monitored forward). _should_monitor() also
-            # requires grad enabled, selecting the training (not a no-grad) forward.
+            # Gate the whole capture: metrics are only recorded on monitored steps.
+            # _should_monitor() also requires grad enabled — under
+            # recompute_granularity=full that is the BACKWARD replay, not the forward,
+            # which is why the composite chains must not depend on firing order.
             if not self._should_monitor():
                 return out
             try:
@@ -392,29 +490,14 @@ class MHCHealthMonitor(TorchProbe):
                         self.record_layer_metric(layer_idx, f"{component}_h_res_theta_lo", theta_lo)
                         self.record_layer_metric(layer_idx, f"{component}_h_res_theta_hi", theta_hi)
 
-                    # Composite mapping M_k = h_res_k @ M_{k-1} (per token).
-                    s, b, n, _ = h_res.shape
-                    hb = h_res.reshape(s * b, n, n)
-                    prev = self._composite.get(chunk_id)
-                    # Reset at the chunk root each forward; also self-heals on first
-                    # fire / shape drift (variable s*b across microbatches). identity @
-                    # h_res == h_res, so seed with h_res; clone() so the slot owns a
-                    # fresh buffer and never pins the model's h_res storage.
-                    if is_root or prev is None or prev.shape != hb.shape:  # noqa: SIM108
-                        M = hb.clone()
-                    else:
-                        M = torch.bmm(hb, prev)  # fresh tensor, no graph
-                    self._composite[chunk_id] = M
-
-                    self.record_layer_metric(layer_idx, f"{component}_composite_amax_gain_fwd", amax_gain(M, dim=-1))
-                    self.record_layer_metric(layer_idx, f"{component}_composite_amax_gain_bwd", amax_gain(M, dim=-2))
-                    comp_orth_mean, comp_orth_ratio = orthogonality_deviation(M.view(s, b, n, n))
-                    self.record_layer_metric(layer_idx, f"{component}_composite_h_res_orth_dev", comp_orth_mean)
-                    self.record_layer_metric(
-                        layer_idx,
-                        f"{component}_composite_h_res_orth_dev_max_med_ratio",
-                        comp_orth_ratio,
-                    )
+                    # Composite mappings need the layers ABOVE this one, which have not
+                    # run yet. Stash h_res; drain as soon as this chunk's full module set
+                    # has fired, so the stash never spans microbatches (with GA that would
+                    # pin ga_steps x modules tensors instead of one microbatch's worth).
+                    stash = self._h_res.setdefault(chunk_id, {})
+                    stash[(layer_idx, component)] = h_res
+                    if len(stash) >= self._expected.get(chunk_id, 0):
+                        self._flush_composites(chunk_id)
             except Exception as e:
                 if self.verbose:
                     logger.error(f"[MHCMonitor] Error layer {layer_idx}/{component}: {e}")

@@ -7,7 +7,7 @@
 - **[QK Stats](./docs/qk_logits.md)** — 注意力 QK 统计监控 (9 指标)
 - **[Massive Activation Health](./docs/massive_activation.md)** — Residual Stream Massive Activation 健康监控 (21 指标)
 - **[PLE Health](./docs/ple_health.md)** — Per-Layer Embedding 健康监控 (7 指标)
-- **[mHC Health](./docs/mhc_health.md)** — Manifold-Constrained Hyper-Connections 映射与多流几何监控 (每 hc 模块 `27 + n` 指标，`n = 4` 时 `29 + n`；仅在开启 mHC 层时生效)
+- **[mHC Health](./docs/mhc_health.md)** — Manifold-Constrained Hyper-Connections 映射与多流几何监控 (每 hc 模块 `29 + n` 指标，`n = 4` 时 `31 + n`；仅在开启 mHC 层时生效)
 - **[LAR (Log-Alignment Ratio)](./docs/lar.md)** — output_layer + 每个 MoE router 的 LAR，泛化/过拟合诊断信号（无 SVD、每步 O(1) 通信）
 
 外加一个非指标类工具：
@@ -316,9 +316,9 @@ Massive activations 是 pre-norm Transformer 的**架构副产品**，独立于�
 这些映射所作用的 `n` 条残差流本身的几何，以及每次更新 `out = h_res x + w`（`w = h_post oᵗ`）的能量分解
 `‖out‖² = ‖h_res x‖² + W + X`。只在模型开启 mHC 层时生效——mHC 类无法 import 或模型不含
 `HyperConnectionTransformerLayer` 时该 monitor 为彻底 no-op（不 wrap、不产生指标）。每层含两个
-hyper-connection 模块（`attn` / `mlp`），各产出以下 `27 + n` 个指标（`n = num_residual_streams`；`n = 4`
-时另加两条 `＋` 标记的 `SO(4)` 转角序列，共 `29 + n`，它们不参与下表编号），
-指标名以 `attn_` / `mlp_` 前缀区分；除两个 `*_max_med_ratio`、`*_stream_norm_max_min_ratio`、
+hyper-connection 模块（`attn` / `mlp`），各产出以下 `29 + n` 个指标（`n = num_residual_streams`；`n = 4`
+时另加两条 `＋` 标记的 `SO(4)` 转角序列，共 `31 + n`，它们不参与下表编号），
+指标名以 `attn_` / `mlp_` 前缀区分；除三个 `*_max_med_ratio`、`*_stream_norm_max_min_ratio`、
 `*_stream_gram_offdiag_max`、`*_mix_write_cos_abs_max`（按 max 聚合）外全部按 token/batch 求均值。
 
 | # | 指标 | 日志键 | 公式 | 级别 | 诊断意义 |
@@ -329,12 +329,14 @@ hyper-connection 模块（`attn` / `mlp`），各产出以下 `27 + n` 个指标
 | 4 | `{c}_h_post_std` | `mhc_health/layer_{i}/{c}_h_post_std` | `std(h_post)` | 每层+全局 | 扩展门离散度 |
 | 5 | `{c}_amax_gain_fwd` | `mhc_health/layer_{i}/{c}_amax_gain_fwd` | `mean_t(max_i \|Σ_j h_res_ij\|)` | 每层+全局 | 单层前向最坏放大 (≈1) |
 | 6 | `{c}_amax_gain_bwd` | `mhc_health/layer_{i}/{c}_amax_gain_bwd` | `mean_t(max_j \|Σ_i h_res_ij\|)` | 每层+全局 | 单层反向最坏放大 (≈1) |
-| 7 | `{c}_composite_amax_gain_fwd` | `mhc_health/layer_{i}/{c}_composite_amax_gain_fwd` | 复合映射 `∏ h_res` 的行和 | 每层+全局 | 跨层累积前向放大 |
-| 8 | `{c}_composite_amax_gain_bwd` | `mhc_health/layer_{i}/{c}_composite_amax_gain_bwd` | 复合映射 `∏ h_res` 的列和 | 每层+全局 | 跨层累积反向放大 |
+| 7 | `{c}_composite_amax_gain_fwd` | `mhc_health/layer_{i}/{c}_composite_amax_gain_fwd` | **前缀积** `M_l = H_l ⋯ H_0` 的行和 | 每层+全局 | 从 stage 入口累积到本层的前向放大 |
+| 8 | `{c}_composite_amax_gain_bwd` | `mhc_health/layer_{i}/{c}_composite_amax_gain_bwd` | **后缀积** `S_l = H_N ⋯ H_l` 的列和 | 每层+全局 | 梯度从 stage 出口传到本层的反向放大（`S_lᵀ` 就是那段 Jacobian） |
 | 9 | `{c}_h_res_orth_dev` | `mhc_health/layer_{i}/{c}_h_res_orth_dev` | `mean_t(\|\|h_resᵀ h_res − I\|\|_F)` | 每层+全局 | 偏离正交（等距）的程度，0 = 保范 |
-| 10 | `{c}_composite_h_res_orth_dev` | `mhc_health/layer_{i}/{c}_composite_h_res_orth_dev` | 同上，作用于复合映射 | 每层+全局 | 跨层累积的非等距程度 |
+| 10a | `{c}_composite_h_res_orth_dev_fwd` | `mhc_health/layer_{i}/{c}_composite_h_res_orth_dev_fwd` | 同上，作用于前缀积 | 每层+全局 | 入口到本层累积的非等距程度 |
+| 10b | `{c}_composite_h_res_orth_dev_bwd` | `mhc_health/layer_{i}/{c}_composite_h_res_orth_dev_bwd` | 同上，作用于后缀积 | 每层+全局 | 本层以上累积的非等距程度 |
 | 11 | `{c}_h_res_orth_dev_max_med_ratio` | `mhc_health/layer_{i}/{c}_h_res_orth_dev_max_med_ratio` | `(max_t d + ε) / (med_t d + ε)`，`d = \|\|h_resᵀ h_res − I\|\|_F` | 每层+全局（**max** 聚合） | 逐 token 尾部：1.0 = 无尾，≫1 = 少数 token 完全不正交而均值仍显示 0 |
-| 12 | `{c}_composite_h_res_orth_dev_max_med_ratio` | `mhc_health/layer_{i}/{c}_composite_h_res_orth_dev_max_med_ratio` | 同上，作用于复合映射 | 每层+全局（**max** 聚合） | 跨层累积后的尾部集中度 |
+| 12a | `{c}_composite_h_res_orth_dev_fwd_max_med_ratio` | `mhc_health/layer_{i}/{c}_composite_h_res_orth_dev_fwd_max_med_ratio` | 同上，作用于前缀积 | 每层+全局（**max** 聚合） | 前向累积后的尾部集中度 |
+| 12b | `{c}_composite_h_res_orth_dev_bwd_max_med_ratio` | `mhc_health/layer_{i}/{c}_composite_h_res_orth_dev_bwd_max_med_ratio` | 同上，作用于后缀积 | 每层+全局（**max** 聚合） | 反向累积后的尾部集中度 |
 | 13 | `{c}_h_res_beta_mean` | `mhc_health/layer_{i}/{c}_h_res_beta_mean` | `mean_t(n − tr(h_res))` | 每层+全局 | rank-1 擦除强度 β（非擦除构型 = 迹亏损） |
 | 14 | `{c}_h_res_beta_std` | `mhc_health/layer_{i}/{c}_h_res_beta_std` | `std_t(n − tr(h_res))` | 每层+全局 | β 的 token 级离散度，0 = 退化成常数 |
 | 15 | `{c}_h_res_outer_dev` | `mhc_health/layer_{i}/{c}_h_res_outer_dev` | `mean_t(\|\|h_res − h_post ⊗ h_pre\|\|_F)` | 每层+全局 | 残差混合中「读写外积」解释不掉的部分 |
@@ -354,8 +356,12 @@ hyper-connection 模块（`attn` / `mlp`），各产出以下 `27 + n` 个指标
 | 26+n | `{c}_resid_write_cos` | `mhc_health/layer_{i}/{c}_resid_write_cos` | `mean_t(⟨x, w⟩ / (‖x‖‖w‖))` | 每层+全局 | 混合**前**的读写对齐；反 Hermite 写入会把它结构性归零 |
 | 27+n | `{c}_resid_gain` | `mhc_health/layer_{i}/{c}_resid_gain` | `mean_t(‖out‖²/R)` | 每层+全局 | 单模块能量增益；未加干预时必须等于 `1 + W/R + X/R`（记账自检），并区分加性/乘性增长 |
 
-`{c}` ∈ `{attn, mlp}`。复合映射为本 pipeline stage / VPP chunk 内 `h_res` 的累乘（每次 forward 在本 stage 首个
-hc 模块处重置）——PP=1 时精确，PP>1 时为 stage 局部近似。两个 `*_max_med_ratio` 与两条 stream 尾部指标跨
+`{c}` ∈ `{attn, mlp}`。两条复合链都在本 pipeline stage / VPP chunk 内累乘 `h_res`：`fwd` 走**前缀积**
+（`M_l = H_l ⋯ H_0`，入口→本层），`bwd` 走**后缀积**（`S_l = H_N ⋯ H_l`，本层→出口，其转置就是梯度那段
+Jacobian）。后缀需要本层以上的 `h_res`，故两条链都**延迟到 chunk 模块集齐后**按静态层序构建——因此结果不依赖
+wrapper 触发顺序，`recompute_granularity=full`（只在反向按降序触发）与 `selective` 给出相同值。
+PP=1 时精确，PP>1 时为 stage 局部近似。Sinkhorn chart 下双随机之积仍双随机，两条 amax-gain 恒 ≈1.0，只当收敛哨兵；
+signed chart（quat / cayley / orth / erase）下才有信息量。三个 `*_max_med_ratio` 与两条 stream 尾部指标跨
 microbatch / rank 按 **max** 合成（取均值会把它们要抓的尾部/失衡抹平），因此全局值是「各 rank 值的最大者」
 而非全局精确比值。多流几何取自 wrapper 入参 `x`（聚合前的 `[s, b, n*C]` 隐状态），不需要额外 hook；
 序列并行下 `x` 按 token 切分但隐藏维完整，逐 token 的量在本 rank 即完备。

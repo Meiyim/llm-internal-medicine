@@ -498,7 +498,7 @@ class MHCMonitorTest(unittest.TestCase):
 
     def _drive(self, targets, x_dim):
         # Fire each wrapped compute_mappings (grad enabled -> _should_monitor passes).
-        for _, _, mod, _, _ in targets:
+        for _, _, mod, _ in targets:
             mod.compute_mappings(torch.randn(4, 2, x_dim))
 
     def test_identity_composite_stays_unit_gain(self):
@@ -527,9 +527,11 @@ class MHCMonitorTest(unittest.TestCase):
                 "composite_amax_gain_fwd",
                 "composite_amax_gain_bwd",
                 "h_res_orth_dev",
-                "composite_h_res_orth_dev",
+                "composite_h_res_orth_dev_fwd",
+                "composite_h_res_orth_dev_bwd",
                 "h_res_orth_dev_max_med_ratio",
-                "composite_h_res_orth_dev_max_med_ratio",
+                "composite_h_res_orth_dev_fwd_max_med_ratio",
+                "composite_h_res_orth_dev_bwd_max_med_ratio",
                 "h_res_beta_mean",
                 "h_res_beta_std",
                 "h_res_outer_dev",
@@ -552,9 +554,10 @@ class MHCMonitorTest(unittest.TestCase):
             # h_res == I -> orthogonal, zero trace deficit; ||I - 0.5*J||_F == 2.0.
             self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_orth_dev"], 0.0, places=5)
             self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_orth_dev_max_med_ratio"], 1.0, places=5)
-            self.assertAlmostEqual(
-                latest[f"mhc_health/layer_0/{comp}_composite_h_res_orth_dev_max_med_ratio"], 1.0, places=5
-            )
+            for d in ("fwd", "bwd"):
+                self.assertAlmostEqual(
+                    latest[f"mhc_health/layer_0/{comp}_composite_h_res_orth_dev_{d}_max_med_ratio"], 1.0, places=5
+                )
             self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_beta_mean"], 0.0, places=5)
             self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_beta_std"], 0.0, places=5)
             self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_outer_dev"], 2.0, places=5)
@@ -585,7 +588,7 @@ class MHCMonitorTest(unittest.TestCase):
         c = 4
         streams = torch.eye(c) * torch.tensor([1.0, 2.0, 3.0, 4.0]).unsqueeze(-1)
         x = streams.reshape(1, 1, n * c).expand(4, 2, n * c).contiguous()
-        for _, _, mod, _, _ in targets:
+        for _, _, mod, _ in targets:
             mod.compute_mappings(x)
         monitor.step()
 
@@ -668,7 +671,7 @@ class MHCMonitorTest(unittest.TestCase):
         o = torch.randn(s, b, c)
         h_res = torch.eye(n).reshape(1, 1, n, n).expand(s, b, n, n).contiguous()
         h_post = torch.ones(s, b, n)
-        for _, _, mod, _, _ in targets:
+        for _, _, mod, _ in targets:
             mod.fused_h_res_h_post_bda(h_res, x.reshape(s, b, n * c), h_post, (o, bias), 0.0, True, False)
         o_eff = o if bias is None else o + bias
         r = x.pow(2).sum(dim=(-2, -1))
@@ -731,32 +734,209 @@ class MHCMonitorTest(unittest.TestCase):
         self.assertEqual(hc.compute_mappings.__func__, FakeHC.compute_mappings)
         self.assertEqual(hc.fused_h_res_h_post_bda.__func__, FakeHC.fused_h_res_h_post_bda)
         self.assertEqual(monitor._wrapped, [])
-        self.assertEqual(monitor._composite, {})
+        self.assertEqual(monitor._h_res, {})
+        self.assertEqual(monitor._expected, {})
 
     def test_no_graph_retention(self):
         n, s, b = 4, 2, 3
         ident = torch.eye(n).reshape(1, 1, n, n).expand(s, b, n, n).contiguous()
         # Outputs attached to a graph (require grad) — the wrapper must detach.
         leaf = torch.zeros(s, b, n, requires_grad=True)
-        h_pre = leaf + 0.5
-        h_post = leaf + 1.0
-        h_res = ident * (leaf.sum() + 1.0)  # requires_grad, has grad_fn
-        hc = FakeHC(n=n, layer_number=1, h_pre=h_pre, h_post=h_post, h_res=h_res)
-        layer = FakeLayer(layer_number=1, attn=hc, mlp=hc)
-        model = _mhc_model([layer])
+
+        def make_hc(layer_number):
+            return FakeHC(
+                n=n,
+                layer_number=layer_number,
+                h_pre=leaf + 0.5,
+                h_post=leaf + 1.0,
+                h_res=ident * (leaf.sum() + 1.0),  # requires_grad, has grad_fn
+            )
+
+        # Distinct hc objects per slot: sharing one would chain the wrappers onto the
+        # same bound method, so a single call would fire all of them.
+        layers = [FakeLayer(layer_number=i + 1, attn=make_hc(i + 1), mlp=make_hc(i + 1)) for i in range(2)]
+        model = _mhc_model(layers)
 
         monitor = MHCHealthMonitor()
         targets = monitor._prepare_layers(model, chunk_id=0)
         monitor.allocate_buffers(torch.device("cpu"))
         monitor._attach_hooks(targets)
-        for _, _, mod, _, _ in targets:
-            mod.compute_mappings(torch.randn(4, 2, n * 8))
+        self.assertEqual(monitor._expected[0], 4)
 
-        stored = monitor._composite[0]
-        self.assertFalse(stored.requires_grad)
-        self.assertIsNone(stored.grad_fn)
+        # Fire one of four: the stash stays mid-flight and inspectable.
+        _, _, mod, _ = targets[0]
+        mod.compute_mappings(torch.randn(4, 2, n * 8))
+
+        stashed = list(monitor._h_res[0].values())
+        self.assertEqual(len(stashed), 1)
+        for t in stashed:
+            self.assertFalse(t.requires_grad)
+            self.assertIsNone(t.grad_fn)
         monitor.step()
-        self.assertEqual(monitor._composite, {})  # cleared between steps
+        self.assertEqual(monitor._h_res, {})  # drained at step()
+
+    def test_complete_chunk_drains_the_stash_inside_the_forward(self):
+        """With gradient accumulation the stash must not span microbatches."""
+        n, s, b = 4, 2, 3
+        layer = self._identity_layer(n, s, b)
+        model = _mhc_model([layer])
+        monitor = MHCHealthMonitor()
+        targets = monitor._prepare_layers(model, chunk_id=0)
+        monitor.allocate_buffers(torch.device("cpu"))
+        monitor._attach_hooks(targets)
+        self.assertEqual(monitor._expected[0], 2)
+
+        self._drive(targets, x_dim=n * 8)
+        self.assertEqual(monitor._h_res, {}, "a complete chunk should drain without waiting for step()")
+        monitor.step()
+        self.assertIn("mhc_health/layer_0/attn_composite_amax_gain_bwd", training_logs.get_latest(prefix="mhc_health"))
+
+
+class MHCCompositeChainTest(unittest.TestCase):
+    """Pin the two composite chains against explicit matrix products.
+
+    ``h_res`` matrices here are deliberately NON-commuting and non-doubly-stochastic:
+    under Sinkhorn every product is doubly stochastic and both gains sit at 1.0, so a
+    wrong multiplication order is invisible. These are the signed charts (quat / cayley
+    / orth) where it is not.
+    """
+
+    N = 3
+    # Two tokens carrying the SAME matrix: the per-token mean stays exact against a
+    # single [n, n] reference, while s*b > 1 keeps the unbiased std series off NaN.
+    S, B = 2, 1
+
+    def setUp(self):
+        training_logs.reset()
+        self._orig_layer_cls = mhc_monitor.HyperConnectionTransformerLayer
+        self._orig_mod_cls = mhc_monitor.HyperConnectionModule
+        mhc_monitor.HyperConnectionTransformerLayer = FakeLayer
+        mhc_monitor.HyperConnectionModule = FakeHC
+
+    def tearDown(self):
+        mhc_monitor.HyperConnectionTransformerLayer = self._orig_layer_cls
+        mhc_monitor.HyperConnectionModule = self._orig_mod_cls
+        training_logs.reset()
+
+    def _build(self, num_layers=3, seed=0):
+        """One distinct h_res per hc module; returns (model, targets, monitor, mats).
+
+        ``mats`` is the ``[n, n]`` per-module matrix in execution order (layer, then
+        attn before mlp) — the order the chains must walk.
+        """
+        torch.manual_seed(seed)
+        n = self.N
+        mats, layers = [], []
+        for li in range(num_layers):
+            slots = {}
+            for comp in ("attn", "mlp"):
+                m = torch.randn(n, n)
+                mats.append(m)
+                slots[comp] = FakeHC(
+                    n=n,
+                    layer_number=li + 1,
+                    h_pre=torch.full((self.S, self.B, n), 0.5),
+                    h_post=torch.ones(self.S, self.B, n),
+                    h_res=m.reshape(1, 1, n, n).expand(self.S, self.B, n, n).contiguous(),
+                )
+            layers.append(FakeLayer(layer_number=li + 1, attn=slots["attn"], mlp=slots["mlp"]))
+
+        model = _mhc_model(layers)
+        monitor = MHCHealthMonitor(log_per_layer=True, log_global=True)
+        targets = monitor._prepare_layers(model, chunk_id=0)
+        monitor.allocate_buffers(torch.device("cpu"))
+        monitor._attach_hooks(targets)
+        return model, targets, monitor, mats
+
+    @staticmethod
+    def _gain(mat, direction):
+        dim = -1 if direction == "fwd" else -2
+        return mat.sum(dim=dim).abs().amax().item()
+
+    def _expected(self, mats):
+        """Reference prefix / suffix products, built the long way."""
+        prefix, suffix = [], [None] * len(mats)
+        acc = None
+        for m in mats:
+            acc = m if acc is None else m @ acc  # M_l = H_l @ M_{l-1}
+            prefix.append(acc)
+        acc = None
+        for i in range(len(mats) - 1, -1, -1):
+            acc = mats[i] if acc is None else acc @ mats[i]  # S_l = S_{l+1} @ H_l
+            suffix[i] = acc
+        return prefix, suffix
+
+    def _keys_in_order(self, targets):
+        return sorted(
+            ((li, comp) for li, comp, _, _ in targets),
+            key=lambda k: (k[0], mhc_monitor._COMPONENT_RANK[k[1]]),
+        )
+
+    def _assert_chains(self, monitor, targets, mats, fire):
+        prefix, suffix = self._expected(mats)
+        fire()
+        monitor.step()
+        latest = training_logs.get_latest(prefix="mhc_health")
+
+        for i, (layer_idx, comp) in enumerate(self._keys_in_order(targets)):
+            got_fwd = latest[f"mhc_health/layer_{layer_idx}/{comp}_composite_amax_gain_fwd"]
+            got_bwd = latest[f"mhc_health/layer_{layer_idx}/{comp}_composite_amax_gain_bwd"]
+            self.assertAlmostEqual(got_fwd, self._gain(prefix[i], "fwd"), places=4, msg=f"fwd @ {i}")
+            self.assertAlmostEqual(got_bwd, self._gain(suffix[i], "bwd"), places=4, msg=f"bwd @ {i}")
+        return latest
+
+    def test_chains_match_explicit_prefix_and_suffix_products(self):
+        _, targets, monitor, mats = self._build()
+        self._assert_chains(monitor, targets, mats, lambda: self._fire(targets, ascending=True))
+
+    def test_chains_are_independent_of_firing_order(self):
+        """Under recompute_granularity=full the only grad-enabled pass is the BACKWARD
+        replay, which fires modules in DESCENDING order. The chains walk a static layer
+        order, so both directions must come out identical either way."""
+        _, targets, monitor, mats = self._build()
+        ascending = self._assert_chains(monitor, targets, mats, lambda: self._fire(targets, ascending=True))
+
+        training_logs.reset()
+        _, targets2, monitor2, mats2 = self._build()  # same seed -> same matrices
+        descending = self._assert_chains(monitor2, targets2, mats2, lambda: self._fire(targets2, ascending=False))
+
+        for key, val in ascending.items():
+            self.assertAlmostEqual(val, descending[key], places=5, msg=key)
+
+    def test_suffix_gain_is_the_backward_jacobian_bound(self):
+        """``S_l^T`` IS d(grad at l) / d(grad at output) — verified against autograd.
+
+        Each hc module applies ``r <- H r``, so composing the stack and differentiating
+        gives the gradient that actually reaches module ``l``. Its worst-case
+        amplification under the paper's ``|row sum|`` bound is ``amax_gain(S_l, dim=-2)``,
+        which is exactly what the bwd series reports.
+        """
+        n = self.N
+        _, targets, monitor, mats = self._build()
+        _, suffix = self._expected(mats)
+
+        for i in range(len(mats)):
+            r = torch.randn(n, 1, requires_grad=True)
+            x = r
+            for m in mats[i:]:
+                x = m @ x
+            g_out = torch.randn(n, 1)
+            x.backward(g_out)
+            self.assertTrue(
+                torch.allclose(r.grad, suffix[i].T @ g_out, atol=1e-5),
+                f"module {i}: grad != S_l^T g_out",
+            )
+
+    def _fire(self, targets, ascending: bool):
+        order = self._keys_in_order(targets)
+        if not ascending:
+            order = list(reversed(order))
+        by_key = {(li, comp): mod for li, comp, mod, _ in targets}
+        # Same x per module regardless of firing order, so the input-derived series
+        # (stream geometry) are comparable across the two orders too.
+        xs = {key: torch.randn(self.S, self.B, self.N * 4) for key in self._keys_in_order(targets)}
+        for key in order:
+            by_key[key].compute_mappings(xs[key])
 
 
 class MHCMonitorNoOpTest(unittest.TestCase):

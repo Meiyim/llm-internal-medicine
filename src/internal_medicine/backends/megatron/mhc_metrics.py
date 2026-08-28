@@ -219,7 +219,7 @@ def so4_angle_stats(mat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 def stream_gram_stats(
     x: torch.Tensor, n: int, eps: float = 1e-6, rel_floor: float = 1e-6
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Geometry of the ``n`` hidden STREAMS themselves (not the ``H_res`` operator).
 
     ``orthogonality_deviation`` measures the mixing MATRIX; this measures the frame it acts on.
@@ -258,7 +258,15 @@ def stream_gram_stats(
         orthogonal (mean-fixing) one it holds. Computed from ``gram`` by the parallel-axis
         identity — ``sum_i ||x_i||^2 = tr(gram)`` and ``||m||^2 = sum_ij gram_ij / n^2``, so
         ``Var = tr/n - ||m||^2`` — hence no new large tensor and no extra bmm.
-    """
+      * ``stream_eff_rank``            — participation-ratio effective rank of the ``n`` streams,
+        ``(tr G)^2 / ||G||_F^2 = (sum_i sigma_i^2)^2 / sum_i sigma_i^4`` on the per-token Gram
+        ``G = X X^T``, per token then meaned. Range ``[1, n]``: ``-> 1`` when one direction
+        carries all the stream energy (rank-1 collapse, the ``H_res -> J`` consequence),
+        ``-> n`` when the streams are orthogonal and equal-energy. This is the Renyi-2 (collision)
+        effective rank; it needs only the two Gram traces (``tr G`` from the diagonal, ``||G||_F^2``
+        as the full sum of squares), so no eigvalsh, no host sync, no new tensor. It is the
+        representation-side (consequence) reading of stream collapse — ``sigma_stats`` reads the
+        same collapse on the OPERATOR side.
     xs = x.reshape(-1, n, x.shape[-1] // n)  # [T, n, C], view
     # Gram from raw streams, fp32 only on the [T,n,n] output: upcasting x first would cost a
     # transient [T,n,C] fp32 copy (~134MB at s=8192,n=4,C=1024) inside the forward.
@@ -274,12 +282,19 @@ def stream_gram_stats(
     var = (mean_stream_energy - m_energy).clamp_min(0)
     cv = (var / m_energy.clamp_min(rel_floor * mean_stream_energy)).sqrt()
 
+    # Participation-ratio (Renyi-2) effective rank: (sum sigma^2)^2 / sum sigma^4 = (tr G)^2 / ||G||_F^2.
+    # ||G||_F^2 >= (tr G)^2 / n by Cauchy-Schwarz, so the floor only guards a fully-dead token.
+    tr_g = gram.diagonal(dim1=-2, dim2=-1).sum(dim=-1)  # [T], = sum sigma^2
+    fro2 = gram.pow(2).sum(dim=(-2, -1))  # [T], = ||G||_F^2 = sum sigma^4
+    eff_rank = (tr_g * tr_g) / fro2.clamp_min(eps)  # [T], in [1, n]
+
     return (
         norms.mean(dim=0),
         ((norms.amax(dim=-1) + eps) / (norms.amin(dim=-1) + eps)).mean(),
         off_vals.mean(),
         off_vals.abs().amax(dim=-1).mean(),
         cv.mean(),
+        eff_rank.mean(),
     )
 
 

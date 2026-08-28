@@ -20,8 +20,9 @@ mHC (Manifold-Constrained Hyper-Connections) model:
   separate (it reads only their cosine sum).
 - the ``n`` residual **streams** themselves, from the module's own input: per-stream
   L2 norm, the per-token max/min norm ratio, the inter-stream cosine off-diagonal of the
-  stream Gram (SIGNED mean + per-token ``|cos|`` max), and the cross-stream coefficient
-  of variation ``stream_cv``. Everything above
+  stream Gram (SIGNED mean + per-token ``|cos|`` max), the cross-stream coefficient
+  of variation ``stream_cv``, and the participation-ratio effective rank ``stream_eff_rank``
+  (how many of the ``n`` stream directions actually carry energy). Everything above
   reduces over the stream axis, so a dominant stream or a collapse of all ``n``
   onto one direction is invisible in it; these series are what see that.
 - the **energy split** of the update ``out = h_res x + w`` (``w = h_post o^T``):
@@ -31,7 +32,7 @@ mHC (Manifold-Constrained Hyper-Connections) model:
   module. See ``conf/mai_ladder/mhc/R7_NORM_CONTROL.md`` in the training repo.
 
 Per hyper-connection module (a layer has two: ``attn`` and ``mlp``) we emit
-``34 + n`` series (``36 + n`` at ``n = 4``), name-prefixed by component — mean-aggregated
+``35 + n`` series (``37 + n`` at ``n = 4``), name-prefixed by component — mean-aggregated
 except the three orth_dev / cos ratios, the norm ratio and the Gram max, which are
 max-aggregated:
 
@@ -52,7 +53,7 @@ max-aggregated:
     {attn,mlp}_h_res_theta_lo           {attn,mlp}_h_res_theta_hi      (n = 4 only)
     {attn,mlp}_stream_norm_0 .. _{n-1}  {attn,mlp}_stream_norm_max_min_ratio
     {attn,mlp}_stream_gram_offdiag_mean {attn,mlp}_stream_gram_offdiag_max
-    {attn,mlp}_stream_cv
+    {attn,mlp}_stream_cv                {attn,mlp}_stream_eff_rank
     {attn,mlp}_write_over_resid         {attn,mlp}_cross_over_resid
     {attn,mlp}_cross_over_write         {attn,mlp}_mix_write_cos
     {attn,mlp}_mix_write_cos_abs_max    {attn,mlp}_resid_write_cos
@@ -141,6 +142,7 @@ _STREAM_METRIC_NAMES = (
     "stream_gram_offdiag_mean",
     "stream_gram_offdiag_max",
     "stream_cv",
+    "stream_eff_rank",
 )
 
 
@@ -466,13 +468,16 @@ class MHCHealthMonitor(TorchProbe):
                     h_res = h_res.detach()
 
                     # Stream geometry of this module's own input, before any mixing.
-                    s_norms, norm_ratio, gram_mean, gram_max, stream_cv = stream_gram_stats(x.detach(), n_streams)
+                    s_norms, norm_ratio, gram_mean, gram_max, stream_cv, eff_rank = stream_gram_stats(
+                        x.detach(), n_streams
+                    )
                     for i in range(n_streams):
                         self.record_layer_metric(layer_idx, f"{component}_stream_norm_{i}", s_norms[i])
                     self.record_layer_metric(layer_idx, f"{component}_stream_norm_max_min_ratio", norm_ratio)
                     self.record_layer_metric(layer_idx, f"{component}_stream_gram_offdiag_mean", gram_mean)
                     self.record_layer_metric(layer_idx, f"{component}_stream_gram_offdiag_max", gram_max)
                     self.record_layer_metric(layer_idx, f"{component}_stream_cv", stream_cv)
+                    self.record_layer_metric(layer_idx, f"{component}_stream_eff_rank", eff_rank)
 
                     pre_mean, pre_std = gate_stats(h_pre)
                     post_mean, post_std = gate_stats(h_post)

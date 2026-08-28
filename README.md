@@ -7,7 +7,7 @@
 - **[QK Stats](./docs/qk_logits.md)** — 注意力 QK 统计监控 (9 指标)
 - **[Massive Activation Health](./docs/massive_activation.md)** — Residual Stream Massive Activation 健康监控 (21 指标)
 - **[PLE Health](./docs/ple_health.md)** — Per-Layer Embedding 健康监控 (7 指标)
-- **[mHC Health](./docs/mhc_health.md)** — Manifold-Constrained Hyper-Connections 映射与多流几何监控 (每 hc 模块 `34 + n` 指标，`n = 4` 时 `36 + n`；仅在开启 mHC 层时生效)
+- **[mHC Health](./docs/mhc_health.md)** — Manifold-Constrained Hyper-Connections 映射与多流几何监控 (每 hc 模块 `35 + n` 指标，`n = 4` 时 `37 + n`；仅在开启 mHC 层时生效)
 - **[LAR (Log-Alignment Ratio)](./docs/lar.md)** — output_layer + 每个 MoE router 的 LAR，泛化/过拟合诊断信号（无 SVD、每步 O(1) 通信）
 
 外加一个非指标类工具：
@@ -316,8 +316,8 @@ Massive activations 是 pre-norm Transformer 的**架构副产品**，独立于�
 这些映射所作用的 `n` 条残差流本身的几何，以及每次更新 `out = h_res x + w`（`w = h_post oᵗ`）的能量分解
 `‖out‖² = ‖h_res x‖² + W + X`。只在模型开启 mHC 层时生效——mHC 类无法 import 或模型不含
 `HyperConnectionTransformerLayer` 时该 monitor 为彻底 no-op（不 wrap、不产生指标）。每层含两个
-hyper-connection 模块（`attn` / `mlp`），各产出以下 `34 + n` 个指标（`n = num_residual_streams`；`n = 4`
-时另加两条 `＋` 标记的 `SO(4)` 转角序列，共 `36 + n`，它们不参与下表编号），
+hyper-connection 模块（`attn` / `mlp`），各产出以下 `35 + n` 个指标（`n = num_residual_streams`；`n = 4`
+时另加两条 `＋` 标记的 `SO(4)` 转角序列，共 `37 + n`，它们不参与下表编号），
 指标名以 `attn_` / `mlp_` 前缀区分；除三个 `*_max_med_ratio`、`*_stream_norm_max_min_ratio`、
 `*_stream_gram_offdiag_max`、`*_mix_write_cos_abs_max`（按 max 聚合）外全部按 token/batch 求均值。
 
@@ -353,13 +353,14 @@ hyper-connection 模块（`attn` / `mlp`），各产出以下 `34 + n` 个指标
 | 19+n | `{c}_stream_gram_offdiag_mean` | `mhc_health/layer_{i}/{c}_stream_gram_offdiag_mean` | `mean_t mean_{j≠k} cos(x_j, x_k)`，**带符号** | 每层+全局 | 流间方向关系 ∈ [−1,1]：0 = 正交，+1 = 塌缩到共同均值，负 = 反向对齐（`\|cos\|` 分不开后两者） |
 | 20+n | `{c}_stream_gram_offdiag_max` | `mhc_health/layer_{i}/{c}_stream_gram_offdiag_max` | `mean_t max_{j≠k} \|cos(x_j, x_k)\|` | 每层+全局（**max** 聚合） | 上一条的逐 token 尾部：少数 token 塌缩时均值仍很小；保持 `\|cos\|`（带符号 max 会漏掉反向对齐的尾巴） |
 | 21+n | `{c}_stream_cv` | `mhc_health/layer_{i}/{c}_stream_cv` | `mean_t(√Var / ‖m‖)`，`m = mean_k x_k`，`Var = (1/n)Σ_k‖x_k − m‖²` | 每层+全局 | 跨流变异系数：→0 = 流塌缩到共同均值。与 `composite_h_res_sigma_min_fwd`（机制）配对成「后果」侧证据 |
-| 22+n | `{c}_write_over_resid` | `mhc_health/layer_{i}/{c}_write_over_resid` | `mean_t(W/R)`，`W = ‖h_post‖²‖o‖²`，`R = ‖x‖²` | 每层+全局 | 单次写入相对残差的能量占比 |
-| 23+n | `{c}_cross_over_resid` | `mhc_health/layer_{i}/{c}_cross_over_resid` | `mean_t(X/R)`，`X = 2⟨h_res x, w⟩` | 每层+全局 | **有符号**交叉项：Cayley 与球面写门都约束不到它，负值 = 净擦除 |
-| 24+n | `{c}_cross_over_write` | `mhc_health/layer_{i}/{c}_cross_over_write` | `mean_t(X/W′)`，`W′ = max(W, 1e-6·R)` | 每层+全局 | 交叉项相对写入能量；`< −1` ⟹ 该模块整体在减少残差能量 |
-| 25+n | `{c}_mix_write_cos` | `mhc_health/layer_{i}/{c}_mix_write_cos` | `mean_t(X / (2√(R·W′)))` | 每层+全局 | `cos θ ∈ [−1,1]`，尺度无关、可跨层比；R7 选型判据 |
-| 26+n | `{c}_mix_write_cos_abs_max` | `mhc_health/layer_{i}/{c}_mix_write_cos_abs_max` | `max_t \|cos θ\|` | 每层+全局（**max** 聚合） | 对齐写入的逐 token 尾部 |
-| 27+n | `{c}_resid_write_cos` | `mhc_health/layer_{i}/{c}_resid_write_cos` | `mean_t(⟨x, w⟩ / (‖x‖‖w‖))` | 每层+全局 | 混合**前**的读写对齐；反 Hermite 写入会把它结构性归零 |
-| 28+n | `{c}_resid_gain` | `mhc_health/layer_{i}/{c}_resid_gain` | `mean_t(‖out‖²/R)` | 每层+全局 | 单模块能量增益；未加干预时必须等于 `1 + W/R + X/R`（记账自检），并区分加性/乘性增长 |
+| 22+n | `{c}_stream_eff_rank` | `mhc_health/layer_{i}/{c}_stream_eff_rank` | `mean_t((tr G)² / ‖G‖_F²)`，`G = X Xᵗ` 为逐 token 流 Gram | 每层+全局 | 参与比（Rényi-2）有效秩 ∈ [1, n]：→1 = 秩 1 塌缩，→n = 各流正交等能量。**有绝对刻度**（读数即「实际用了几条流」），与 `stream_cv` 互补：CV 是一阶量，有效秩是二阶谱量，能抓到「流两两正交但其中几条量级近零」；仅用 Gram 两个迹，**无 `eigvalsh`、无 host sync** |
+| 23+n | `{c}_write_over_resid` | `mhc_health/layer_{i}/{c}_write_over_resid` | `mean_t(W/R)`，`W = ‖h_post‖²‖o‖²`，`R = ‖x‖²` | 每层+全局 | 单次写入相对残差的能量占比 |
+| 24+n | `{c}_cross_over_resid` | `mhc_health/layer_{i}/{c}_cross_over_resid` | `mean_t(X/R)`，`X = 2⟨h_res x, w⟩` | 每层+全局 | **有符号**交叉项：Cayley 与球面写门都约束不到它，负值 = 净擦除 |
+| 25+n | `{c}_cross_over_write` | `mhc_health/layer_{i}/{c}_cross_over_write` | `mean_t(X/W′)`，`W′ = max(W, 1e-6·R)` | 每层+全局 | 交叉项相对写入能量；`< −1` ⟹ 该模块整体在减少残差能量 |
+| 26+n | `{c}_mix_write_cos` | `mhc_health/layer_{i}/{c}_mix_write_cos` | `mean_t(X / (2√(R·W′)))` | 每层+全局 | `cos θ ∈ [−1,1]`，尺度无关、可跨层比；R7 选型判据 |
+| 27+n | `{c}_mix_write_cos_abs_max` | `mhc_health/layer_{i}/{c}_mix_write_cos_abs_max` | `max_t \|cos θ\|` | 每层+全局（**max** 聚合） | 对齐写入的逐 token 尾部 |
+| 28+n | `{c}_resid_write_cos` | `mhc_health/layer_{i}/{c}_resid_write_cos` | `mean_t(⟨x, w⟩ / (‖x‖‖w‖))` | 每层+全局 | 混合**前**的读写对齐；反 Hermite 写入会把它结构性归零 |
+| 29+n | `{c}_resid_gain` | `mhc_health/layer_{i}/{c}_resid_gain` | `mean_t(‖out‖²/R)` | 每层+全局 | 单模块能量增益；未加干预时必须等于 `1 + W/R + X/R`（记账自检），并区分加性/乘性增长 |
 
 `{c}` ∈ `{attn, mlp}`。两条复合链都在本 pipeline stage / VPP chunk 内累乘 `h_res`：`fwd` 走**前缀积**
 （`M_l = H_l ⋯ H_0`，入口→本层），`bwd` 走**后缀积**（`S_l = H_N ⋯ H_l`，本层→出口，其转置就是梯度那段
@@ -369,7 +370,7 @@ PP=1 时精确，PP>1 时为 stage 局部近似。Sinkhorn chart 下双随机之
 signed chart（quat / cayley / orth / erase）下才有信息量。**复合 σ 则相反**：Sinkhorn 下它才是主信号 ——
 双随机固定流均值但压扁 `1^⊥`，累乘后把 `n` 条流压到一条方向上（实测 σ_min 12 层后为 0），
 而保均值正交（R3-Cayley / R9）在任何深度都是 `1^⊥` 上的等距（σ_min ≡ 1）。
-`stream_cv` 是这件事的**后果**侧读数，二者应同步移动。
+`stream_cv` 与 `stream_eff_rank` 是这件事的**后果**侧读数，三者应同步移动（σ_min → 0 / CV → 0 / 有效秩 → 1）。
 三个 `*_max_med_ratio` 与两条 stream 尾部指标跨
 microbatch / rank 按 **max** 合成（取均值会把它们要抓的尾部/失衡抹平），因此全局值是「各 rank 值的最大者」
 而非全局精确比值。多流几何取自 wrapper 入参 `x`（聚合前的 `[s, b, n*C]` 隐状态），不需要额外 hook；

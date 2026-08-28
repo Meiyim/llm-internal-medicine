@@ -342,7 +342,7 @@ class MHCMetricsTest(unittest.TestCase):
         n, c = 4, 4
         streams = torch.eye(c) * torch.tensor([1.0, 2.0, 3.0, 4.0]).unsqueeze(-1)
         x = streams.reshape(1, 1, n * c).expand(3, 2, n * c).contiguous()
-        norms, ratio, off_mean, off_max, _ = mhc_metrics.stream_gram_stats(x, n)
+        norms, ratio, off_mean, off_max, _, _ = mhc_metrics.stream_gram_stats(x, n)
         self.assertEqual(tuple(norms.shape), (n,))
         for i, expected in enumerate((1.0, 2.0, 3.0, 4.0)):
             self.assertAlmostEqual(norms[i].item(), expected, places=5)
@@ -355,13 +355,15 @@ class MHCMetricsTest(unittest.TestCase):
         n, c = 4, 8
         one = torch.randn(c)
         x = one.repeat(n).reshape(1, 1, n * c).expand(5, 2, n * c).contiguous()
-        norms, ratio, off_mean, off_max, cv = mhc_metrics.stream_gram_stats(x, n)
+        norms, ratio, off_mean, off_max, cv, eff_rank = mhc_metrics.stream_gram_stats(x, n)
         self.assertAlmostEqual(ratio.item(), 1.0, places=5)
         self.assertAlmostEqual(off_mean.item(), 1.0, places=5)
         self.assertAlmostEqual(off_max.item(), 1.0, places=5)
         self.assertAlmostEqual(norms[0].item(), one.norm().item(), places=4)
         # Collapsed onto the common mean -> zero cross-stream spread.
         self.assertAlmostEqual(cv.item(), 0.0, places=3)
+        # ... and a rank-1 stream frame: only one direction carries energy.
+        self.assertAlmostEqual(eff_rank.item(), 1.0, places=4)
 
     def test_stream_gram_offdiag_mean_is_signed(self):
         """The off-diagonal MEAN is the signed cosine; only the MAX stays on ``|cos|``.
@@ -373,17 +375,17 @@ class MHCMetricsTest(unittest.TestCase):
         n, c = 4, 8
         v = torch.randn(c)
 
-        _, _, same_mean, same_max, _ = mhc_metrics.stream_gram_stats(v.repeat(n).reshape(1, 1, n * c), n)
+        _, _, same_mean, same_max, _, _ = mhc_metrics.stream_gram_stats(v.repeat(n).reshape(1, 1, n * c), n)
         self.assertAlmostEqual(same_mean.item(), 1.0, places=5)
         self.assertAlmostEqual(same_max.item(), 1.0, places=5)
 
         # +v, -v, +v, -v: 4 aligned and 8 anti-aligned off-diagonal pairs -> mean -1/3.
         alt = torch.stack([v, -v, v, -v]).reshape(1, 1, n * c)
-        _, _, alt_mean, alt_max, _ = mhc_metrics.stream_gram_stats(alt, n)
+        _, _, alt_mean, alt_max, _, _ = mhc_metrics.stream_gram_stats(alt, n)
         self.assertAlmostEqual(alt_mean.item(), -1.0 / 3.0, places=5)
         self.assertAlmostEqual(alt_max.item(), 1.0, places=5, msg="max must stay on |cos|")
 
-        _, _, orth_mean, orth_max, _ = mhc_metrics.stream_gram_stats(torch.eye(n).reshape(1, 1, n * n), n)
+        _, _, orth_mean, orth_max, _, _ = mhc_metrics.stream_gram_stats(torch.eye(n).reshape(1, 1, n * n), n)
         self.assertAlmostEqual(orth_mean.item(), 0.0, places=6)
         self.assertAlmostEqual(orth_max.item(), 0.0, places=6)
 
@@ -391,7 +393,7 @@ class MHCMetricsTest(unittest.TestCase):
         torch.manual_seed(4)
         n, c, t = 4, 7, 5
         xs = torch.randn(t, n, c)
-        *_, cv = mhc_metrics.stream_gram_stats(xs.reshape(t, 1, n * c), n)
+        *_, cv, _ = mhc_metrics.stream_gram_stats(xs.reshape(t, 1, n * c), n)
 
         m = xs.mean(dim=1)  # [t, c]
         var = (xs - m.unsqueeze(1)).pow(2).sum(dim=(-2, -1)) / n
@@ -408,9 +410,58 @@ class MHCMetricsTest(unittest.TestCase):
         n, c, t = 4, 6, 3
         xs = torch.randn(t, n, c)
         xs = xs - xs.mean(dim=1, keepdim=True)  # exact zero stream mean
-        *_, cv = mhc_metrics.stream_gram_stats(xs.reshape(t, 1, n * c), n)
+        *_, cv, _ = mhc_metrics.stream_gram_stats(xs.reshape(t, 1, n * c), n)
         self.assertTrue(torch.isfinite(cv).all(), cv)
         self.assertGreater(cv.item(), 1.0, "a zero common mean is maximal cross-stream spread")
+
+    def test_stream_stats_survive_an_all_zero_token(self):
+        """An all-zero token must not poison any series with nan.
+
+        ``stream_cv``'s relative floor is itself proportional to the token energy, so it also
+        vanishes here — 0/0. ``stream_eff_rank`` reads 1.0 (no direction carries energy), never 0,
+        which the metric can never legitimately take.
+        """
+        n, c = 4, 8
+        for t in mhc_metrics.stream_gram_stats(torch.zeros(3, 2, n * c), n):
+            self.assertTrue(torch.isfinite(t).all(), t)
+        *_, cv, eff_rank = mhc_metrics.stream_gram_stats(torch.zeros(3, 2, n * c), n)
+        self.assertAlmostEqual(cv.item(), 0.0, places=6)
+        self.assertAlmostEqual(eff_rank.item(), 1.0, places=6)
+
+    def test_stream_eff_rank_matches_the_singular_value_definition(self):
+        """``(tr G)^2 / ||G||_F^2`` must equal ``(sum s^2)^2 / sum s^4`` on the stream matrix.
+
+        The trace form is what the hot path computes (two Gram reductions, no eigvalsh); this
+        pins it to the spectral definition it stands in for.
+        """
+        torch.manual_seed(11)
+        n, c, t = 4, 9, 6
+        xs = torch.randn(t, n, c)
+        *_, eff_rank = mhc_metrics.stream_gram_stats(xs.reshape(t, 1, n * c), n)
+
+        sv = torch.linalg.svdvals(xs)  # [t, n]
+        s2 = sv.pow(2)
+        expected = (s2.sum(dim=-1).pow(2) / s2.pow(2).sum(dim=-1)).mean()
+        self.assertAlmostEqual(eff_rank.item(), expected.item(), places=4)
+
+    def test_stream_eff_rank_spans_one_to_n(self):
+        # Both ends of the range, exactly: rank-1 collapse -> 1, orthonormal frame -> n.
+        n, c = 4, 8
+        v = torch.randn(c)
+        *_, collapsed = mhc_metrics.stream_gram_stats(v.repeat(n).reshape(1, 1, n * c), n)
+        self.assertAlmostEqual(collapsed.item(), 1.0, places=4)
+
+        q = torch.linalg.qr(torch.randn(c, n))[0].t().contiguous()  # [n, c], orthonormal rows
+        *_, full = mhc_metrics.stream_gram_stats(q.reshape(1, 1, n * c), n)
+        self.assertAlmostEqual(full.item(), float(n), places=4)
+
+    def test_stream_eff_rank_counts_only_energised_directions(self):
+        # 2 unit streams + 2 near-dead ones: eff rank ~= 2, NOT the algebraic rank 4.
+        n, c = 4, 6
+        e = torch.eye(c)
+        streams = torch.stack([e[0], e[1], e[2] * 1e-4, e[3] * 1e-4])
+        *_, eff_rank = mhc_metrics.stream_gram_stats(streams.reshape(1, 1, n * c), n)
+        self.assertAlmostEqual(eff_rank.item(), 2.0, places=3)
 
     def test_stream_gram_offdiag_max_exposes_tail_the_mean_hides(self):
         # Token 0 orthogonal, token 1 has two parallel streams: mean 1/6, per-token max 1/2.
@@ -418,7 +469,7 @@ class MHCMetricsTest(unittest.TestCase):
         tok0 = torch.eye(n)
         tok1 = torch.stack([torch.eye(n)[0], torch.eye(n)[0], torch.eye(n)[2]])
         x = torch.stack([tok0.reshape(-1), tok1.reshape(-1)]).reshape(2, 1, n * c)
-        _, ratio, off_mean, off_max, _ = mhc_metrics.stream_gram_stats(x, n)
+        _, ratio, off_mean, off_max, _, _ = mhc_metrics.stream_gram_stats(x, n)
         self.assertAlmostEqual(off_mean.item(), 1.0 / 6.0, places=5)
         self.assertAlmostEqual(off_max.item(), 0.5, places=5)
         self.assertAlmostEqual(ratio.item(), 1.0, places=5)
@@ -1129,7 +1180,7 @@ class MHCCompositeSigmaTest(unittest.TestCase):
         xs = torch.randn(1, n, c)
 
         def cv_of(frame):
-            *_, cv = mhc_metrics.stream_gram_stats(frame.reshape(1, 1, n * c), n)
+            *_, cv, _ = mhc_metrics.stream_gram_stats(frame.reshape(1, 1, n * c), n)
             return cv.item()
 
         before = cv_of(xs)
@@ -1142,6 +1193,32 @@ class MHCCompositeSigmaTest(unittest.TestCase):
 
         self.assertLess(cv_of(ds), before * 0.1, "a DS stack should collapse the streams")
         self.assertAlmostEqual(cv_of(orth), before, places=3, msg="an isometry preserves the spread")
+
+    def test_ds_stack_drops_stream_eff_rank_while_an_isometry_holds_it(self):
+        """The same DS-vs-orthogonal contrast, read as effective rank instead of spread.
+
+        A doubly-stochastic stack drives the stream frame to rank 1 (eff rank -> 1); a
+        mean-fixing orthogonal stack is an isometry, so the frame's singular values — and
+        therefore its eff rank — cannot change at all.
+        """
+        torch.manual_seed(12)
+        n, c = self.N, 6
+        xs = torch.randn(1, n, c)
+
+        def eff_rank_of(frame):
+            *_, er = mhc_metrics.stream_gram_stats(frame.reshape(1, 1, n * c), n)
+            return er.item()
+
+        before = eff_rank_of(xs)
+        ds = xs
+        for _ in range(8):
+            ds = self._sinkhorn(torch.randn(n, n)) @ ds
+        orth = xs
+        for _ in range(8):
+            orth = self._cayley(torch.randn(n, n) * 0.5) @ orth
+
+        self.assertLess(eff_rank_of(ds), 1.05, "a DS stack should drive the frame to rank 1")
+        self.assertAlmostEqual(eff_rank_of(orth), before, places=3, msg="an isometry preserves the spectrum")
 
 
 class MHCMonitorNoOpTest(unittest.TestCase):

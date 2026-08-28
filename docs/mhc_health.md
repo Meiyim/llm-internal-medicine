@@ -70,8 +70,8 @@ internal_medicine_monitors:
 
 ## 监控指标
 
-每个 hc 模块产出 `34 + n` 个指标（`n` 条逐流 norm）；`n = 4` 时另加两条 `SO(4)` 转角序列
-（`h_res_theta_lo` / `h_res_theta_hi`），共 `36 + n`。指标名以 `attn_` / `mlp_` 前缀区分。除三个
+每个 hc 模块产出 `35 + n` 个指标（`n` 条逐流 norm）；`n = 4` 时另加两条 `SO(4)` 转角序列
+（`h_res_theta_lo` / `h_res_theta_hi`），共 `37 + n`。指标名以 `attn_` / `mlp_` 前缀区分。除三个
 `*_orth_dev*_max_med_ratio`、`*_stream_norm_max_min_ratio`、`*_stream_gram_offdiag_max`、
 `*_mix_write_cos_abs_max` 按 **max** 合成外，
 其余全部按 token/batch 求均值（并在 flush 时对 microbatch/rank 求均值）。日志键形如
@@ -196,6 +196,7 @@ Cayley 参数化下构造上恒为 1.0；迭代式正交化（Schulz）与 Sinkh
 | `{c}_stream_gram_offdiag_mean` | `mean_t mean_{i≠j} cos(x_i, x_j)`，**带符号** | 流间方向关系 ∈ [−1,1]：0 = 相互正交，+1 = 塌缩到共同均值，负 = 反向对齐 |
 | `{c}_stream_gram_offdiag_max` | `mean_t max_{i≠j} \|cos(x_i, x_j)\|` | 同上的逐 token 尾部（少数 token 塌缩，均值看不见）；保持 `\|cos\|` |
 | `{c}_stream_cv` | `mean_t( sqrt(Var) / ‖m‖ )`，`m = mean_i x_i`，`Var = (1/n)Σ_i‖x_i − m‖²` | 跨流变异系数：→0 = 流塌缩到共同均值，大 = 各流携带独立内容 |
+| `{c}_stream_eff_rank` | `mean_t( (tr G)² / ‖G‖_F² )`，`G = X Xᵗ` 为逐 token 流 Gram | 参与比（Rényi-2）有效秩 ∈ [1, n]：→1 = 只剩一个方向承载能量（秩 1 塌缩），→n = 各流正交且能量均衡 |
 
 **为什么必须逐流。** 其余每一条指标都沿 stream 轴归约（`mean(h_pre)`、逐 token 行和 …），所以「1 条流承载全部信号、
 另外 `n−1` 条衰减成噪声」与「n 条流均衡工作」在它们身上读数相同 —— `stream_norm_mean` 这种把 stream 轴也平均掉的
@@ -207,9 +208,14 @@ Cayley 参数化下构造上恒为 1.0；迭代式正交化（Schulz）与 Sinkh
 符号，`_max` 仍用 `|cos|`（它是尾部/塌缩探测器，带符号的 max 会漏掉反向对齐的尾巴）。保均值的正交 `H_res` 不改变
 这个读数；一般（会旋转均值方向的）正交映射可以把它推到负值。
 
-**`stream_cv` 与复合 σ 是一对。** `composite_h_res_sigma_min_*` 测的是**算子**（机制：DS 把 `1^⊥` 压掉），
-`stream_cv` 测的是**表示**（后果：流真的塌缩了）。「正交优于双随机」的证据是这两者同步 —— 算子 σ_min → 0
-伴随 CV → 0 / 带符号 cos → +1，而正交栈下三者都随深度保持不变。
+**`stream_cv` / `stream_eff_rank` 与复合 σ 是一对。** `composite_h_res_sigma_min_*` 测的是**算子**（机制：DS 把
+`1^⊥` 压掉），`stream_cv` 与 `stream_eff_rank` 测的是**表示**（后果：流真的塌缩了）。「正交优于双随机」的证据是
+这两侧同步 —— 算子 σ_min → 0 伴随 CV → 0 / 有效秩 → 1 / 带符号 cos → +1，而正交栈下四者都随深度保持不变。
+
+`stream_cv` 与 `stream_eff_rank` 抓的塌缩不完全重合：CV 是**一阶**量（流偏离共同均值多远），有效秩是**二阶谱**量
+（几个方向真正承载能量）。「4 条流两两正交但其中 2 条量级近零」这种状态 CV 不小，有效秩却已经掉到 2；反过来
+`n` 条流等距张开时两者都饱和。有效秩额外的用处是它有**绝对刻度**：读数直接就是「实际用了几条流」，不需要和
+基线比。
 
 **实现上的三点。** Gram 由原始（bf16）流直接 `bmm` 得到、只把 `[T, n, n]` 的输出升到 fp32：先把 `x` 升 fp32 会在
 forward 里产生一个 `[T, n, C]` 的临时拷贝（s=8192、n=4、C=1024 时约 134 MB）。norm 取 Gram 对角线的平方根，
@@ -217,7 +223,9 @@ forward 里产生一个 `[T, n, C]` 的临时拷贝（s=8192、n=4、C=1024 时�
 `stream_cv` 完全从同一个 `gram` 导出（平行轴定理：`Σ_i‖x_i‖² = tr(gram)`、`‖m‖² = Σ_ij gram_ij / n²`，故
 `Var = tr/n − ‖m‖²`），不新增张量也不多一次 bmm；`‖m‖²` 的下限是**相对**的（`1e-6 · tr/n`）而非绝对 eps ——
 各流相消的 token 上 CV 本身无意义，绝对 eps 会让它贡献巨大值而毁掉均值，与 `residual_energy_split` 的
-`rel_floor` 同一 pattern。
+`rel_floor` 同一 pattern。`stream_eff_rank` 同样只用 `gram` 的两个迹（`tr G` 取对角线之和、`‖G‖_F²` 取全元素
+平方和），**不做 `eigvalsh`** —— 参与比形式恰好绕开特征分解，因此没有 host sync（`n = 4` 的逐 token
+`eigvalsh` 会在 forward hook 里同步主机，违反热路径规则）。
 
 ### 能量分解（更新的交叉项）
 

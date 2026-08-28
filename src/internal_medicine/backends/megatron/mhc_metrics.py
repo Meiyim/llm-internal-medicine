@@ -267,6 +267,7 @@ def stream_gram_stats(
         as the full sum of squares), so no eigvalsh, no host sync, no new tensor. It is the
         representation-side (consequence) reading of stream collapse — ``sigma_stats`` reads the
         same collapse on the OPERATOR side.
+    """
     xs = x.reshape(-1, n, x.shape[-1] // n)  # [T, n, C], view
     # Gram from raw streams, fp32 only on the [T,n,n] output: upcasting x first would cost a
     # transient [T,n,C] fp32 copy (~134MB at s=8192,n=4,C=1024) inside the forward.
@@ -280,13 +281,16 @@ def stream_gram_stats(
     mean_stream_energy = gram.diagonal(dim1=-2, dim2=-1).sum(dim=-1) / n  # tr(gram)/n, [T]
     m_energy = gram.sum(dim=(-2, -1)) / (n * n)  # ||m||^2, [T]
     var = (mean_stream_energy - m_energy).clamp_min(0)
-    cv = (var / m_energy.clamp_min(rel_floor * mean_stream_energy)).sqrt()
+    # The relative floor goes to 0 on an all-zero token, so back it with an absolute one:
+    # 0/0 would be nan and poison the token mean. 1e-12 is 6 orders below a live token's floor.
+    cv = (var / m_energy.clamp_min(rel_floor * mean_stream_energy).clamp_min(1e-12)).sqrt()
 
     # Participation-ratio (Renyi-2) effective rank: (sum sigma^2)^2 / sum sigma^4 = (tr G)^2 / ||G||_F^2.
-    # ||G||_F^2 >= (tr G)^2 / n by Cauchy-Schwarz, so the floor only guards a fully-dead token.
+    # eps on BOTH sides: negligible against a live token (tr G is a squared norm, squared again) and
+    # makes an all-zero token read 1.0 rather than 0, a value the metric can never legitimately take.
     tr_g = gram.diagonal(dim1=-2, dim2=-1).sum(dim=-1)  # [T], = sum sigma^2
     fro2 = gram.pow(2).sum(dim=(-2, -1))  # [T], = ||G||_F^2 = sum sigma^4
-    eff_rank = (tr_g * tr_g) / fro2.clamp_min(eps)  # [T], in [1, n]
+    eff_rank = (tr_g * tr_g + eps) / (fro2 + eps)  # [T], in [1, n]
 
     return (
         norms.mean(dim=0),

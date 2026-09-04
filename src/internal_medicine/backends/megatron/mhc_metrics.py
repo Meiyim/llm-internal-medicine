@@ -219,7 +219,16 @@ def so4_angle_stats(mat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 def stream_gram_stats(
     x: torch.Tensor, n: int, eps: float = 1e-6, rel_floor: float = 1e-6
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
     """Geometry of the ``n`` hidden STREAMS themselves (not the ``H_res`` operator).
 
     ``orthogonality_deviation`` measures the mixing MATRIX; this measures the frame it acts on.
@@ -267,6 +276,18 @@ def stream_gram_stats(
         as the full sum of squares), so no eigvalsh, no host sync, no new tensor. It is the
         representation-side (consequence) reading of stream collapse — ``sigma_stats`` reads the
         same collapse on the OPERATOR side.
+      * ``stream_mean_rms``            — RMS of the MEAN stream ``m = (1/n) sum_i x_i``, i.e.
+        ``||m|| / sqrt(C)``, per token then meaned. This is the scale the aggregated hidden state
+        actually enters the sublayer at (``h_pre``-weighted aggregation is a reweighting of exactly
+        this mean), so it is the mHC analogue of a plain model's residual-stream RMS: the absolute
+        magnitude every other series here is blind to, since ``stream_cv`` normalises by ``||m||``
+        and the cosines / eff rank are scale-free. Read it against ``stream_norm_{i}``: the ratio
+        ``stream_mean_rms * sqrt(C) / mean_i ||x_i||`` is ``1`` when the streams are identical and
+        ``1/sqrt(n)`` when they are orthogonal and equal-norm.
+      * ``stream_mean_rms_max_med_ratio`` — ``(max_t rms + eps) / (med_t rms + eps)`` over the
+        token axis. Growth here is a per-token magnitude outlier — the residual-stream analogue of
+        a massive activation — which the token mean cannot show. MAX-aggregated across
+        microbatches / ranks, like the other tail detectors.
     """
     xs = x.reshape(-1, n, x.shape[-1] // n)  # [T, n, C], view
     # Gram from raw streams, fp32 only on the [T,n,n] output: upcasting x first would cost a
@@ -278,18 +299,21 @@ def stream_gram_stats(
     off = ~torch.eye(n, device=xs.device, dtype=torch.bool)  # [n, n] off-diagonal mask
     off_vals = cos[:, off]  # [T, n*(n-1)], signed
 
-    mean_stream_energy = gram.diagonal(dim1=-2, dim2=-1).sum(dim=-1) / n  # tr(gram)/n, [T]
+    tr_g = gram.diagonal(dim1=-2, dim2=-1).sum(dim=-1)  # [T], = sum sigma^2 = sum_i ||x_i||^2
+    mean_stream_energy = tr_g / n  # tr(gram)/n, [T]
     m_energy = gram.sum(dim=(-2, -1)) / (n * n)  # ||m||^2, [T]
     var = (mean_stream_energy - m_energy).clamp_min(0)
     # The relative floor goes to 0 on an all-zero token, so back it with an absolute one:
     # 0/0 would be nan and poison the token mean. 1e-12 is 6 orders below a live token's floor.
     cv = (var / m_energy.clamp_min(rel_floor * mean_stream_energy).clamp_min(1e-12)).sqrt()
+    mean_rms = (m_energy / xs.shape[-1]).sqrt()  # [T], RMS of the mean stream = ||m|| / sqrt(C)
 
     # Participation-ratio (Renyi-2) effective rank: (sum sigma^2)^2 / sum sigma^4 = (tr G)^2 / ||G||_F^2.
+    # vector_norm fuses the reduction, so ||G||_F^2 costs one [T] tensor; ``gram.pow(2).sum(...)``
+    # would materialise a transient [T,n,n] first.
     # eps on BOTH sides: negligible against a live token (tr G is a squared norm, squared again) and
     # makes an all-zero token read 1.0 rather than 0, a value the metric can never legitimately take.
-    tr_g = gram.diagonal(dim1=-2, dim2=-1).sum(dim=-1)  # [T], = sum sigma^2
-    fro2 = gram.pow(2).sum(dim=(-2, -1))  # [T], = ||G||_F^2 = sum sigma^4
+    fro2 = torch.linalg.vector_norm(gram, dim=(-2, -1)).pow(2)  # [T], = ||G||_F^2 = sum sigma^4
     eff_rank = (tr_g * tr_g + eps) / (fro2 + eps)  # [T], in [1, n]
 
     return (
@@ -299,6 +323,8 @@ def stream_gram_stats(
         off_vals.abs().amax(dim=-1).mean(),
         cv.mean(),
         eff_rank.mean(),
+        mean_rms.mean(),
+        (mean_rms.amax() + eps) / (mean_rms.median() + eps),
     )
 
 

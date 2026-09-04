@@ -21,8 +21,11 @@ mHC (Manifold-Constrained Hyper-Connections) model:
 - the ``n`` residual **streams** themselves, from the module's own input: per-stream
   L2 norm, the per-token max/min norm ratio, the inter-stream cosine off-diagonal of the
   stream Gram (SIGNED mean + per-token ``|cos|`` max), the cross-stream coefficient
-  of variation ``stream_cv``, and the participation-ratio effective rank ``stream_eff_rank``
-  (how many of the ``n`` stream directions actually carry energy). Everything above
+  of variation ``stream_cv``, the participation-ratio effective rank ``stream_eff_rank``
+  (how many of the ``n`` stream directions actually carry energy), and the RMS of the MEAN
+  stream ``stream_mean_rms`` (+ its per-token max/median tail) — the absolute scale the
+  aggregated hidden state enters the sublayer at, which every scale-free series above misses.
+  Everything above
   reduces over the stream axis, so a dominant stream or a collapse of all ``n``
   onto one direction is invisible in it; these series are what see that.
 - the **energy split** of the update ``out = h_res x + w`` (``w = h_post o^T``):
@@ -32,9 +35,9 @@ mHC (Manifold-Constrained Hyper-Connections) model:
   module. See ``conf/mai_ladder/mhc/R7_NORM_CONTROL.md`` in the training repo.
 
 Per hyper-connection module (a layer has two: ``attn`` and ``mlp``) we emit
-``35 + n`` series (``37 + n`` at ``n = 4``), name-prefixed by component — mean-aggregated
-except the three orth_dev / cos ratios, the norm ratio and the Gram max, which are
-max-aggregated:
+``37 + n`` series (``39 + n`` at ``n = 4``), name-prefixed by component — mean-aggregated
+except the three orth_dev / cos ratios, the norm ratio, the Gram max and the mean-RMS
+max/median ratio, which are max-aggregated:
 
     {attn,mlp}_h_pre_mean   {attn,mlp}_h_pre_std
     {attn,mlp}_h_post_mean  {attn,mlp}_h_post_std
@@ -54,6 +57,7 @@ max-aggregated:
     {attn,mlp}_stream_norm_0 .. _{n-1}  {attn,mlp}_stream_norm_max_min_ratio
     {attn,mlp}_stream_gram_offdiag_mean {attn,mlp}_stream_gram_offdiag_max
     {attn,mlp}_stream_cv                {attn,mlp}_stream_eff_rank
+    {attn,mlp}_stream_mean_rms          {attn,mlp}_stream_mean_rms_max_med_ratio
     {attn,mlp}_write_over_resid         {attn,mlp}_cross_over_resid
     {attn,mlp}_cross_over_write         {attn,mlp}_mix_write_cos
     {attn,mlp}_mix_write_cos_abs_max    {attn,mlp}_resid_write_cos
@@ -143,6 +147,8 @@ _STREAM_METRIC_NAMES = (
     "stream_gram_offdiag_max",
     "stream_cv",
     "stream_eff_rank",
+    "stream_mean_rms",
+    "stream_mean_rms_max_med_ratio",
 )
 
 
@@ -194,6 +200,7 @@ _MAX_METRIC_NAMES = (
     "composite_h_res_orth_dev_bwd_max_med_ratio",
     "stream_norm_max_min_ratio",
     "stream_gram_offdiag_max",
+    "stream_mean_rms_max_med_ratio",
     "mix_write_cos_abs_max",
 )
 _MAX_AGGREGATED = {f"{comp}_{name}" for comp, _ in _COMPONENTS for name in _MAX_METRIC_NAMES}
@@ -468,9 +475,16 @@ class MHCHealthMonitor(TorchProbe):
                     h_res = h_res.detach()
 
                     # Stream geometry of this module's own input, before any mixing.
-                    s_norms, norm_ratio, gram_mean, gram_max, stream_cv, eff_rank = stream_gram_stats(
-                        x.detach(), n_streams
-                    )
+                    (
+                        s_norms,
+                        norm_ratio,
+                        gram_mean,
+                        gram_max,
+                        stream_cv,
+                        eff_rank,
+                        mean_rms,
+                        mean_rms_ratio,
+                    ) = stream_gram_stats(x.detach(), n_streams)
                     for i in range(n_streams):
                         self.record_layer_metric(layer_idx, f"{component}_stream_norm_{i}", s_norms[i])
                     self.record_layer_metric(layer_idx, f"{component}_stream_norm_max_min_ratio", norm_ratio)
@@ -478,6 +492,10 @@ class MHCHealthMonitor(TorchProbe):
                     self.record_layer_metric(layer_idx, f"{component}_stream_gram_offdiag_max", gram_max)
                     self.record_layer_metric(layer_idx, f"{component}_stream_cv", stream_cv)
                     self.record_layer_metric(layer_idx, f"{component}_stream_eff_rank", eff_rank)
+                    self.record_layer_metric(layer_idx, f"{component}_stream_mean_rms", mean_rms)
+                    self.record_layer_metric(
+                        layer_idx, f"{component}_stream_mean_rms_max_med_ratio", mean_rms_ratio
+                    )
 
                     pre_mean, pre_std = gate_stats(h_pre)
                     post_mean, post_std = gate_stats(h_post)

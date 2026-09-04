@@ -63,17 +63,18 @@ internal_medicine_monitors:
 
 热路径纪律见 `.claude/skills/monitor-hook-perf-rules`：hook 内无 D2H 同步、无集合通信，schema 在 `allocate_buffers`
 前声明。TP 不沿 `n` 切分映射，故无需 hook 内通信；跨 rank 归约在 flush 时由 `gather_and_aggregate` 完成
-（mean，三个 `*_orth_dev*_max_med_ratio`、`*_stream_norm_max_min_ratio`、`*_stream_gram_offdiag_max` 走 max）。
+（mean，三个 `*_orth_dev*_max_med_ratio`、`*_stream_norm_max_min_ratio`、`*_stream_gram_offdiag_max`、
+`*_stream_mean_rms_max_med_ratio` 走 max）。
 序列并行下 `x` 按 token 切分但隐藏维完整，逐 token 的多流几何在本 rank 就是完备的，同样不需要 hook 内通信。
 
 ---
 
 ## 监控指标
 
-每个 hc 模块产出 `35 + n` 个指标（`n` 条逐流 norm）；`n = 4` 时另加两条 `SO(4)` 转角序列
-（`h_res_theta_lo` / `h_res_theta_hi`），共 `37 + n`。指标名以 `attn_` / `mlp_` 前缀区分。除三个
+每个 hc 模块产出 `37 + n` 个指标（`n` 条逐流 norm）；`n = 4` 时另加两条 `SO(4)` 转角序列
+（`h_res_theta_lo` / `h_res_theta_hi`），共 `39 + n`。指标名以 `attn_` / `mlp_` 前缀区分。除三个
 `*_orth_dev*_max_med_ratio`、`*_stream_norm_max_min_ratio`、`*_stream_gram_offdiag_max`、
-`*_mix_write_cos_abs_max` 按 **max** 合成外，
+`*_stream_mean_rms_max_med_ratio`、`*_mix_write_cos_abs_max` 按 **max** 合成外，
 其余全部按 token/batch 求均值（并在 flush 时对 microbatch/rank 求均值）。日志键形如
 `mhc_health/layer_{i}/{c}_{name}`，`{c}` ∈ `{attn, mlp}`；
 对应的 `mhc_health/global_{c}_{name}` 由逐层累加器在 flush 时自动派生。
@@ -197,6 +198,8 @@ Cayley 参数化下构造上恒为 1.0；迭代式正交化（Schulz）与 Sinkh
 | `{c}_stream_gram_offdiag_max` | `mean_t max_{i≠j} \|cos(x_i, x_j)\|` | 同上的逐 token 尾部（少数 token 塌缩，均值看不见）；保持 `\|cos\|` |
 | `{c}_stream_cv` | `mean_t( sqrt(Var) / ‖m‖ )`，`m = mean_i x_i`，`Var = (1/n)Σ_i‖x_i − m‖²` | 跨流变异系数：→0 = 流塌缩到共同均值，大 = 各流携带独立内容 |
 | `{c}_stream_eff_rank` | `mean_t( (tr G)² / ‖G‖_F² )`，`G = X Xᵗ` 为逐 token 流 Gram | 参与比（Rényi-2）有效秩 ∈ [1, n]：→1 = 只剩一个方向承载能量（秩 1 塌缩），→n = 各流正交且能量均衡 |
+| `{c}_stream_mean_rms` | `mean_t( ‖m‖ / √C )`，`m = mean_i x_i` | **均值流的 RMS** —— 聚合后隐状态真正进入子层时的绝对尺度（`h_pre` 加权聚合就是对这个均值的重加权），即普通模型「残差流 RMS」在 mHC 下的对应物 |
+| `{c}_stream_mean_rms_max_med_ratio` | `(max_t rms + ε) / (med_t rms + ε)` | 逐 token 幅度尾部：残差流版的 massive activation 探测器，token 均值看不见 |
 
 **为什么必须逐流。** 其余每一条指标都沿 stream 轴归约（`mean(h_pre)`、逐 token 行和 …），所以「1 条流承载全部信号、
 另外 `n−1` 条衰减成噪声」与「n 条流均衡工作」在它们身上读数相同 —— `stream_norm_mean` 这种把 stream 轴也平均掉的
@@ -217,15 +220,26 @@ Cayley 参数化下构造上恒为 1.0；迭代式正交化（Schulz）与 Sinkh
 `n` 条流等距张开时两者都饱和。有效秩额外的用处是它有**绝对刻度**：读数直接就是「实际用了几条流」，不需要和
 基线比。
 
+**`stream_mean_rms` 补的是「绝对尺度」这个盲区。** 上面每一条流几何指标都是**尺度无关**的：`stream_cv` 除以 `‖m‖`
+归一化掉了量级，余弦和有效秩本身就只看方向与谱形状。于是「n 条流的几何完全不变、但整体幅度涨了 100 倍」在它们身上
+读数一模一样。`stream_mean_rms` 就是那个被除掉的分母本身 —— 而且它取的是**均值流** `m` 而非逐流，因为 `h_pre`
+加权聚合（`Σ_j h_pre_j · x_j`）本质上就是对这个均值的重加权，所以 `m` 的尺度才是子层真正看到的输入尺度。
+
+与 `stream_norm_{i}` 对读可以直接反推流的塌缩程度：`stream_mean_rms · √C / mean_i‖x_i‖` 在各流相同时为 `1`，
+在各流正交等范时为 `1/√n` —— 和余弦看到的是同一件事，但这条有绝对刻度。`_max_med_ratio` 那条是残差流版的
+massive-activation 探测器：均值流 RMS 在少数 token 上炸开时，token 均值几乎不动，故按 **max** 跨 microbatch/rank 合成。
+
 **实现上的三点。** Gram 由原始（bf16）流直接 `bmm` 得到、只把 `[T, n, n]` 的输出升到 fp32：先把 `x` 升 fp32 会在
 forward 里产生一个 `[T, n, C]` 的临时拷贝（s=8192、n=4、C=1024 时约 134 MB）。norm 取 Gram 对角线的平方根，
 不另算一遍；`ε = 1e-6` 是比值/余弦分母的下界，使某条流恰好为 0 时读数仍是有限值而不是 nan。
 `stream_cv` 完全从同一个 `gram` 导出（平行轴定理：`Σ_i‖x_i‖² = tr(gram)`、`‖m‖² = Σ_ij gram_ij / n²`，故
 `Var = tr/n − ‖m‖²`），不新增张量也不多一次 bmm；`‖m‖²` 的下限是**相对**的（`1e-6 · tr/n`）而非绝对 eps ——
 各流相消的 token 上 CV 本身无意义，绝对 eps 会让它贡献巨大值而毁掉均值，与 `residual_energy_split` 的
-`rel_floor` 同一 pattern。`stream_eff_rank` 同样只用 `gram` 的两个迹（`tr G` 取对角线之和、`‖G‖_F²` 取全元素
-平方和），**不做 `eigvalsh`** —— 参与比形式恰好绕开特征分解，因此没有 host sync（`n = 4` 的逐 token
-`eigvalsh` 会在 forward hook 里同步主机，违反热路径规则）。
+`rel_floor` 同一 pattern。`stream_eff_rank` 同样只用 `gram` 的两个迹（`tr G` 取对角线之和、`‖G‖_F²` 用
+`linalg.vector_norm` 融合归约，避免 `gram.pow(2)` 先实体化一个 `[T, n, n]` 临时量），**不做 `eigvalsh`** ——
+参与比形式恰好绕开特征分解，因此没有 host sync（`n = 4` 的逐 token `eigvalsh` 会在 forward hook 里同步主机，
+违反热路径规则）。`stream_mean_rms` 直接复用 CV already 算出的 `‖m‖²`（`= Σ_ij gram_ij / n²`），只多一次
+`sqrt` 与除以 `C`；两条新序列各只产出一个 `[T]` 向量，实测边际显存为 0。
 
 ### 能量分解（更新的交叉项）
 

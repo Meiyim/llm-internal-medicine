@@ -27,6 +27,8 @@ MAX_AGGREGATED_SUFFIXES = (
     "orth_dev_max_med_ratio",
     # mHC stream-norm imbalance: same reason, and it does not end in _max.
     "stream_norm_max_min_ratio",
+    # mHC mean-stream magnitude tail: same reason, and it does not end in _max.
+    "stream_mean_rms_max_med_ratio",
 )
 
 

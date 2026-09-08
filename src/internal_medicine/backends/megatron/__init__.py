@@ -6,6 +6,7 @@ from .activation_dump_monitor import ActivationDumpMonitor, setup_activation_dum
 from .base import TorchProbe
 from .gather import install_gather_fn
 from .lar_monitor import LARMonitor, setup_lar_monitor
+from .looped_monitor import LoopedHealthMonitor, setup_looped_monitor
 from .massive_activation_monitor import MassiveActivationMonitor, setup_massive_activation_monitor
 from .mhc_monitor import MHCHealthMonitor, setup_mhc_monitor
 from .moe_monitor import MoESpecialistMonitor, setup_moe_monitor
@@ -22,6 +23,7 @@ _MONITOR_MAP = {
     "mhc_health": setup_mhc_monitor,
     "act_dump": setup_activation_dump_monitor,
     "lar": setup_lar_monitor,
+    "looped_health": setup_looped_monitor,
 }
 
 
@@ -74,4 +76,6 @@ __all__ = [
     "setup_activation_dump_monitor",
     "LARMonitor",
     "setup_lar_monitor",
+    "LoopedHealthMonitor",
+    "setup_looped_monitor",
 ]

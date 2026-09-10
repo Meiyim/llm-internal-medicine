@@ -29,6 +29,8 @@ LARMonitor = lar_module.LARMonitor
 setup_lar_monitor = lar_module.setup_lar_monitor
 MoESpecialistMonitor = importlib.import_module("internal_medicine.backends.megatron.moe_monitor").MoESpecialistMonitor
 moe_monitor_module = importlib.import_module("internal_medicine.backends.megatron.moe_monitor")
+QKStatsMonitor = importlib.import_module("internal_medicine.backends.megatron.qk_monitor").QKStatsMonitor
+qk_monitor_module = importlib.import_module("internal_medicine.backends.megatron.qk_monitor")
 PLEHealthMonitor = importlib.import_module("internal_medicine.backends.megatron.ple_monitor").PLEHealthMonitor
 training_logs = importlib.import_module("internal_medicine.core.training_logs").training_logs
 massive_activation_metrics = importlib.import_module("internal_medicine.backends.megatron.massive_activation_metrics")
@@ -1898,6 +1900,265 @@ class MegatronLARMonitorTest(unittest.TestCase):
         hidden_masked = hidden.reshape(-1, H)[mask]
         want, *_ = _lar_analytical(hidden_masked, router_weight, logits=hidden_masked @ router_weight.t())
         self.assertAlmostEqual(got, want, places=4)
+
+
+# ============================================================================
+# Effective-depth (unrolled) indexing under looped/recurrent-depth models.
+# The recurrent core is the SAME physical modules run r times per forward; the
+# monitors must re-key per-layer metrics onto a flat effective-depth axis so each
+# unrolled visit is its own slot (own meter, counted once). Non-looped / degenerate
+# models must be byte-identical to before (physical-layer indexing).
+# ============================================================================
+
+
+class _FakeCoreAttn(nn.Module):
+    def forward(self, query, key, *args, **kwargs):
+        return query
+
+
+class _FakeAttnLayer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.self_attention = SimpleNamespace(core_attention=_FakeCoreAttn())
+
+
+class _AttnDecoder(nn.Module):
+    """decoder.layers of attention layers; looped geometry attrs set only when given."""
+
+    def __init__(self, num_layers, looped=None):
+        super().__init__()
+        self.layers = nn.ModuleList([_FakeAttnLayer() for _ in range(num_layers)])
+        self._probe = nn.Linear(1, 1)  # gives model.parameters() a device
+        if looped is not None:
+            self.prelude_end, self.core_end, self.looped_num_recurrence = looped
+
+
+class _AttnModel(nn.Module):
+    def __init__(self, num_layers, looped=None):
+        super().__init__()
+        self.decoder = _AttnDecoder(num_layers, looped)
+
+
+def _drive_qk(model, S=6, B=1, Hh=2, D=4):
+    """Fire core_attention pre-hooks in looped order (prelude, core*r, coda)."""
+    dec = model.decoder
+    r = getattr(dec, "looped_num_recurrence", None)
+
+    def fire(L):
+        dec.layers[L].self_attention.core_attention(torch.randn(S, B, Hh, D), torch.randn(S, B, Hh, D))
+
+    if r is None:
+        for L in range(len(dec.layers)):
+            fire(L)
+        return
+    pe, ce = dec.prelude_end, dec.core_end
+    for L in range(pe):
+        fire(L)
+    for _ in range(r):
+        for L in range(pe, ce):
+            fire(L)
+    for L in range(ce, len(dec.layers)):
+        fire(L)
+
+
+class _FakeDenseLayer(nn.Module):
+    """A non-MoE prelude layer: _find_moe_layers must skip it."""
+
+    def forward(self, hidden):
+        return hidden
+
+
+class _FakeLoopedRouter(nn.Module):
+    """Router with the _apply_aux_loss hook the monitor patches for score caching,
+    plus a global_tokens_per_expert buffer to exercise the load-balance path."""
+
+    def __init__(self, hidden_size, num_experts, topk=2):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(num_experts, hidden_size))
+        self.topk = topk
+        self.num_experts = num_experts
+        self.global_tokens_per_expert = torch.tensor([5.0, 3.0, 2.0, 2.0][:num_experts])
+        self.ga_steps = torch.tensor(4.0)
+
+    def _apply_aux_loss(self, probs, scores_for_aux_loss, routing_map, *args, **kwargs):
+        return probs
+
+    def forward(self, hidden):
+        probs = F.softmax(F.linear(hidden, self.weight), dim=-1)
+        routing_map = probs.argmax(dim=-1, keepdim=True)
+        self._apply_aux_loss(probs, probs, routing_map)
+        return probs, routing_map
+
+
+class _FakeLoopedMoELayer(nn.Module):
+    def __init__(self, hidden_size, num_experts):
+        super().__init__()
+        self.router = _FakeLoopedRouter(hidden_size, num_experts)
+
+    def forward(self, hidden):
+        return self.router(hidden)
+
+
+class _MoEDecoder(nn.Module):
+    def __init__(self, num_layers, hidden_size, num_experts, dense_prefix=0, looped=None):
+        super().__init__()
+        mods = [
+            _FakeDenseLayer() if dense_prefix > L else _FakeLoopedMoELayer(hidden_size, num_experts)
+            for L in range(num_layers)
+        ]
+        self.layers = nn.ModuleList(mods)
+        if looped is not None:
+            self.prelude_end, self.core_end, self.looped_num_recurrence = looped
+
+
+class _MoEModel(nn.Module):
+    def __init__(self, decoder):
+        super().__init__()
+        self.decoder = decoder
+
+
+def _layer_ids_for(latest, metric):
+    """Sorted per-layer depth indices that recorded ``metric`` (ignores globals)."""
+    suffix = "/" + metric
+    return sorted({int(k.split("/layer_")[1].split("/")[0]) for k in latest if "/layer_" in k and k.endswith(suffix)})
+
+
+def _drive_moe(model, hidden):
+    dec = model.decoder
+    r = getattr(dec, "looped_num_recurrence", None)
+    if r is None:
+        for layer in dec.layers:
+            layer(hidden)
+        return
+    pe, ce = dec.prelude_end, dec.core_end
+    for L in range(pe):
+        dec.layers[L](hidden)
+    for _ in range(r):
+        for L in range(pe, ce):
+            dec.layers[L](hidden)
+    for L in range(ce, len(dec.layers)):
+        dec.layers[L](hidden)
+
+
+class LoopedQKDepthTest(unittest.TestCase):
+    def setUp(self):
+        training_logs.reset()
+
+    def tearDown(self):
+        training_logs.reset()
+
+    def test_non_looped_keys_unchanged(self):
+        # Regression gate: without looped geometry the keys are physical layer_{L}.
+        model = _AttnModel(num_layers=3)
+        monitor = QKStatsMonitor(use_triton=False, monitor_interval=1)
+        monitor.register_hooks(model)
+        self.assertIsNone(monitor._depthmap)
+        try:
+            _drive_qk(model)
+            monitor.step()
+            latest = training_logs.get_latest(prefix="qk_stats")
+            self.assertEqual(_layer_ids_for(latest, "max"), [0, 1, 2])
+        finally:
+            monitor.remove_hooks()
+
+    def test_looped_keys_span_effective_depth(self):
+        # pe=1, ce=3, num=4, r=2 -> l_P=1,l_R=2,l_C=1, effective_depth=6.
+        model = _AttnModel(num_layers=4, looped=(1, 3, 2))
+        monitor = QKStatsMonitor(use_triton=False, monitor_interval=1)
+        monitor.register_hooks(model)
+        self.assertIsNotNone(monitor._depthmap)
+        self.assertEqual(monitor._depthmap.effective_depth, 6)
+        try:
+            _drive_qk(model)
+            monitor.step()
+            latest = training_logs.get_latest(prefix="qk_stats")
+            # Every physical layer's unrolled positions tile [0, 6): prelude L0->0,
+            # core L1->{1,3} L2->{2,4}, coda L3->5.
+            self.assertEqual(_layer_ids_for(latest, "max"), [0, 1, 2, 3, 4, 5])
+        finally:
+            monitor.remove_hooks()
+
+    def test_global_de_biasing_each_slot_counted_once(self):
+        # The whole point: each effective slot is observed exactly once per forward,
+        # so no physical core layer is weighted r-fold in the global mean.
+        model = _AttnModel(num_layers=4, looped=(1, 3, 2))
+        monitor = QKStatsMonitor(use_triton=False, monitor_interval=1)
+        monitor.register_hooks(model)
+        try:
+            _drive_qk(model)
+            counts = [monitor._gpu_cnt[f"qk_stats/layer_{d}/max"] for d in range(6)]
+            # Every slot exactly 1 (no r-fold); total == number of unrolled positions.
+            self.assertEqual(counts, [1, 1, 1, 1, 1, 1])
+            self.assertEqual(sum(counts), monitor._depthmap.effective_depth)
+        finally:
+            monitor.remove_hooks()
+
+
+class LoopedMoEDepthTest(unittest.TestCase):
+    def setUp(self):
+        training_logs.reset()
+
+    def tearDown(self):
+        training_logs.reset()
+
+    def test_non_looped_keys_unchanged(self):
+        model = _MoEModel(_MoEDecoder(num_layers=3, hidden_size=8, num_experts=4))
+        monitor = MoESpecialistMonitor(monitor_interval=1)
+        monitor.register_hooks(model)
+        self.assertIsNone(monitor._depthmap)
+        try:
+            _drive_moe(model, torch.randn(4, 1, 8))
+            monitor._record_global_load_balance_metrics()
+            monitor.step()
+            latest = training_logs.get_latest(prefix="moe_health")
+            self.assertEqual(_layer_ids_for(latest, "router_entropy"), [0, 1, 2])
+        finally:
+            monitor.remove_hooks()
+
+    def test_looped_router_metrics_at_per_iteration_depth(self):
+        # pe=1 (dense), ce=3 (core L1,L2 MoE), num=4 (coda L3 MoE), r=2.
+        # effective_depth=6; MoE occupies unrolled positions {1,2,3,4,5} (d=0 is the
+        # dense prelude layer, so it must be absent from MoE metrics).
+        model = _MoEModel(_MoEDecoder(num_layers=4, hidden_size=8, num_experts=4, dense_prefix=1, looped=(1, 3, 2)))
+        monitor = MoESpecialistMonitor(monitor_interval=1)
+        monitor.register_hooks(model)
+        self.assertIsNotNone(monitor._depthmap)
+        try:
+            _drive_moe(model, torch.randn(4, 1, 8))
+            monitor.step()
+            latest = training_logs.get_latest(prefix="moe_health")
+            self.assertEqual(_layer_ids_for(latest, "router_entropy"), [1, 2, 3, 4, 5])
+        finally:
+            monitor.remove_hooks()
+
+    def test_looped_router_slots_counted_once(self):
+        model = _MoEModel(_MoEDecoder(num_layers=4, hidden_size=8, num_experts=4, dense_prefix=1, looped=(1, 3, 2)))
+        monitor = MoESpecialistMonitor(monitor_interval=1)
+        monitor.register_hooks(model)
+        try:
+            _drive_moe(model, torch.randn(4, 1, 8))
+            counts = [monitor._gpu_cnt[f"moe_health/layer_{d}/router_entropy"] for d in (1, 2, 3, 4, 5)]
+            self.assertEqual(counts, [1, 1, 1, 1, 1])
+        finally:
+            monitor.remove_hooks()
+
+    def test_looped_step_metrics_at_representative_depth(self):
+        # Load-balance is read once per step from accumulated router state, so it is
+        # keyed at the representative depth depth(L,0): L1->1, L2->2, L3(coda)->5.
+        # It must NOT appear at the per-iteration router slots d=3,4.
+        model = _MoEModel(_MoEDecoder(num_layers=4, hidden_size=8, num_experts=4, dense_prefix=1, looped=(1, 3, 2)))
+        monitor = MoESpecialistMonitor(monitor_interval=1)
+        monitor.register_hooks(model)
+        self.assertTrue(monitor._global_lb_enabled)
+        self.assertEqual(sorted(idx for idx, _ in monitor._load_balance_routers), [1, 2, 5])
+        try:
+            _drive_moe(model, torch.randn(4, 1, 8))
+            monitor._record_global_load_balance_metrics()
+            monitor.step()
+            latest = training_logs.get_latest(prefix="moe_health")
+            self.assertEqual(_layer_ids_for(latest, "load_max_min_ratio"), [1, 2, 5])
+        finally:
+            monitor.remove_hooks()
 
 
 if __name__ == "__main__":

@@ -1,6 +1,29 @@
 """
 MoE Specialist Monitor for Megatron-Bridge.
 Migrated from src/internal_medicine/moe_specialist/.
+
+Effective-depth indexing under looped models
+---------------------------------------------
+On a looped/recurrent-depth model the recurrent-core MoE layers are the same
+module instances run ``r`` times per forward. When a looped core is discovered
+(``find_looped_depth_map``), metrics are re-keyed by effective (unrolled) depth
+``d`` so each visit becomes its own slot. There are two metric paths, treated
+differently:
+
+- **Forward-hook metrics** (``_ROUTER_METRICS`` via ``_make_router_hook``,
+  ``_LATENT_COMBINE_METRICS`` via ``_make_latent_combine_hook``) fire once per
+  core visit, so each is recorded at its per-iteration effective depth
+  ``d = depth(L, i)``.
+- **Step-based metrics** (``_EXPERT_METRICS`` in ``step()``; ``_LOAD_BALANCE_METRICS``
+  via the finalize-time patches) read router state that is **accumulated** over
+  all ``r`` core visits (the aux loss is divided by ``r`` for the same reason), so
+  they cannot be split per iteration. They are keyed at the **representative**
+  depth ``d = depth(L, 0)`` (== physical ``L`` for core, shifted for coda) and are
+  per-physical-layer accumulations over all ``r`` visits, NOT per-iteration values.
+  Per-iteration load would need a router-side per-visit token count (follow-up).
+
+Non-looped or degenerate (``l_R == 0``) models get ``_depthmap is None`` and behave
+exactly as before (physical-layer indexing).
 """
 
 import logging
@@ -13,6 +36,7 @@ import torch.nn as nn
 
 from ...core.training_logs import training_logs
 from .base import TorchProbe
+from .looped_depth import find_looped_depth_map
 from .moe_metrics import (
     compute_bias_affinity_jaccard,
     compute_expert_norms,
@@ -107,6 +131,8 @@ class MoESpecialistMonitor(TorchProbe):
         self._global_lb_enabled = False
         self._load_balance_routers: list[tuple[int, weakref.ref]] = []
         self._orig_reset_model_temporary_tensors = None
+        # Effective-depth remap for looped models; None => physical-layer indexing.
+        self._depthmap = None
 
     def register_hooks(self, model: nn.Module):
         self._init_parallel_state()
@@ -135,37 +161,66 @@ class MoESpecialistMonitor(TorchProbe):
         if self.verbose:
             logger.info(f"[MoEMonitor] Found {len(moe_layers)} MoE layers.")
 
+        dmap = find_looped_depth_map(model)
+        if dmap is not None and self._depthmap is not None:
+            # PP>1 is rejected for looped models, so exactly one core per process;
+            # refuse to remap a second discovered core rather than mislabel it.
+            logger.warning("[MoEMonitor] a looped core was already registered; keeping physical indexing here")
+        elif dmap is not None:
+            self._depthmap = dmap
+            if self.verbose:
+                logger.info(f"[MoEMonitor] looped core: effective_depth={dmap.effective_depth} r={dmap.r}")
+
         for layer_idx, moe_layer in moe_layers:
-            for name in (*_ROUTER_METRICS, *_EXPERT_METRICS):
-                self.declare_layer_metric(layer_idx, name)
+            rep_d = self._rep_depth(layer_idx)
+            # Router metrics fire once per core visit -> per-iteration effective depth.
+            for d in self._unrolled_depths(layer_idx):
+                for name in _ROUTER_METRICS:
+                    self.declare_layer_metric(d, name)
+            # Expert-weight metrics are read once per step from accumulated state ->
+            # representative depth only (see module docstring).
+            for name in _EXPERT_METRICS:
+                self.declare_layer_metric(rep_d, name)
             # Latent-combine magnitude: only exists on latent-MoE models, where
-            # MoELayer builds fc2_latent_proj. Declare here so the schema is locked
-            # before allocate_buffers (perf-rules Rule 3: no lazy declare).
+            # MoELayer builds fc2_latent_proj. Fires once per core visit like the
+            # router, so declare it per-iteration. Declared here so the schema is
+            # locked before allocate_buffers (perf-rules Rule 3: no lazy declare).
             if self._latent_proj_of(moe_layer) is not None:
-                for name in _LATENT_COMBINE_METRICS:
-                    self.declare_layer_metric(layer_idx, name)
+                for d in self._unrolled_depths(layer_idx):
+                    for name in _LATENT_COMBINE_METRICS:
+                        self.declare_layer_metric(d, name)
             # Load-balance ratios need globally-reduced per-expert counts. Prefer
             # router.global_tokens_per_expert (global_aux_loss path); fall back to
-            # the expert-bias path when only that is available. Declare the metrics
-            # here so the schema is locked before allocate_buffers.
+            # the expert-bias path when only that is available. These read
+            # accumulated state -> representative depth. Declare the metrics here so
+            # the schema is locked before allocate_buffers.
             router = getattr(moe_layer, "router", None)
             if router is None:
                 continue
             if getattr(router, "global_tokens_per_expert", None) is not None:
                 self._global_lb_enabled = True
-                self._load_balance_routers.append((layer_idx, weakref.ref(router)))
+                self._load_balance_routers.append((rep_d, weakref.ref(router)))
                 for name in _LOAD_BALANCE_METRICS:
-                    self.declare_layer_metric(layer_idx, name)
+                    self.declare_layer_metric(rep_d, name)
             elif getattr(router, "enable_expert_bias", False):
                 self._expert_bias_enabled = True
-                self._load_balance_layer_order.append(layer_idx)
+                self._load_balance_layer_order.append(rep_d)
                 for name in _LOAD_BALANCE_METRICS:
-                    self.declare_layer_metric(layer_idx, name)
+                    self.declare_layer_metric(rep_d, name)
         return moe_layers
+
+    def _rep_depth(self, layer_idx: int) -> int:
+        """Representative effective depth (first core visit) for step-based metrics."""
+        return layer_idx if self._depthmap is None else self._depthmap.depth(layer_idx, 0)
+
+    def _unrolled_depths(self, layer_idx: int) -> list[int]:
+        """All effective depths a forward-hook metric on this physical layer maps onto."""
+        return [layer_idx] if self._depthmap is None else self._depthmap.unrolled_depths(layer_idx)
 
     def _attach_hooks(self, targets: list[tuple[int, nn.Module]]):
         for layer_idx, moe_layer in targets:
-            self._monitored_moe_layers.append((layer_idx, weakref.ref(moe_layer)))
+            # Step-based expert metrics read accumulated state -> representative depth.
+            self._monitored_moe_layers.append((self._rep_depth(layer_idx), weakref.ref(moe_layer)))
             if hasattr(moe_layer, "router"):
                 self._patch_router_cache(moe_layer.router)
                 hook = moe_layer.router.register_forward_hook(
@@ -395,15 +450,27 @@ class MoESpecialistMonitor(TorchProbe):
         return moe_layers
 
     def _make_router_hook(self, layer_idx: int, moe_layer: nn.Module):
+        # Per-forward core-iteration counter: core layers cycle 0..r-1, prelude/coda
+        # fire once (i stays 0). Bumped only after the monitor gate passes.
+        is_core = self._depthmap is not None and self._depthmap.is_core(layer_idx)
+        cnt = [0]
+
         def hook_fn(module, _inputs, outputs):
             if not self._should_monitor():
                 for attr in ("_cached_scores_for_aux_loss", "_cached_routing_map_for_aux_loss"):
                     if hasattr(module, attr):
                         setattr(module, attr, None)
                 return
+            if self._depthmap is None:
+                layer_d = layer_idx
+            elif is_core:
+                layer_d = self._depthmap.depth(layer_idx, cnt[0] % self._depthmap.r)
+                cnt[0] += 1
+            else:
+                layer_d = self._depthmap.depth(layer_idx, 0)
             try:
                 with torch.no_grad():
-                    self._compute_router_metrics(layer_idx, module, outputs, moe_layer)
+                    self._compute_router_metrics(layer_d, module, outputs, moe_layer)
             except Exception as e:
                 if self.verbose:
                     logger.error(f"[MoEMonitor] Router hook error layer {layer_idx}: {e}")
@@ -427,10 +494,21 @@ class MoESpecialistMonitor(TorchProbe):
         DP/CP-partitioned, and flush-time ``gather_and_aggregate`` composes those
         (mean for the RMS, max for the ratio).
         """
+        # Own per-forward counter: latent proj fires once per core visit, in step
+        # with the router hook but tracked separately.
+        is_core = self._depthmap is not None and self._depthmap.is_core(layer_idx)
+        cnt = [0]
 
         def hook_fn(module, args, kwargs):
             if not self._should_monitor():
                 return None
+            if self._depthmap is None:
+                layer_d = layer_idx
+            elif is_core:
+                layer_d = self._depthmap.depth(layer_idx, cnt[0] % self._depthmap.r)
+                cnt[0] += 1
+            else:
+                layer_d = self._depthmap.depth(layer_idx, 0)
             try:
                 # mcore calls ``self.fc2_latent_proj(output)`` positionally and
                 # ``TELinear.forward(self, x)`` takes a single tensor; the kwargs
@@ -445,7 +523,7 @@ class MoESpecialistMonitor(TorchProbe):
                     return None
                 with torch.no_grad():
                     for name, val in compute_latent_combine_stats(hidden.detach()).items():
-                        self.record_layer_metric(layer_idx, name, val)
+                        self.record_layer_metric(layer_d, name, val)
             except Exception as e:
                 if self.verbose:
                     logger.error(f"[MoEMonitor] latent-combine hook error layer {layer_idx}: {e}")

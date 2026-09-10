@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 
 from .base import TorchProbe
+from .looped_depth import find_looped_depth_map
 from .sink_head_metrics import compute_sink_head_classification
 from .triton_kernels import compute_qk_stats
 
@@ -60,6 +61,8 @@ class QKStatsMonitor(TorchProbe):
         self.tp_size = 1
         self.tp_rank = 0
         self.tp_group = None
+        # Effective-depth remap for looped models; None => physical-layer indexing.
+        self._depthmap = None
 
     def register_hooks(self, model: nn.Module):
         self._init_parallel_state()
@@ -90,10 +93,26 @@ class QKStatsMonitor(TorchProbe):
         if self.verbose:
             logger.info(f"[QKMonitor] Found {len(attention_layers)} attention layers. TP={self.tp_size}")
 
+        dmap = find_looped_depth_map(model)
+        if dmap is not None and self._depthmap is not None:
+            # PP>1 is rejected for looped models, so exactly one core per process;
+            # refuse to remap a second discovered core rather than mislabel it.
+            logger.warning("[QKMonitor] a looped core was already registered; keeping physical indexing for this chunk")
+        elif dmap is not None:
+            self._depthmap = dmap
+            if self.verbose:
+                logger.info(f"[QKMonitor] looped core: effective_depth={dmap.effective_depth} r={dmap.r}")
+
         for layer_idx, _ in attention_layers:
-            for name in _LAYER_METRICS:
-                self.declare_layer_metric(layer_idx, name)
+            for d in self._effective_depths(layer_idx):
+                for name in _LAYER_METRICS:
+                    self.declare_layer_metric(d, name)
         return attention_layers
+
+    def _effective_depths(self, layer_idx: int) -> list[int]:
+        if self._depthmap is None:
+            return [layer_idx]
+        return self._depthmap.unrolled_depths(layer_idx)
 
     def _attach_hooks(self, targets: list[tuple[int, nn.Module]]):
         for layer_idx, attention_module in targets:
@@ -129,9 +148,22 @@ class QKStatsMonitor(TorchProbe):
         return attention_layers
 
     def _make_compute_hook(self, layer_idx: int):
+        # Per-forward core-iteration counter (count % r == iteration index). Only
+        # core layers cycle 0..r-1; prelude/coda fire once so i stays 0. Bumped
+        # only after the monitor gate passes, so unmonitored steps don't desync.
+        is_core = self._depthmap is not None and self._depthmap.is_core(layer_idx)
+        cnt = [0]
+
         def hook_fn(module, args):
             if not self._should_monitor():
                 return
+            if self._depthmap is None:
+                layer_d = layer_idx
+            elif is_core:
+                layer_d = self._depthmap.depth(layer_idx, cnt[0] % self._depthmap.r)
+                cnt[0] += 1
+            else:
+                layer_d = self._depthmap.depth(layer_idx, 0)
             try:
                 query, key = args[0].detach(), args[1].detach()
                 if query.dim() == 3:
@@ -156,15 +188,15 @@ class QKStatsMonitor(TorchProbe):
                 sink_local = sink_per_head.mean(dim=0) if sink_per_head.dim() > 1 else sink_per_head
                 sink_class = compute_sink_head_classification(sink_local, threshold=self.sink_head_threshold)
 
-                self.record_layer_metric(layer_idx, "max", stats["max_global"])
-                self.record_layer_metric(layer_idx, "mean", stats["mean_global"])
-                self.record_layer_metric(layer_idx, "entropy_avg", stats["entropy_global"])
-                self.record_layer_metric(layer_idx, "sink", stats["sink_global"])
-                self.record_layer_metric(layer_idx, "entropy_min", local_head_entropy.min())
-                self.record_layer_metric(layer_idx, "entropy_max", local_head_entropy.max())
-                self.record_layer_metric(layer_idx, "sink_head_ratio", sink_class["sink_head_ratio"])
-                self.record_layer_metric(layer_idx, "sink_head_max", sink_class["sink_head_max"])
-                self.record_layer_metric(layer_idx, "sink_nonsink_gap", sink_class["sink_nonsink_gap"])
+                self.record_layer_metric(layer_d, "max", stats["max_global"])
+                self.record_layer_metric(layer_d, "mean", stats["mean_global"])
+                self.record_layer_metric(layer_d, "entropy_avg", stats["entropy_global"])
+                self.record_layer_metric(layer_d, "sink", stats["sink_global"])
+                self.record_layer_metric(layer_d, "entropy_min", local_head_entropy.min())
+                self.record_layer_metric(layer_d, "entropy_max", local_head_entropy.max())
+                self.record_layer_metric(layer_d, "sink_head_ratio", sink_class["sink_head_ratio"])
+                self.record_layer_metric(layer_d, "sink_head_max", sink_class["sink_head_max"])
+                self.record_layer_metric(layer_d, "sink_nonsink_gap", sink_class["sink_nonsink_gap"])
             except Exception as e:
                 if self.verbose:
                     logger.error(f"[QKMonitor] Error layer {layer_idx}: {e}")

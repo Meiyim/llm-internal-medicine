@@ -38,6 +38,11 @@ Recurrence-axis metrics (per iteration ``i``)
                    byproducts (concat injection only). ->0 means the model has
                    learned to ignore the injected input ``e``; -> large means it
                    ignores the recurrent state ``s`` (the paper's Bad Run 2).
+``dt_mean`` / ``dt_std``   mean and std of the learned effective timestep
+                   ``Δt = softplus(dt + dt_bias)`` from the Variant D2 adaLN ZOH gate
+                   (``looped_adaln_content``; adapter is None). Averaged over the core
+                   sublayer heads and tokens per iteration — tracks how the ZOH gate's
+                   depth clock opens across the recurrence. Absent for non-adaln cores.
 
 Global weight-space metrics (concat injection only)
 ---------------------------------------------------
@@ -154,10 +159,13 @@ class LoopedHealthMonitor(TorchProbe):
         # Set once the looped block is discovered in _prepare_layers.
         self.r: int | None = None
         self._injection: str | None = None
-        # Per-forward iteration counters (count % r == iteration index). Two
-        # independent counters because the core-state hook and adapter each fire r times.
+        self._has_dt = False
+        # Per-forward iteration counters (count % r == iteration index). Independent
+        # counters because the core-state hook and adapter each fire r times; the ZOH
+        # gate heads (D2) each fire r times too, so they get a per-module counter dict.
         self._state_iter = 0
         self._adapter_iter = 0
+        self._dt_iter: dict[int, int] = {}
         # Previous iteration's state, for ||s_i - s_{i-1}||. Detached, one [S,B,H]
         # tensor held only across a monitored forward.
         self._prev_norm_state: torch.Tensor | None = None
@@ -189,21 +197,48 @@ class LoopedHealthMonitor(TorchProbe):
         except ImportError:
             pass
 
+    def _find_dt_heads(self, block):
+        """Core-layer ZOH gate heads (Variant D2), discovered by duck-typing.
+
+        A head is any core-layer submodule exposing the detached effective-Δt
+        stats ``last_dt_mean`` / ``last_dt_std`` (stashed by ``ZOHGateHead.forward``).
+        Only the recurrent core carries modulation heads (prelude/coda are Identity),
+        so scanning ``layers[prelude_end:core_end]`` finds exactly the heads that fire
+        r times per forward. Returns [] for non-adaln cores (adapter / self-map).
+        """
+        heads = []
+        layers = getattr(block, "layers", None)
+        if layers is None:
+            return heads
+        layers = list(layers)
+        start = getattr(block, "prelude_end", 0)
+        end = getattr(block, "core_end", len(layers))
+        for layer in layers[start:end]:
+            submods = layer.modules() if hasattr(layer, "modules") else [layer]
+            for m in submods:
+                if hasattr(m, "last_dt_mean") and hasattr(m, "last_dt_std"):
+                    heads.append(m)
+        return heads
+
     def _find_looped_block(self, model: nn.Module):
         """Return the LoopedTransformerBlock if this chunk is a live looped core.
 
-        A non-looped decoder, or a looped block in its degenerate ``l_R == 0``
-        parity configuration (adapter is None there), returns None so the monitor
-        is a clean no-op — it can sit in the ``all`` monitor list safely.
+        Live means ``r >= 1`` and the core carries either a loop adapter (variants
+        A/A2/C mix e/τ; state metrics only for B/none) OR content-only ZOH gate heads
+        (Variant D2, adaLN gating, no adapter). A non-looped decoder, or a looped block
+        in its degenerate ``l_R == 0`` parity configuration (no adapter AND no heads),
+        returns None so the monitor is a clean no-op — it can sit in ``all`` safely.
         """
         if hasattr(model, "module"):
             model = model.module
         decoder = getattr(model, "decoder", None)
         if decoder is None:
             return None
-        adapter = getattr(decoder, "adapter", None)
         r = getattr(decoder, "looped_num_recurrence", None)
-        if adapter is None or not isinstance(r, int) or r < 1:
+        if not isinstance(r, int) or r < 1:
+            return None
+        adapter = getattr(decoder, "adapter", None)
+        if adapter is None and not self._find_dt_heads(decoder):
             return None
         return decoder
 
@@ -224,10 +259,17 @@ class LoopedHealthMonitor(TorchProbe):
 
         self.r = r
         self._injection = injection
+        self._has_dt = bool(self._find_dt_heads(block))
 
         for i in range(r):
             self.declare_layer_metric(i, "token_cosine")
             self.declare_layer_metric(i, "eff_rank")
+        # D2 (adaLN ZOH gate): mean/std of the learned effective Δt = softplus(dt+dt_bias),
+        # averaged over core sublayers and tokens, per recurrence iteration.
+        if self._has_dt:
+            for i in range(r):
+                self.declare_layer_metric(i, "dt_mean")
+                self.declare_layer_metric(i, "dt_std")
         # state_delta compares against the previous iteration, so iteration 0 has
         # nothing to diff — declare it only for i >= 1.
         for i in range(1, r):
@@ -259,6 +301,11 @@ class LoopedHealthMonitor(TorchProbe):
                 self.timed_hook("adapter", self._make_adapter_hook())
             )
             self.hooks.append(adapter_hook)
+        # D2: one hook per ZOH gate head. Each head fires r times per forward, so a
+        # per-module counter recovers its iteration index; records average across heads.
+        for head in self._find_dt_heads(block):
+            dt_hook = head.register_forward_hook(self.timed_hook("dt_head", self._make_dt_hook()))
+            self.hooks.append(dt_hook)
         logger.info("[LoopedMonitor] Registered %d hooks (r=%d).", len(self.hooks), self.r)
 
     # ------------------------------------------------------------------
@@ -313,6 +360,30 @@ class LoopedHealthMonitor(TorchProbe):
             with torch.no_grad():
                 ratio = embed_norm.detach() / state_norm.detach().clamp_min(self.eps)
                 self.record_layer_metric(i, "adapter_e_ratio", ratio)
+
+        return hook_fn
+
+    def _make_dt_hook(self):
+        """Post-hook on a ZOH gate head: mean/std of its learned effective Δt.
+
+        The head stashes ``last_dt_mean`` / ``last_dt_std`` (0-dim GPU tensors) in its
+        forward; the hook just routes them into this iteration's slot. Per-module
+        counters index the iteration; multiple heads at the same iteration mean-average.
+        """
+
+        def hook_fn(module, args, output):
+            if not self._should_monitor():
+                return
+            dt_mean = module.last_dt_mean
+            dt_std = module.last_dt_std
+            if dt_mean is None or dt_std is None:
+                return
+            mid = id(module)
+            i = self._dt_iter.get(mid, 0) % self.r
+            self._dt_iter[mid] = self._dt_iter.get(mid, 0) + 1
+            with torch.no_grad():
+                self.record_layer_metric(i, "dt_mean", dt_mean.detach())
+                self.record_layer_metric(i, "dt_std", dt_std.detach())
 
         return hook_fn
 

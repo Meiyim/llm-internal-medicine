@@ -82,16 +82,61 @@ class FakeAdapter(nn.Module):
         return state
 
 
+class FakeZOHHead(nn.Module):
+    """Stand-in for ZOHGateHead (Variant D2): stashes the detached mean/std of its
+    'effective Δt' (here just the input) as 0-dim tensors, the byproducts the dt hook
+    reads. A ``proj`` param gives it discoverable weights; forward returns the input."""
+
+    def __init__(self, hidden_size=HIDDEN):
+        super().__init__()
+        self.proj = nn.Linear(hidden_size, 2 * hidden_size, bias=False)
+        self.last_dt_mean = None
+        self.last_dt_std = None
+
+    def forward(self, x):
+        d = x.detach()
+        self.last_dt_mean = d.mean()
+        self.last_dt_std = d.std()
+        return x
+
+
+class FakeAdaLNCoreLayer(nn.Module):
+    """Core layer for the adaLN (D2) path: two ZOH gate heads see the layer input,
+    then the layer returns ``(hidden_states, context)`` for the state hook's tuple
+    unwrap. Both heads fire once per iteration, mirroring attn/mlp modulation."""
+
+    def __init__(self, hidden_size=HIDDEN):
+        super().__init__()
+        self.attn_head = FakeZOHHead(hidden_size)
+        self.mlp_head = FakeZOHHead(hidden_size)
+
+    def forward(self, x):
+        self.attn_head(x)
+        self.mlp_head(x)
+        return x, None
+
+
 def _looped_model(r, injection="concat", with_block=True, hidden_size=HIDDEN):
-    """SimpleNamespace shaped like ErnieDevGPTModel.decoder for discovery."""
+    """SimpleNamespace shaped like ErnieDevGPTModel.decoder for discovery.
+
+    ``injection="adaln"`` models Variant D2: no adapter, core layer carries ZOH gate
+    heads (found by ``last_dt_mean`` duck-typing under ``layers[prelude_end:core_end]``).
+    """
     if not with_block:
         # A plain decoder: no adapter / looped_num_recurrence.
         return SimpleNamespace(decoder=SimpleNamespace(layers=nn.ModuleList([nn.Linear(4, 4)])))
+    if injection == "adaln":
+        core = FakeAdaLNCoreLayer(hidden_size)
+        adapter = None
+    else:
+        core = FakeCoreLayer()
+        adapter = FakeAdapter(injection=injection, hidden_size=hidden_size)
     decoder = SimpleNamespace(
-        adapter=FakeAdapter(injection=injection, hidden_size=hidden_size),
+        adapter=adapter,
         looped_num_recurrence=r,
         # A single core layer; core_end - 1 == 0 is the s_i hook site.
-        layers=nn.ModuleList([FakeCoreLayer()]),
+        layers=nn.ModuleList([core]),
+        prelude_end=0,
         core_end=1,
     )
     # allocate_buffers picks a device off model.parameters(); give it one param.
@@ -115,10 +160,11 @@ def _drive_forward(block, states, embed_norms=None, state_norms=None):
     r = block.looped_num_recurrence
     core = block.layers[block.core_end - 1]
     for i in range(r):
-        if block.adapter.injection == "concat" and embed_norms is not None:
-            block.adapter.last_embed_norm = torch.tensor(float(embed_norms[i]))
-            block.adapter.last_state_norm = torch.tensor(float(state_norms[i]))
-        block.adapter(states[i], states[i])
+        if block.adapter is not None:
+            if block.adapter.injection == "concat" and embed_norms is not None:
+                block.adapter.last_embed_norm = torch.tensor(float(embed_norms[i]))
+                block.adapter.last_state_norm = torch.tensor(float(state_norms[i]))
+            block.adapter(states[i], states[i])
         core(states[i])
 
 
@@ -285,6 +331,68 @@ class LoopedMonitorTest(unittest.TestCase):
         # state-side metrics still present.
         self.assertIn("looped_health/layer_0/token_cosine", latest)
 
+    # ------------------------------------------------------------------
+    # adaLN ZOH gate (Variant D2): learned-Δt metrics, no adapter
+    # ------------------------------------------------------------------
+    def test_adaln_block_found_and_hooks(self):
+        r = 3
+        monitor = LoopedHealthMonitor()
+        model = _looped_model(r, injection="adaln")
+        self.assertIsNotNone(monitor._find_looped_block(model))
+        block = _register(monitor, model)
+        # 1 core-state hook + 2 ZOH gate heads (attn/mlp); adapter is None.
+        self.assertEqual(len(monitor.hooks), 3)
+        self.assertIsNone(block.adapter)
+
+    def test_adaln_declares_dt_schema(self):
+        r = 4
+        monitor = LoopedHealthMonitor()
+        block = _register(monitor, _looped_model(r, injection="adaln"))
+        states = [torch.randn(8, 2, HIDDEN) for _ in range(r)]
+        _drive_forward(block, states)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="looped_health")
+        for i in range(r):
+            self.assertIn(f"looped_health/layer_{i}/dt_mean", latest)
+            self.assertIn(f"looped_health/layer_{i}/dt_std", latest)
+        # cross-iteration global reductions derived at flush.
+        self.assertIn("looped_health/global_dt_mean", latest)
+        self.assertIn("looped_health/global_dt_std", latest)
+        # state metrics still present; adapter-only metrics absent.
+        self.assertIn("looped_health/layer_0/token_cosine", latest)
+        self.assertFalse(any("adapter_e_ratio" in k for k in latest))
+        self.assertFalse(any("spec_norm" in k for k in latest))
+
+    def test_adaln_dt_records_per_iteration(self):
+        # Head stashes mean/std of its input; a constant tensor per iteration gives a
+        # known Δt. Both heads see the same input, so the mean-averaged slot == that
+        # constant and std == 0.
+        r = 2
+        monitor = LoopedHealthMonitor()
+        block = _register(monitor, _looped_model(r, injection="adaln"))
+        states = [torch.full((8, 2, HIDDEN), 2.0), torch.full((8, 2, HIDDEN), 5.0)]
+        _drive_forward(block, states)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="looped_health")
+        self.assertAlmostEqual(latest["looped_health/layer_0/dt_mean"], 2.0, places=4)
+        self.assertAlmostEqual(latest["looped_health/layer_1/dt_mean"], 5.0, places=4)
+        self.assertAlmostEqual(latest["looped_health/layer_0/dt_std"], 0.0, places=4)
+
+    def test_adaln_no_heads_is_noop(self):
+        # adapter None AND no ZOH gate heads (a plain core layer) -> clean no-op.
+        decoder = SimpleNamespace(
+            adapter=None,
+            looped_num_recurrence=4,
+            layers=nn.ModuleList([FakeCoreLayer()]),
+            prelude_end=0,
+            core_end=1,
+        )
+        model = SimpleNamespace(decoder=decoder)
+        monitor = LoopedHealthMonitor()
+        self.assertIsNone(monitor._find_looped_block(model))
+
     def test_non_looped_model_is_noop(self):
         monitor = LoopedHealthMonitor()
         self.assertIsNone(monitor._prepare_layers(_looped_model(4, with_block=False)))
@@ -349,6 +457,14 @@ class LoopedMonitorTest(unittest.TestCase):
         setup_looped_monitor(model, monitor_dict=monitor_dict, verbose=True)
         self.assertIn("looped_health", monitor_dict)
         self.assertEqual(len(monitor_dict["looped_health"].hooks), 2)  # core state + adapter
+
+    def test_setup_factory_adaln_attaches_dt_hooks(self):
+        monitor_dict = {}
+        model = _looped_model(4, injection="adaln")
+        setup_looped_monitor(model, monitor_dict=monitor_dict)
+        self.assertIn("looped_health", monitor_dict)
+        # core state + 2 ZOH gate heads; no adapter hook.
+        self.assertEqual(len(monitor_dict["looped_health"].hooks), 3)
 
     def test_setup_factory_noop_on_plain_model(self):
         monitor_dict = {}

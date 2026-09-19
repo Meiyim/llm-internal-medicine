@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """LoopedHealthMonitor: recurrence-axis + weight-space metrics for a looped transformer.
 
 These pin the behaviours the plan calls out:
@@ -202,6 +201,11 @@ class LoopedMonitorTest(unittest.TestCase):
         self.assertNotIn("looped_health/layer_0/state_delta", latest)
         for i in range(1, r):
             self.assertIn(f"looped_health/layer_{i}/state_delta", latest)
+        # settling_ratio needs two consecutive step sizes, so only i >= 2.
+        self.assertNotIn("looped_health/layer_0/settling_ratio", latest)
+        self.assertNotIn("looped_health/layer_1/settling_ratio", latest)
+        for i in range(2, r):
+            self.assertIn(f"looped_health/layer_{i}/settling_ratio", latest)
         # cross-iteration global reductions are derived at flush.
         self.assertIn("looped_health/global_token_cosine", latest)
         self.assertIn("looped_health/global_eff_rank", latest)
@@ -253,6 +257,38 @@ class LoopedMonitorTest(unittest.TestCase):
         latest = training_logs.get_latest(prefix="looped_health")
         self.assertAlmostEqual(latest["looped_health/layer_1/state_delta"], 0.0, places=5)
         self.assertAlmostEqual(latest["looped_health/layer_2/state_delta"], 0.5, places=4)
+
+    def test_settling_ratio_one_when_all_tokens_decelerate(self):
+        # Every token takes a big first step then a near-zero second step, so its
+        # relative displacement shrinks -> all settle -> ratio 1.0.
+        r = 3
+        monitor = LoopedHealthMonitor()
+        block = _register(monitor, _looped_model(r, injection="none"))
+        base = torch.randn(8, 2, HIDDEN)
+        s0 = torch.zeros_like(base)  # iter1 step: ||base||/||base|| = 1.0
+        s1 = base
+        s2 = base + 1e-3 * torch.randn_like(base)  # iter2 step: ~0 relative
+        _drive_forward(block, [s0, s1, s2])
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="looped_health")
+        self.assertAlmostEqual(latest["looped_health/layer_2/settling_ratio"], 1.0, places=5)
+
+    def test_settling_ratio_zero_when_all_tokens_accelerate(self):
+        # Tiny first step then a large opposing second step -> every token's
+        # relative displacement grows -> none settle -> ratio 0.0.
+        r = 3
+        monitor = LoopedHealthMonitor()
+        block = _register(monitor, _looped_model(r, injection="none"))
+        base = torch.randn(8, 2, HIDDEN)
+        s0 = base
+        s1 = base + 1e-3 * torch.randn_like(base)  # iter1 step: ~0 relative
+        s2 = -base  # iter2 step: ~2.0 relative
+        _drive_forward(block, [s0, s1, s2])
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="looped_health")
+        self.assertAlmostEqual(latest["looped_health/layer_2/settling_ratio"], 0.0, places=5)
 
     def test_adapter_e_ratio_is_embed_over_state(self):
         r = 2

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Recurrent-depth (looped transformer) health monitor — arXiv 2502.05171.
 
 What it watches
@@ -34,6 +33,13 @@ Recurrence-axis metrics (per iteration ``i``)
 ``state_delta``    RMS of ``s_i - s_{i-1}`` normalized by RMS of ``s_i`` (paper
                    Fig 11): does the recurrence converge to a fixed point or keep
                    moving? Only defined for ``i >= 1``.
+``settling_ratio`` fraction of tokens whose *relative* per-step displacement
+                   ``||s_i - s_{i-1}|| / ||s_i||`` (per token, over H) shrank
+                   versus the previous step. High -> most tokens are decelerating
+                   / converging; low -> most keep moving further each iteration.
+                   Splits the token population that ``state_delta`` averages away;
+                   the ``1 - settling_ratio`` complement is the "still-moving"
+                   fraction. Needs two consecutive step sizes, so ``i >= 2``.
 ``adapter_e_ratio``  ``||A_e e|| / ||A_s s||`` from the adapter's per-branch RMS
                    byproducts (concat injection only). ->0 means the model has
                    learned to ignore the injected input ``e``; -> large means it
@@ -169,6 +175,9 @@ class LoopedHealthMonitor(TorchProbe):
         # Previous iteration's state, for ||s_i - s_{i-1}||. Detached, one [S,B,H]
         # tensor held only across a monitored forward.
         self._prev_norm_state: torch.Tensor | None = None
+        # Previous iteration's per-token relative step size, for settling_ratio.
+        # A [S,B] fp32 tensor held only across a monitored forward.
+        self._prev_token_delta: torch.Tensor | None = None
         # Spectral-norm power iteration: warm-started unit vectors per matrix
         # (fp32, on the weight's device) and a once-per-step guard (the adapter
         # hook fires r times but the weight is constant within a forward).
@@ -274,6 +283,9 @@ class LoopedHealthMonitor(TorchProbe):
         # nothing to diff — declare it only for i >= 1.
         for i in range(1, r):
             self.declare_layer_metric(i, "state_delta")
+        # settling_ratio compares two consecutive step sizes, so it needs i >= 2.
+        for i in range(2, r):
+            self.declare_layer_metric(i, "settling_ratio")
         # The e/s branch ratio and the spectral norms only exist for the concat
         # adapter (none has no separable branches / no A_s, A_e matrices).
         if injection == "concat":
@@ -292,14 +304,10 @@ class LoopedHealthMonitor(TorchProbe):
         # s_i is the last core layer's output (runs once per iteration, only in
         # the loop; coda is layers[core_end:]). The old core-exit state_norm is gone.
         core_state_module = block.layers[block.core_end - 1]
-        state_hook = core_state_module.register_forward_hook(
-            self.timed_hook("core_state", self._make_state_hook())
-        )
+        state_hook = core_state_module.register_forward_hook(self.timed_hook("core_state", self._make_state_hook()))
         self.hooks.append(state_hook)
         if self._injection == "concat":
-            adapter_hook = block.adapter.register_forward_hook(
-                self.timed_hook("adapter", self._make_adapter_hook())
-            )
+            adapter_hook = block.adapter.register_forward_hook(self.timed_hook("adapter", self._make_adapter_hook()))
             self.hooks.append(adapter_hook)
         # D2: one hook per ZOH gate head. Each head fires r times per forward, so a
         # per-module counter recovers its iteration index; records average across heads.
@@ -324,15 +332,31 @@ class LoopedHealthMonitor(TorchProbe):
             self._state_iter += 1
             with torch.no_grad():
                 state = state.detach()
-                self.record_layer_metric(i, "token_cosine",
-                                         compute_post_norm_cosine_stability(state, self.cosine_sample_pairs))
+                self.record_layer_metric(
+                    i, "token_cosine", compute_post_norm_cosine_stability(state, self.cosine_sample_pairs)
+                )
                 self.record_layer_metric(i, "eff_rank", _covariance_effective_rank(state, self.eps))
 
                 state_f = state.float()
                 if i >= 1 and self._prev_norm_state is not None and self._prev_norm_state.shape == state_f.shape:
-                    num = (state_f - self._prev_norm_state).pow(2).mean().sqrt()
+                    diff = state_f - self._prev_norm_state
+                    num = diff.pow(2).mean().sqrt()
                     den = state_f.pow(2).mean().sqrt().clamp_min(self.eps)
                     self.record_layer_metric(i, "state_delta", num / den)
+                    # per-token relative step ||s_i-s_{i-1}||/||s_i|| over H -> [S,B];
+                    # settling = fraction whose step shrank vs the previous iteration.
+                    tok_delta = diff.pow(2).mean(dim=-1).sqrt() / state_f.pow(2).mean(dim=-1).sqrt().clamp_min(self.eps)
+                    if (
+                        i >= 2
+                        and self._prev_token_delta is not None
+                        and self._prev_token_delta.shape == tok_delta.shape
+                    ):
+                        self.record_layer_metric(
+                            i, "settling_ratio", (tok_delta < self._prev_token_delta).float().mean()
+                        )
+                    self._prev_token_delta = None if i == self.r - 1 else tok_delta
+                else:
+                    self._prev_token_delta = None
                 # Stash for the next iteration; drop it at the forward boundary so a
                 # monitored forward holds at most one [S,B,H] fp32 copy.
                 self._prev_norm_state = None if i == self.r - 1 else state_f
@@ -407,6 +431,7 @@ class LoopedHealthMonitor(TorchProbe):
         # steps (e.g. after a forward interrupted before its last iteration).
         super().step(global_step)
         self._prev_norm_state = None
+        self._prev_token_delta = None
         # Re-arm the once-per-step spectral-norm computation for the next step.
         self._spec_done = False
 
